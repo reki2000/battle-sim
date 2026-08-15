@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use sim_core::{deploy_block, World, WorldConfig};
 use sim_math::{fx, Vec2Fx};
-use sim_terrain::TerrainParams;
+use sim_terrain::{SeaEdge, TerrainParams};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -29,7 +29,8 @@ fn main() {
                 "使い方:\n  \
                  bench   [--soldiers N] [--ticks N] [--size M] [--seed N]   性能を計測する\n  \
                  verify  [--soldiers N] [--ticks N] [--seed N]              決定論を検証する\n  \
-                 terrain [--size M] [--relief 0-1000] [--seed N]            地形の統計を出す"
+                 terrain [--size M] [--relief 0-1000] [--seed N]            地形の統計を出す\n          \
+                 [--river-density 0-1000] [--roads N] [--sea north|east|south|west]"
             );
             std::process::exit(2);
         }
@@ -42,6 +43,9 @@ struct Opts {
     size_m: u32,
     relief: u16,
     seed: u64,
+    river_density: u16,
+    road_count: u16,
+    sea_edge: SeaEdge,
 }
 
 impl Opts {
@@ -52,6 +56,9 @@ impl Opts {
             size_m: 2_000,
             relief: 450,
             seed: 0x5EED_1234_ABCD_0001,
+            river_density: 500,
+            road_count: 2,
+            sea_edge: SeaEdge::None,
         };
         let mut i = 1;
         while i + 1 < args.len() {
@@ -62,6 +69,17 @@ impl Opts {
                 "--size" => o.size_m = v.parse().unwrap_or(o.size_m),
                 "--relief" => o.relief = v.parse().unwrap_or(o.relief),
                 "--seed" => o.seed = parse_seed(v).unwrap_or(o.seed),
+                "--river-density" => o.river_density = v.parse().unwrap_or(o.river_density),
+                "--roads" => o.road_count = v.parse().unwrap_or(o.road_count),
+                "--sea" => {
+                    o.sea_edge = match v.as_str() {
+                        "north" => SeaEdge::North,
+                        "east" => SeaEdge::East,
+                        "south" => SeaEdge::South,
+                        "west" => SeaEdge::West,
+                        _ => SeaEdge::None,
+                    }
+                }
                 _ => {}
             }
             i += 2;
@@ -207,6 +225,9 @@ fn terrain_report(o: &Opts) {
         seed: o.seed,
         size_m: o.size_m,
         relief: o.relief,
+        river_density: o.river_density,
+        road_count: o.road_count,
+        sea_edge: o.sea_edge,
         ..Default::default()
     };
     let t0 = Instant::now();
@@ -227,6 +248,27 @@ fn terrain_report(o: &Opts) {
         s.impassable,
         s.impassable as f64 * 100.0 / t.surface.len() as f64
     );
+    println!(
+        "最大連結域  通行可能セルの {:.1}%",
+        s.largest_passable_component as f64 * 100.0
+            / (t.surface.len() - s.impassable as usize).max(1) as f64
+    );
+    println!(
+        "水系        河川 {} セル / 湖 {} セル / 海 {} セル",
+        s.river_cells, s.lake_cells, s.sea_cells
+    );
+    println!("崖          {} エッジ", s.cliff_edges);
+    println!("会戦地候補  {} 件", s.battle_sites);
+    if let Some(best) = t.battle_sites.first() {
+        println!(
+            "  最上位候補 ({:>5}, {:>5}) score={} 通行可能={:.0}% 開放度={:.0}%",
+            best.x_m,
+            best.y_m,
+            best.score,
+            best.passable_permille as f64 / 10.0,
+            best.openness_permille as f64 / 10.0
+        );
+    }
     println!("地表の内訳:");
     let total = t.surface.len() as f64;
     let names = [
