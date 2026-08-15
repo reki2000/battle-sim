@@ -1,0 +1,17 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+web/dist/
+web/smoke-out/
+
+# wasm-pack の出力（ビルド生成物なのでコミットしない）
+web/src/wasm/
+
+# エディタ
+.DS_Store
+*.swp
+.idea/
+.vscode/

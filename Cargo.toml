@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sim-math",
+    "crates/sim-terrain",
+    "crates/sim-core",
+    "crates/sim-wasm",
+    "crates/sim-headless",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/reki2000/battle-sim"
+
+[workspace.dependencies]
+sim-math = { path = "crates/sim-math" }
+sim-terrain = { path = "crates/sim-terrain" }
+sim-core = { path = "crates/sim-core" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# wasm 向けはサイズを優先する
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
