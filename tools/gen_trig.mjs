@@ -22,6 +22,9 @@ out += "// index i は角度 i * 16 brad に対応する。\n";
 out += "// 端点を含めるため長さは QUARTER_ENTRIES+1。\n\n";
 out += `pub const QUARTER_ENTRIES: usize = ${N};\n`;
 out += "pub const QUARTER_SHIFT: u32 = 4; // 1 エントリあたり 16 brad\n\n";
+// rustfmt に触らせない。整形されると生成結果と差分が出て、
+// CI の「再生成しても変わらないか」チェックが落ちる。
+out += "#[rustfmt::skip]\n";
 out += "pub static SIN_QUARTER: [i16; QUARTER_ENTRIES + 1] = [\n";
 for (let i = 0; i < vals.length; i += 16) {
   out += "    " + vals.slice(i, i + 16).map((v) => String(v).padStart(4)).join(", ") + ",\n";
