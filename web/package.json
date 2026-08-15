@@ -1,0 +1,19 @@
+{
+  "name": "battle-sim-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "wasm": "wasm-pack build ../crates/sim-wasm --target web --out-dir ../../web/src/wasm --out-name sim",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  }
+}

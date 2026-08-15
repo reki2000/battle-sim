@@ -1,0 +1,160 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 書式
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 浮動小数点の混入チェック
+        run: ./tools/check_no_float.sh
+
+      - name: テスト
+        run: cargo test --workspace
+
+      - name: wasm ターゲットでビルドが通るか
+        run: cargo check -p sim-wasm --target wasm32-unknown-unknown
+
+  determinism:
+    name: 決定論
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 同一シードで結果が一致するか
+        run: |
+          cargo run --release -p sim-headless -- verify \
+            --soldiers 5000 --ticks 5000 --size 1500
+
+      - name: 三角関数テーブルが再生成しても変わらないか
+        run: |
+          node tools/gen_trig.mjs
+          git diff --exit-code crates/sim-math/src/trig_table.rs
+
+  bench:
+    name: 性能
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 目標は仕様 11 章 1 節。GitHub のランナーは性能が安定しないので、
+      # ここでは「明らかな回帰」を捕まえる閾値にしてある。
+      # 実測値の追跡はローカルとリリースビルドで行う。
+      - name: 20,000 体のベンチ
+        run: |
+          cargo run --release -p sim-headless -- bench \
+            --soldiers 20000 --ticks 500 --size 2000 | tee bench.json
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("bench.json"))
+          budget = 25.0  # ms/tick。20 Hz の実時間予算 50 ms の半分
+          print(f"{r['soldiers']} 体 / {r['ms_per_tick']} ms per tick")
+          if r["ms_per_tick"] > budget:
+              sys.exit(f"性能リグレッション: {r['ms_per_tick']} ms > {budget} ms")
+          PY
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: wasm-pack を入れる
+        run: cargo install wasm-pack --locked
+
+      - name: wasm をビルド
+        run: |
+          wasm-pack build crates/sim-wasm --target web \
+            --out-dir ../../web/src/wasm --out-name sim
+
+      - name: 依存を入れる
+        working-directory: web
+        run: npm ci
+
+      - name: 型チェックとバンドル
+        working-directory: web
+        run: npm run build
+
+  smoke:
+    name: ブラウザ疎通
+    runs-on: ubuntu-latest
+    needs: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: wasm-pack を入れる
+        run: cargo install wasm-pack --locked
+
+      - name: wasm をビルド
+        run: |
+          wasm-pack build crates/sim-wasm --target web \
+            --out-dir ../../web/src/wasm --out-name sim
+
+      - name: 依存を入れる
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: ビルドして全ズーム域を確認する
+        working-directory: web
+        run: |
+          npm run build
+          npx vite preview --port 4173 --strictPort &
+          npx wait-on http://localhost:4173 || sleep 5
+          npm run smoke
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-screenshots
+          path: web/smoke-out/
+          if-no-files-found: ignore

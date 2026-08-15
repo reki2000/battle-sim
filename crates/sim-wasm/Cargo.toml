@@ -1,0 +1,31 @@
+[package]
+name = "sim-wasm"
+description = "wasm-bindgen の境界。ロジックは持たない"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sim-core.workspace = true
+sim-math.workspace = true
+sim-terrain.workspace = true
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# wasm-opt は wasm-pack がビルド時に binaryen のリリースを GitHub から取得する。
+# ネットワークが制限された環境ではこれが失敗するため既定では無効にしてある。
+# サイズ最適化（仕様 01 章 6 節の目標 800 KB 未満）を効かせるときは、
+# binaryen を別途インストールしたうえで下の行を消すか、
+#   wasm-opt -Oz web/src/wasm/sim_bg.wasm -o web/src/wasm/sim_bg.wasm
+# をビルド後に手で走らせる。
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.dev]
+wasm-opt = false

@@ -1,0 +1,10 @@
+[package]
+name = "sim-terrain"
+description = "シードから決定論的に地形を生成する"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sim-math.workspace = true

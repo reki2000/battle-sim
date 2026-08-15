@@ -1,0 +1,12 @@
+[package]
+name = "sim-headless"
+description = "CLI。ベンチ・決定論検証・バランス回帰テスト用"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sim-core.workspace = true
+sim-math.workspace = true
+sim-terrain.workspace = true

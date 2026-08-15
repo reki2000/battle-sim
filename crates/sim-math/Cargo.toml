@@ -1,0 +1,14 @@
+[package]
+name = "sim-math"
+description = "決定論的な固定小数点数学。シミュレーションコアの土台"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints.rust]
+# シミュレーション系クレートでは浮動小数点を使わない（docs/spec/02-simulation-core.md）
+# CI では tools/check_no_float.sh でも機械的に検査する。
+missing_debug_implementations = "warn"
+
+[dependencies]
