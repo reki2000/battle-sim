@@ -713,8 +713,7 @@ fn classify_surface(t: &mut Terrain, p: &TerrainParams, dist_to_water: &[u16]) {
 
             // -FX_ONE..FX_ONE を 0..1000 の湿度に写す
             let humidity_noise = humidity_field[idx];
-            let base_humidity =
-                (((humidity_noise + sim_math::FX_ONE) as i32 * 500) / sim_math::FX_ONE) as i32;
+            let base_humidity = ((humidity_noise + sim_math::FX_ONE) * 500) / sim_math::FX_ONE;
 
             // 水域までの距離が近いほど加点する（0 距離で最大 +1000、上限距離で 0）
             let d = (dist_to_water[idx] as i32).min(PROXIMITY_RANGE);
@@ -890,9 +889,7 @@ pub fn validate(t: &Terrain) -> Result<(), String> {
         return Err(format!("通行可能セルが {ratio}% しかない"));
     }
 
-    if passable > 0 {
-        let largest = largest_connected_component(t);
-        let frag_ratio = largest * 100 / passable;
+    if let Some(frag_ratio) = (largest_connected_component(t) * 100).checked_div(passable) {
         if frag_ratio < 90 {
             return Err(format!(
                 "通行可能領域が分断されている: 最大連結成分は全体の {frag_ratio}%"
