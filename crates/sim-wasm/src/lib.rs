@@ -210,6 +210,50 @@ impl World {
     pub fn terrain_passability_ptr(&self) -> *const u8 {
         self.inner.terrain.passability.as_ptr()
     }
+
+    /// 水深グリッド（10 cm 単位、0 = 陸地）。仕様 08 章の水面描画で使う。
+    #[wasm_bindgen(js_name = terrainWaterPtr)]
+    pub fn terrain_water_ptr(&self) -> *const u8 {
+        self.inner.terrain.water.as_ptr()
+    }
+
+    /// 水域種別グリッド（[`sim_terrain::WaterKind`] の discriminant）。
+    #[wasm_bindgen(js_name = terrainWaterKindPtr)]
+    pub fn terrain_water_kind_ptr(&self) -> *const u8 {
+        self.inner.terrain.water_kind.as_ptr() as *const u8
+    }
+
+    /// 崖ビットマスクグリッド（[`sim_terrain::cliff_bits`]）。
+    /// 描画で崖面の側面クアッドを立てる方向の判定に使う。
+    #[wasm_bindgen(js_name = terrainCliffPtr)]
+    pub fn terrain_cliff_ptr(&self) -> *const u8 {
+        self.inner.terrain.cliff.as_ptr()
+    }
+
+    /// 会戦地候補の数。
+    #[wasm_bindgen(js_name = battleSiteCount)]
+    pub fn battle_site_count(&self) -> u32 {
+        self.inner.terrain.battle_sites.len() as u32
+    }
+
+    /// 会戦地候補の詳細（JSON 経由、低頻度呼び出し想定）。
+    #[wasm_bindgen(js_name = battleSites)]
+    pub fn battle_sites(&self) -> Vec<i32> {
+        // wasm-bindgen の型変換を単純に保つため、候補ごとに
+        // [x_m, y_m, score, passable_permille, asymmetry_permille, openness_permille, bottleneck_count]
+        // の平坦な配列として返す。
+        let mut out = Vec::with_capacity(self.inner.terrain.battle_sites.len() * 7);
+        for s in &self.inner.terrain.battle_sites {
+            out.push(s.x_m);
+            out.push(s.y_m);
+            out.push(s.score);
+            out.push(s.passable_permille as i32);
+            out.push(s.asymmetry_permille as i32);
+            out.push(s.openness_permille as i32);
+            out.push(s.bottleneck_count as i32);
+        }
+        out
+    }
 }
 
 /// パニック時に JS のコンソールへスタックトレースを出す。
@@ -265,5 +309,24 @@ mod tests {
         assert_eq!(w.terrain_size_m(), 600);
         assert_eq!(w.terrain_cell_m(), 2);
         assert_eq!(w.terrain_dim(), 300);
+    }
+
+    #[test]
+    fn water_cliff_and_battle_site_pointers_are_accessible() {
+        let w = World::new(7, 0, 1600, 700);
+        let n = (w.terrain_dim() * w.terrain_dim()) as usize;
+        assert!(!w.terrain_water_ptr().is_null());
+        assert!(!w.terrain_water_kind_ptr().is_null());
+        assert!(!w.terrain_cliff_ptr().is_null());
+
+        // このクレートは unsafe を禁止しているので生ポインタは辿らず、
+        // 背後の配列長が期待どおりか（境界を指しているか）を直接確認する
+        assert_eq!(w.inner.terrain.water.len(), n);
+        assert_eq!(w.inner.terrain.water_kind.len(), n);
+        assert_eq!(w.inner.terrain.cliff.len(), n);
+
+        let sites = w.battle_sites();
+        assert_eq!(sites.len() % 7, 0);
+        assert_eq!(sites.len() / 7, w.battle_site_count() as usize);
     }
 }

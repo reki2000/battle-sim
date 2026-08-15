@@ -111,6 +111,16 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       const height = new Int16Array(
         new Int16Array(memory.buffer, world.terrainHeightPtr(), cells),
       );
+      const water = new Uint8Array(
+        new Uint8Array(memory.buffer, world.terrainWaterPtr(), cells),
+      );
+      const waterKind = new Uint8Array(
+        new Uint8Array(memory.buffer, world.terrainWaterKindPtr(), cells),
+      );
+      const cliff = new Uint8Array(
+        new Uint8Array(memory.buffer, world.terrainCliffPtr(), cells),
+      );
+      const battleSites = Array.from(world.battleSites());
 
       post(
         {
@@ -124,9 +134,13 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
             sizeM: world.terrainSizeM(),
             surface: surface.buffer,
             height: height.buffer,
+            water: water.buffer,
+            waterKind: waterKind.buffer,
+            cliff: cliff.buffer,
+            battleSites,
           },
         },
-        [surface.buffer, height.buffer],
+        [surface.buffer, height.buffer, water.buffer, waterKind.buffer, cliff.buffer],
       );
 
       lastRealMs = performance.now();

@@ -1,29 +1,35 @@
 /**
  * エントリポイント。
  *
- * M0 の目的は「Rust → wasm → Worker → 描画」の経路が通っていることを
- * 目で確認できるようにすること。実装は Canvas2D の最小構成で、
- * M1（地形の WebGL2 描画）と M2（兵士のインスタンシング）で置き換わる。
+ * 地形は WebGL2（terrain-gl.ts）、兵士とオーバーレイは Canvas2D
+ * （soldiers.ts、透明な上乗せキャンバス）に分けている。兵士のインスタンス
+ * 描画を WebGL2 に統合するのは M2 の仕事（仕様 08 章 4 節）。
  */
 
 import { Camera } from "./render/iso";
-import { TerrainRenderer } from "./render/terrain";
+import { TerrainGlRenderer } from "./render/terrain-gl";
 import { SoldierRenderer } from "./render/soldiers";
+import { MinimapRenderer } from "./render/minimap";
 import { InterpolatedPositions, SnapshotView } from "./sim/snapshot";
+import type { TerrainData } from "./sim/terrain-data";
 import type { FromWorker, ToWorker } from "./sim/protocol";
 
 const TICK_MS = 50;
 
-const canvas = document.getElementById("view") as HTMLCanvasElement;
-const ctx = canvas.getContext("2d", { alpha: false })!;
+const terrainCanvas = document.getElementById("terrain-view") as HTMLCanvasElement;
+const overlayCanvas = document.getElementById("overlay-view") as HTMLCanvasElement;
+const overlayCtx = overlayCanvas.getContext("2d", { alpha: true })!;
 const hud = document.getElementById("hud") as HTMLDivElement;
 
 const cam = new Camera();
-const terrainRenderer = new TerrainRenderer();
+const terrainGl = new TerrainGlRenderer(terrainCanvas);
 const soldierRenderer = new SoldierRenderer();
+const minimap = new MinimapRenderer();
 const snapshot = new SnapshotView();
 const interp = new InterpolatedPositions();
+let dpr = 1;
 
+let terrainData: TerrainData | null = null;
 let lastSnapshotAt = performance.now();
 let simTick = 0;
 let soldierCount = 0;
@@ -51,13 +57,26 @@ worker.onmessage = (ev: MessageEvent<FromWorker>) => {
 
   if (msg.type === "ready") {
     const t = msg.terrain;
-    terrainRenderer.setTerrain({
+    terrainData = {
       dim: t.dim,
       cellM: t.cellM,
       sizeM: t.sizeM,
       surface: new Uint8Array(t.surface),
       height: new Int16Array(t.height),
-    });
+      water: new Uint8Array(t.water),
+      waterKind: new Uint8Array(t.waterKind),
+      cliff: new Uint8Array(t.cliff),
+    };
+    terrainGl.setTerrain(terrainData);
+    minimap.setTerrain(terrainData);
+
+    const siteCount = t.battleSites.length / 7;
+    if (siteCount > 0) {
+      const best = t.battleSites.slice(0, 7);
+      console.log(
+        `会戦地候補 ${siteCount} 件。最上位: (${best[0]}, ${best[1]}) score=${best[2]}`,
+      );
+    }
 
     cam.worldSizeM = t.sizeM;
     cam.centerX = t.sizeM / 2;
@@ -116,29 +135,30 @@ worker.onmessage = (ev: MessageEvent<FromWorker>) => {
 
 let dragging = false;
 let lastPointer = { x: 0, y: 0 };
+const viewStack = document.getElementById("view-stack") as HTMLDivElement;
 
-canvas.addEventListener("pointerdown", (e) => {
+viewStack.addEventListener("pointerdown", (e) => {
   dragging = true;
   lastPointer = { x: e.clientX, y: e.clientY };
-  canvas.setPointerCapture(e.pointerId);
+  viewStack.setPointerCapture(e.pointerId);
 });
 
-canvas.addEventListener("pointerup", (e) => {
+viewStack.addEventListener("pointerup", (e) => {
   dragging = false;
-  canvas.releasePointerCapture(e.pointerId);
+  viewStack.releasePointerCapture(e.pointerId);
 });
 
-canvas.addEventListener("pointermove", (e) => {
+viewStack.addEventListener("pointermove", (e) => {
   if (!dragging) return;
   cam.panByScreen(e.clientX - lastPointer.x, e.clientY - lastPointer.y);
   lastPointer = { x: e.clientX, y: e.clientY };
 });
 
-canvas.addEventListener(
+viewStack.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
-    const rect = canvas.getBoundingClientRect();
+    const rect = viewStack.getBoundingClientRect();
     // 対数ズーム。1 ノッチで約 1.15 倍（仕様 08 章 2.1）
     const step = -Math.sign(e.deltaY) * Math.log2(1.15);
     cam.zoomAt(e.clientX - rect.left, e.clientY - rect.top, step);
@@ -199,13 +219,18 @@ function setSpeed(v: number): void {
 // ── 描画ループ ──────────────────────────────────────────
 
 function resize(): void {
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.floor(window.innerWidth * dpr);
-  canvas.height = Math.floor(window.innerHeight * dpr);
-  canvas.style.width = `${window.innerWidth}px`;
-  canvas.style.height = `${window.innerHeight}px`;
-  cam.viewW = canvas.width;
-  cam.viewH = canvas.height;
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.floor(window.innerWidth * dpr);
+  const h = Math.floor(window.innerHeight * dpr);
+
+  for (const c of [terrainCanvas, overlayCanvas]) {
+    c.width = w;
+    c.height = h;
+    c.style.width = `${window.innerWidth}px`;
+    c.style.height = `${window.innerHeight}px`;
+  }
+  cam.viewW = w;
+  cam.viewH = h;
   cam.clampZoom();
 }
 
@@ -223,18 +248,31 @@ function frame(now: number): void {
     fpsFrames = 0;
   }
 
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = "#0d1014";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  terrainGl.draw(cam);
 
-  terrainRenderer.draw(ctx, cam);
+  overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
   // 20 Hz のスナップショット間を補間する。倍速時は補間しない
   const alpha =
     speed >= 8 ? 1 : Math.min(1, (now - lastSnapshotAt) / (TICK_MS / speed));
-  soldierRenderer.draw(ctx, cam, snapshot, interp, alpha, (x, y) =>
-    terrainRenderer.heightAt(x, y),
-  );
+  if (terrainData) {
+    const td = terrainData;
+    soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, (x, y) =>
+      terrainGl.heightAt(td, x, y),
+    );
+  }
+
+  if (terrainData) {
+    minimap.draw(
+      overlayCtx,
+      overlayCanvas.width,
+      overlayCanvas.height,
+      dpr,
+      cam,
+      snapshot,
+      interp,
+    );
+  }
 
   const lodNames = ["至近", "戦術", "部隊", "会戦", "戦域"];
   hud.textContent =

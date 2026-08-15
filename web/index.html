@@ -18,11 +18,18 @@
         background: #0d1014;
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       }
-      #view {
+      #terrain-view,
+      #overlay-view {
         display: block;
+        position: absolute;
+        top: 0;
+        left: 0;
         cursor: grab;
       }
-      #view:active {
+      #overlay-view {
+        pointer-events: none;
+      }
+      #view-stack:active #overlay-view {
         cursor: grabbing;
       }
       #hud {
@@ -56,7 +63,10 @@
     </style>
   </head>
   <body>
-    <canvas id="view"></canvas>
+    <div id="view-stack">
+      <canvas id="terrain-view"></canvas>
+      <canvas id="overlay-view"></canvas>
+    </div>
     <div id="hud">起動中…</div>
     <div id="help">
 ドラッグ  パン

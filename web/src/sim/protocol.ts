@@ -13,6 +13,18 @@ export interface TerrainPayload {
   surface: ArrayBuffer;
   /** Int16Array（標高 cm）の中身 */
   height: ArrayBuffer;
+  /** Uint8Array（水深、10 cm 単位）の中身 */
+  water: ArrayBuffer;
+  /** Uint8Array（WaterKind）の中身 */
+  waterKind: ArrayBuffer;
+  /** Uint8Array（崖ビットマスク）の中身 */
+  cliff: ArrayBuffer;
+  /**
+   * 会戦地候補。1 件あたり
+   * [xM, yM, score, passablePermille, asymmetryPermille, opennessPermille, bottleneckCount]
+   * の平坦な配列（sim-wasm の battleSites() と同じレイアウト）。
+   */
+  battleSites: number[];
 }
 
 export type ToWorker =
