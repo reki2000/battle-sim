@@ -9,6 +9,9 @@
 
 M3 では編成・陣形のプリセットを追加した。読み込み機構（`sim-data` クレート）は
 まだ未実装のため、シミュレーション実行時の既定値は Rust 側にも保持している。
+人物描画については先行して `visual-profiles/*.toml` を正本とし、スプライト生成
+スキルが検証済みの実行時 JSON へ変換する。ここには時代・地域・兵科・行動の意味を
+置き、服装や武具の史料調査結果は `art/sprites/` 側へ分離する。
 
 | 仕様上のファイル | 現在の置き場所 |
 |---|---|
@@ -16,6 +19,7 @@ M3 では編成・陣形のプリセットを追加した。読み込み機構�
 | `qualities.toml` | `crates/sim-core/src/lib.rs` の `deploy_block` |
 | `formations.toml` | `crates/sim-core/src/organization.rs` の `formation_def` |
 | `factions/medieval_western.toml` | M3 のプリセットデータ |
+| `visual-profiles/medieval_western.toml` | 14世紀ヨーロッパの兵科・行動・画像再生契約 |
 | `morale.toml` | `crates/sim-core/src/soldiers.rs` の初期士気 |
 
 M3（編成）で `sim-data` を追加し、以下を順に外へ出す。
@@ -34,6 +38,7 @@ data/
 ├── terrain_surfaces.toml
 ├── engineer_tasks.toml
 ├── sprite_sets.toml
+├── visual-profiles/
 ├── factions/
 └── scenarios/
 ```

@@ -38,6 +38,7 @@ export type ToWorker =
       spacingMm: number;
       faction: number;
       unitId: number;
+      troopType: number;
       seedSalt: number;
     }
   | { type: "setFactionGoal"; faction: number; xM: number; yM: number }

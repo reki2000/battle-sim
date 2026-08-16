@@ -15,3 +15,6 @@ web/src/wasm/
 *.swp
 .idea/
 .vscode/
+
+# この作業環境だけのツール起動メモ（マシン固有なのでコミットしない）
+/TOOLS.md

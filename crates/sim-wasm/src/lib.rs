@@ -100,9 +100,10 @@ impl World {
         spacing_mm: i32,
         faction: u8,
         unit_id: u16,
+        troop_type: u16,
         seed_salt: u32,
     ) {
-        sim_core::deploy_block(
+        sim_core::deploy_block_typed(
             &mut self.inner,
             Vec2Fx::new(fx(x_m), fx(y_m)),
             files,
@@ -110,6 +111,7 @@ impl World {
             spacing_mm,
             faction,
             unit_id,
+            troop_type,
             seed_salt,
         );
     }
@@ -462,7 +464,7 @@ mod tests {
     #[test]
     fn world_can_be_created_and_ticked() {
         let mut w = World::new(7, 0, 600, 200);
-        w.deploy_block(100, 100, 5, 5, 900, 0, 0, 1);
+        w.deploy_block(100, 100, 5, 5, 900, 0, 0, 0, 1);
         assert_eq!(w.soldier_count(), 25);
         w.set_faction_goal(0, 300, 300);
         for _ in 0..20 {
@@ -475,7 +477,7 @@ mod tests {
     #[test]
     fn snapshot_length_matches_soldier_count() {
         let mut w = World::new(7, 0, 600, 200);
-        w.deploy_block(100, 100, 4, 4, 900, 0, 0, 1);
+        w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
         w.write_snapshot();
         assert_eq!(
             w.soldiers_byte_len(),
@@ -486,7 +488,7 @@ mod tests {
     #[test]
     fn state_hash_halves_reconstruct_the_full_value() {
         let mut w = World::new(7, 0, 600, 200);
-        w.deploy_block(100, 100, 3, 3, 900, 0, 0, 1);
+        w.deploy_block(100, 100, 3, 3, 900, 0, 0, 0, 1);
         w.tick();
         let lo = w.state_hash_lo() as u64;
         let hi = w.state_hash_hi() as u64;

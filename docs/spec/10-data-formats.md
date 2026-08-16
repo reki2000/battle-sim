@@ -19,6 +19,7 @@ data/
 ├── terrain_surfaces.toml  地表タイプの効果
 ├── engineer_tasks.toml    工兵タスクの工数と効果
 ├── sprite_sets.toml       スプライト生成の定義
+├── visual-profiles/       時代・地域・兵科・行動の描画契約（シミュレーター正本）
 ├── factions/
 │   ├── english_1415.toml
 │   ├── french_1415.toml
@@ -176,6 +177,26 @@ attr_bias = { aggression = +35, bravery = +25, discipline = -15 }
 tactics = { charge_start_m = 200, prefer_flank = true, regroup_after_charge = true }
 sprite_set = "knight_mounted"
 ```
+
+### 4.1 人物画像の責務境界
+
+`data/visual-profiles/<id>.toml` はシミュレーターが所有し、次だけを定義する。
+
+- 時代・地域
+- 必要な兵科ロール、説明、安定した `troop_type_index`
+- ロールごとに必要な画像行動
+- `State` 全値から画像行動への対応
+- 8行の再生方式（通常行動 `cycle: 1x8`、待機 `variant-loop: 4x2`、
+  死亡 `static-variants: 8x1`）
+
+服装、染色、武器寸法、防具構造、持ち手、装具の左右などはシミュレーションの
+判断ロジックではないため、このファイルへ記述しない。スプライト生成スキルが
+時代・地域・ロール説明に沿ってWeb上の史料を調査し、出典付き `research.json` と
+ImageGen用 `role.json` を `art/sprites/sets/` に作る。
+
+スキルは同時に `web/public/assets/sprites/v2/profiles/<id>.json` を生成する。描画側は
+スナップショットの `troop_type` と `state`、この実行時プロファイル、v2 manifestを
+結合してシートを選ぶ。画像生成側から兵科や状態の意味を追加してはならない。
 
 ## 5. 陣形
 

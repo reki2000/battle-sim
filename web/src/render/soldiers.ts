@@ -5,11 +5,10 @@
  * クアッドは 1 枚だけを共有し、位置・標高・向き・スプライト番号・陣営・状態を
  * 16 バイトのインスタンス属性へ詰めて 1 ドローコールで送る。
  *
- * 人物画像は ImageGen で事前生成した PNG をテクスチャとして読み込む。現在の
- * アセットは 1 枚絵だが、packed の facing / sprite フィールドとシェーダの
- * アトラス分岐は将来の「役職 × 行動 × 8方向 × フレーム」スプライトシートへ
- * 差し替えられるようにしてある。WebGL2 が使えない環境では従来の Canvas2D
- * 簡易描画へフォールバックする。
+ * 人物画像は ImageGen で事前生成した PNG をテクスチャとして読み込む。近距離は
+ * v2 runtime profile と manifest により「兵科 × 状態→行動 × 8方向 × 8スロット」
+ * を選び、可視なシート単位で描画する。v2シートが未生成なら既存の1枚絵へ、
+ * WebGL2が使えなければ Canvas2D の簡易描画へフォールバックする。
  */
 
 import { createContext, createProgram } from "./gl";
@@ -17,6 +16,8 @@ import { Camera, Lod, PX_PER_M, TILE_H, TILE_M, Z_SCALE } from "./iso";
 import type { InterpolatedPositions, SnapshotView } from "../sim/snapshot";
 import { SoldierState } from "../sim/snapshot";
 import { loadSoldierSprite } from "./generated-assets";
+import { loadSpriteRuntime } from "./sprite-atlas";
+import type { SpriteRuntime } from "./sprite-atlas";
 
 /** 陣営色。色覚多様性に配慮し、赤/青ではなく青/橙にする（仕様 09 章 9 節）。 */
 const FACTION_COLORS = ["#3d7ab8", "#d98032"];
@@ -38,16 +39,15 @@ uniform float u_zScale;
 uniform float u_worldSize;
 uniform float u_spriteWidth;
 uniform float u_spriteHeight;
+uniform float u_sheetColumns;
+uniform float u_sheetRows;
 
 out vec2 v_uv;
 flat out uint v_packed;
 
 void main() {
-  float facing = float(i_packed & 255u);
-  float sprite = float((i_packed >> 8u) & 4095u);
-  // 現在の 1 枚絵アセットでは未使用だが、値を読むことでアトラスの
-  // facing/sprite インデックスを後から同じバッファのまま利用できる。
-  float atlasOffset = facing * 0.0 + sprite * 0.0;
+  float direction = float(i_packed & 255u);
+  float frame = float((i_packed >> 8u) & 4095u);
 
   float sx = (i_pos.x - i_pos.y) * u_pxPerM * u_zoom - u_camOffset.x
     + u_viewSize.x * 0.5;
@@ -61,8 +61,11 @@ void main() {
   // x+y の昇順を GPU 深度へ写す。兵士キャンバス内の CPU ソートを不要にし、
   // 地形と同じワールド→スクリーン式で座標を揃える。
   float depth = clamp((i_pos.x + i_pos.y) / (2.0 * u_worldSize), 0.0, 1.0);
-  gl_Position = vec4(ndc, depth * 2.0 - 1.0 + atlasOffset, 1.0);
-  v_uv = vec2(a_quad.x, 1.0 - a_quad.y);
+  gl_Position = vec4(ndc, depth * 2.0 - 1.0, 1.0);
+  v_uv = vec2(
+    (direction + a_quad.x) / u_sheetColumns,
+    (frame + 1.0 - a_quad.y) / u_sheetRows
+  );
   v_packed = i_packed;
 }
 `;
@@ -85,20 +88,20 @@ void main() {
   uint state = (v_packed >> 24u) & 255u;
   vec4 factionColor = faction == 1u ? u_faction1 : u_faction0;
 
-  // Downed / Dead はスプライトを残しつつ、横倒しの暗い個体として表示する。
-  // シミュレーション上の個体を描画から間引かないという M2 の原則を守る。
-  if (state >= 12u) {
-    float edge = smoothstep(0.0, 0.18, v_uv.y) * smoothstep(1.0, 0.82, v_uv.y);
-    outColor = vec4(factionColor.rgb * 0.48, 0.68 * edge);
-    return;
-  }
-
   // L2/L3/L4 は小さなクアッド／点に落とす。状態は色の明度に反映し、
   // 画面を遠ざけても状態と陣営の違いを失わないようにする。
   vec3 dotColor = factionColor.rgb;
   if (state == 8u || state == 9u) dotColor = mix(dotColor, vec3(0.92, 0.48, 0.20), 0.35);
   if (state == 10u) dotColor = mix(dotColor, vec3(0.35, 0.86, 0.52), 0.28);
-  vec4 dot = vec4(dotColor, 0.96);
+  float dotAlpha = 0.96;
+  if (state >= 12u) {
+    // 遠距離では Downed / Dead を横倒しの暗い個体として残す。近距離では
+    // manifest の dead 静止バリエーションへ滑らかにクロスフェードする。
+    float edge = smoothstep(0.0, 0.18, v_uv.y) * smoothstep(1.0, 0.82, v_uv.y);
+    dotColor = factionColor.rgb * 0.48;
+    dotAlpha = 0.68 * edge;
+  }
+  vec4 dot = vec4(dotColor, dotAlpha);
 
   if (u_dotBlend >= 0.999) {
     outColor = dot;
@@ -114,6 +117,7 @@ void main() {
   // 2陣営目だけをシェーダ内でパレット寄せする。将来の本格的な
   // パレット置換でも、このインスタンス属性と描画経路はそのまま使える。
   if (faction == 1u) sprite.rgb = mix(sprite.rgb, factionColor.rgb, 0.28);
+  if (state >= 12u) sprite.rgb *= 0.62;
 
   // 隣接 LOD 間はクロスフェード帯（px/m で ±15%）を設け、両方を描いて
   // アルファでブレンドする（仕様 08 章 2.3 節）。
@@ -142,12 +146,16 @@ export class SoldierRenderer {
     spriteWidth: WebGLUniformLocation;
     spriteHeight: WebGLUniformLocation;
     dotBlend: WebGLUniformLocation;
+    sheetColumns: WebGLUniformLocation;
+    sheetRows: WebGLUniformLocation;
     spriteTex: WebGLUniformLocation;
     faction0: WebGLUniformLocation;
     faction1: WebGLUniformLocation;
   } | null;
   private instanceBytes = new ArrayBuffer(0);
   private assetsReady = false;
+  private spriteRuntime: SpriteRuntime | null = null;
+  private readonly v2Textures = new Map<string, WebGLTexture>();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -192,6 +200,8 @@ export class SoldierRenderer {
       spriteWidth: location("u_spriteWidth"),
       spriteHeight: location("u_spriteHeight"),
       dotBlend: location("u_dotBlend"),
+      sheetColumns: location("u_sheetColumns"),
+      sheetRows: location("u_sheetRows"),
       spriteTex: location("u_spriteTex"),
       faction0: location("u_faction0"),
       faction1: location("u_faction1"),
@@ -247,11 +257,30 @@ export class SoldierRenderer {
 
   async loadAssets(): Promise<void> {
     if (!this.gl || !this.spriteTexture) return;
-    const sprite = await loadSoldierSprite();
+    const [sprite, runtime] = await Promise.all([
+      loadSoldierSprite(),
+      loadSpriteRuntime().catch((error) => {
+        console.warn("v2スプライト設定を読み込めないため従来画像を使います", error);
+        return null;
+      }),
+    ]);
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this.spriteTexture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sprite);
+    this.spriteRuntime = runtime;
+    for (const sheet of runtime?.sheets ?? []) {
+      const texture = gl.createTexture();
+      if (!texture) throw new Error(`v2スプライト用テクスチャを作成できません: ${sheet.url}`);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sheet.image);
+      this.v2Textures.set(sheet.url, texture);
+    }
     this.assetsReady = true;
   }
 
@@ -261,13 +290,14 @@ export class SoldierRenderer {
     snap: SnapshotView,
     interp: InterpolatedPositions,
     alpha: number,
+    elapsedSeconds: number,
     groundHeight: (x: number, y: number) => number,
   ): void {
     if (!this.gl || !this.program || !this.vao || !this.instanceBuffer || !this.uniform) {
       this.drawFallback(fallbackCtx, cam, snap, interp, alpha, groundHeight);
       return;
     }
-    this.drawInstanced(cam, snap, interp, alpha, groundHeight);
+    this.drawInstanced(cam, snap, interp, alpha, elapsedSeconds, groundHeight);
   }
 
   private drawInstanced(
@@ -275,6 +305,7 @@ export class SoldierRenderer {
     snap: SnapshotView,
     interp: InterpolatedPositions,
     alpha: number,
+    elapsedSeconds: number,
     groundHeight: (x: number, y: number) => number,
   ): void {
     const gl = this.gl!;
@@ -320,14 +351,27 @@ export class SoldierRenderer {
       return;
     }
 
-    if (this.instanceBytes.byteLength < n * INSTANCE_STRIDE) {
-      this.instanceBytes = new ArrayBuffer(n * INSTANCE_STRIDE);
-    }
-    const data = new DataView(this.instanceBytes);
     const margin = Math.max(spriteWidth, spriteHeight) * 1.5;
     // 少数個体では毎個体の射影判定の方が高くつく。GPU は画面外のクアッドを
     // そのままクリップできるため、5,000 体規模でだけ CPU カリングを有効にする。
     const shouldCull = n > 3000;
+    type DrawGroup = {
+      texture: WebGLTexture;
+      columns: number;
+      rows: number;
+      indices: number[];
+    };
+    const groups = new Map<string, DrawGroup>();
+    const fallbackGroup = (): DrawGroup => {
+      const key = "__fallback__";
+      let group = groups.get(key);
+      if (!group) {
+        group = { texture: this.spriteTexture!, columns: 1, rows: 1, indices: [] };
+        groups.set(key, group);
+      }
+      return group;
+    };
+    const useSprites = this.assetsReady && dotBlend < 0.999;
     let visibleCount = 0;
     for (let i = 0; i < n; i++) {
       const x = interp.x(i, alpha);
@@ -345,16 +389,22 @@ export class SoldierRenderer {
         }
       }
 
-      const offset = visibleCount * INSTANCE_STRIDE;
-      data.setFloat32(offset, x, true);
-      data.setFloat32(offset + 4, y, true);
-      data.setFloat32(offset + 8, z, true);
-      const facing = Math.round((snap.facing(i) / 65536) * 255) & 0xff;
-      const spriteIndex = 0;
-      const faction = snap.unitId(i) % 2;
-      const state = snap.state(i) & 0xff;
-      const packed = facing | (spriteIndex << 8) | ((faction & 0x0f) << 20) | (state << 24);
-      data.setUint32(offset + 12, packed >>> 0, true);
+      if (!useSprites) {
+        fallbackGroup().indices.push(i);
+      } else {
+        const resolved = this.spriteRuntime?.resolve(snap.troopType(i), snap.state(i));
+        const texture = resolved ? this.v2Textures.get(resolved.sheet.url) : undefined;
+        if (!resolved || !texture) {
+          fallbackGroup().indices.push(i);
+        } else {
+          let group = groups.get(resolved.sheet.url);
+          if (!group) {
+            group = { texture, columns: 8, rows: 8, indices: [] };
+            groups.set(resolved.sheet.url, group);
+          }
+          group.indices.push(i);
+        }
+      }
       visibleCount++;
     }
 
@@ -366,8 +416,6 @@ export class SoldierRenderer {
       return;
     }
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(this.instanceBytes, 0, visibleCount * INSTANCE_STRIDE), gl.DYNAMIC_DRAW);
     gl.bindVertexArray(vao);
     gl.useProgram(program);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
@@ -389,8 +437,56 @@ export class SoldierRenderer {
     gl.uniform4f(u.faction1, 0.851, 0.502, 0.196, 1);
 
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.spriteTexture);
-    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, visibleCount);
+    for (const group of groups.values()) {
+      const count = group.indices.length;
+      if (this.instanceBytes.byteLength < count * INSTANCE_STRIDE) {
+        this.instanceBytes = new ArrayBuffer(count * INSTANCE_STRIDE);
+      }
+      const data = new DataView(this.instanceBytes);
+      for (let slot = 0; slot < count; slot++) {
+        const i = group.indices[slot]!;
+        const offset = slot * INSTANCE_STRIDE;
+        const x = interp.x(i, alpha);
+        const y = interp.y(i, alpha);
+        data.setFloat32(offset, x, true);
+        data.setFloat32(offset + 4, y, true);
+        data.setFloat32(offset + 8, groundHeight(x, y), true);
+
+        let direction = 0;
+        let frame = 0;
+        const resolved = group.columns === 8
+          ? this.spriteRuntime?.resolve(snap.troopType(i), snap.state(i))
+          : null;
+        if (resolved) {
+          direction = Math.round((snap.facing(i) / 65536) * 8) & 7;
+          const stable = Math.imul(i + 1, 0x9e3779b1) >>> 0;
+          if (resolved.playback.mode === "variant-loop") {
+            const variant = stable % resolved.playback.variantCount;
+            const phase = Math.floor(elapsedSeconds * resolved.playback.framesPerSecond) %
+              resolved.playback.framesPerVariant;
+            frame = variant * resolved.playback.framesPerVariant + phase;
+          } else if (resolved.playback.mode === "static-variants") {
+            frame = stable % resolved.playback.variantCount;
+          } else {
+            frame = (Math.floor(elapsedSeconds * resolved.playback.framesPerSecond) + (stable & 7)) & 7;
+          }
+        }
+        const faction = snap.faction(i) & 0x0f;
+        const state = snap.state(i) & 0xff;
+        const packed = direction | (frame << 8) | (faction << 20) | (state << 24);
+        data.setUint32(offset + 12, packed >>> 0, true);
+      }
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Uint8Array(this.instanceBytes, 0, count * INSTANCE_STRIDE),
+        gl.DYNAMIC_DRAW,
+      );
+      gl.uniform1f(u.sheetColumns, group.columns);
+      gl.uniform1f(u.sheetRows, group.rows);
+      gl.bindTexture(gl.TEXTURE_2D, group.texture);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    }
     gl.bindVertexArray(null);
     this.drawn = visibleCount;
   }
@@ -414,7 +510,7 @@ export class SoldierRenderer {
       const y = interp.y(i, alpha);
       const p = cam.worldToScreen(x, y, groundHeight(x, y));
       if (p.sx < -margin || p.sy < -margin || p.sx > cam.viewW + margin || p.sy > cam.viewH + margin) continue;
-      const faction = snap.unitId(i) % FACTION_COLORS.length;
+      const faction = snap.faction(i) % FACTION_COLORS.length;
       const state = snap.state(i);
       ctx.fillStyle = state === SoldierState.Dead || state === SoldierState.Downed
         ? "rgba(60,40,40,0.65)"
