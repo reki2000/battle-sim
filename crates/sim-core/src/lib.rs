@@ -5,12 +5,14 @@
 //!
 //! M0〜M2 の移動基盤に加え、M3 の指揮ツリー・命令・陣形、M4 の白兵戦・負傷・
 //! 士気、M5 の騎兵突撃、M6 の工兵（作業タスク・野戦築城・地形改修・矢の補給・
-//! 負傷者回収）を実装する（`docs/spec/12-roadmap.md`）。
+//! 負傷者回収）、M7 の指揮官 AI（Blackboard・戦況評価・Objective・会戦プラン・
+//! 独断専行・判断ログ）を実装する（`docs/spec/12-roadmap.md`）。
 
 #![forbid(unsafe_code)]
 
 pub mod cavalry;
 pub mod combat;
+pub mod commander_ai;
 pub mod engineering;
 pub mod organization;
 pub mod pathing;
@@ -32,7 +34,9 @@ use structures::StructureSystem;
 /// シミュレーションのロジックバージョン。リプレイの互換性判定に使う。
 ///
 /// M6 で工兵（野戦築城・地形改修・矢の補給・負傷者回収）を追加したため 3 → 4。
-pub const SIM_VERSION: u32 = 4;
+/// M7 で指揮官 AI（Blackboard・戦況評価・Objective・会戦プラン・独断専行）を
+/// 追加したため 4 → 5。
+pub const SIM_VERSION: u32 = 5;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -238,6 +242,42 @@ impl World {
     }
 
     // ------------------------------------------------------------------
+    // M7: 指揮官 AI（アーキタイプ・戦況評価・判断ログ）
+    // ------------------------------------------------------------------
+
+    /// この指揮官の性格をアーキタイプから生成して設定する（仕様 05 章 5.5 節）。
+    /// `archetype` は `commander_ai::ARCHETYPES` の index。
+    pub fn set_commander_archetype(
+        &mut self,
+        node: organization::NodeId,
+        archetype: usize,
+        seed_salt: u32,
+    ) {
+        commander_ai::set_archetype(&mut self.command, node, archetype, self.seed, seed_salt);
+    }
+
+    /// この指揮官の性格を直接設定する（アーキタイプを経由しない）。
+    pub fn set_commander_attrs(
+        &mut self,
+        node: organization::NodeId,
+        attrs: organization::CommanderAttrs,
+    ) {
+        self.command.set_commander_attrs(node, attrs);
+    }
+
+    /// この指揮官が実際に認識している戦況評価と、地上の実際の戦況を並べて返す
+    /// （認識 vs 実際、仕様 12 章 M7 の受け入れ条件）。
+    pub fn commander_perceived_vs_true(
+        &self,
+        node: organization::NodeId,
+    ) -> (
+        organization::SituationAssessment,
+        organization::SituationAssessment,
+    ) {
+        commander_ai::perceived_vs_true(node, &self.command, &self.terrain, self.seed, self.tick)
+    }
+
+    // ------------------------------------------------------------------
     // M6: 工兵タスク・野戦築城・地形改修・補給・負傷者回収
     // ------------------------------------------------------------------
 
@@ -336,6 +376,18 @@ impl World {
     pub fn tick(&mut self) {
         self.command
             .tick(&mut self.soldiers, &self.terrain, self.tick);
+        // M7 の指揮官 AI（Blackboard の更新、Objective・会戦プランの選択と
+        // それに基づく命令の発令、独断専行の判定）。`command.tick` の直後に
+        // 置くことで、`NodeStats` が最新（このメソッド呼び出し時点）であり、
+        // かつ独断専行の即時適用が同じ tick の `formation_goals` に反映される。
+        commander_ai::tick(
+            &mut self.command,
+            &mut self.soldiers,
+            &self.terrain,
+            &self.combat,
+            self.seed,
+            self.tick,
+        );
         self.command
             .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
@@ -1213,6 +1265,182 @@ mod tests {
         assert!(
             damage_with_stakes < damage_without_stakes,
             "杭列があっても突撃の損害が減っていない: with={damage_with_stakes} without={damage_without_stakes}"
+        );
+    }
+
+    /// M7 の「軍 1 個」テストシナリオ: ルート（Unit なし）の下に 2 個の葉部隊、
+    /// 反対陣営には敵の葉部隊が 1 個。
+    struct ArmyScenario {
+        world: World,
+        root: organization::NodeId,
+        children: [organization::NodeId; 2],
+    }
+
+    fn decent_attrs() -> Attrs {
+        Attrs::new(140, 140, 140, 140, 140, 140, 140, 150, 130, 120, 150, 140)
+    }
+
+    fn build_army_scenario() -> ArmyScenario {
+        build_army_scenario_with(6, 10)
+    }
+
+    /// `own_per_child`: 自軍の葉部隊 1 個あたりの人数。`enemy_count`: 敵部隊の人数。
+    /// アーキタイプの差が Objective の選択を左右するかを見るテストでは、
+    /// 兵力比を拮抗させたり不利にしたりして分岐点に乗せる。
+    fn build_army_scenario_with(own_per_child: u32, enemy_count: u32) -> ArmyScenario {
+        let mut w = small_world();
+        let root_commander = w.spawn(Vec2Fx::new(fx(110), fx(90)), 0, 0, 0, decent_attrs(), 0);
+        let root = w.add_command_node(None, 0, 0, root_commander, vec![], None);
+
+        let mut children = [0u32; 2];
+        for (k, x) in [fx(90), fx(130)].into_iter().enumerate() {
+            let commander = w.spawn(Vec2Fx::new(x, fx(100)), 0, 0, 0, decent_attrs(), 0);
+            let mut soldiers = vec![commander];
+            for j in 1..own_per_child {
+                soldiers.push(w.spawn(
+                    Vec2Fx::new(x + fx(j as i32), fx(100)),
+                    0,
+                    0,
+                    0,
+                    decent_attrs(),
+                    0,
+                ));
+            }
+            let unit = organization::Unit {
+                soldiers,
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(x, fx(100)),
+                formation_facing: 0,
+                ranks: 1,
+                file_spacing: fx_from_mm(800),
+                rank_spacing: fx_from_mm(800),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(x, fx(100)),
+                pursuit_leash: None,
+            };
+            children[k] = w.add_command_node(Some(root), 1, 0, commander, vec![], Some(unit));
+        }
+
+        let enemy_commander = w.spawn(Vec2Fx::new(fx(110), fx(300)), 0, 0, 1, decent_attrs(), 0);
+        let mut enemy_soldiers = vec![enemy_commander];
+        for j in 1..enemy_count {
+            enemy_soldiers.push(w.spawn(
+                Vec2Fx::new(fx(105 + j as i32), fx(300)),
+                sim_math::brad_from_deg(180),
+                0,
+                1,
+                decent_attrs(),
+                0,
+            ));
+        }
+        let enemy_unit = organization::Unit {
+            soldiers: enemy_soldiers,
+            troop_type: 0,
+            formation: organization::FORMATION_LINE,
+            formation_origin: Vec2Fx::new(fx(110), fx(300)),
+            formation_facing: sim_math::BRAD_HALF as u16,
+            ranks: 1,
+            file_spacing: fx_from_mm(800),
+            rank_spacing: fx_from_mm(800),
+            banner: None,
+            formation_change: None,
+            path: Vec::new(),
+            path_final: Vec2Fx::new(fx(110), fx(300)),
+            pursuit_leash: None,
+        };
+        w.add_command_node(None, 1, 1, enemy_commander, vec![], Some(enemy_unit));
+
+        ArmyScenario {
+            world: w,
+            root,
+            children,
+        }
+    }
+
+    /// 仕様 12 章 M7 の受け入れ条件「どの指揮官を選んでも『なぜその判断をしたか』が
+    /// スコア内訳で見られる」。
+    #[test]
+    fn commander_decisions_are_logged_with_a_score_breakdown() {
+        let mut scenario = build_army_scenario();
+        for _ in 0..300 {
+            scenario.world.tick();
+        }
+        let root_node = scenario.world.command.node(scenario.root).unwrap();
+        let record = root_node
+            .decision_log
+            .latest()
+            .expect("ルート指揮官の判断が記録されていない");
+        assert!(!record.breakdown.is_empty(), "スコア内訳が空");
+        assert!(!record.candidates.is_empty(), "候補が空");
+        assert!(
+            record
+                .candidates
+                .iter()
+                .any(|(name, _)| *name == record.chosen),
+            "選ばれた候補が候補一覧に含まれていない"
+        );
+    }
+
+    /// 仕様 12 章 M7 の受け入れ条件「tactical_skill の低い指揮官が戦況を誤認し、
+    /// それが UI で『認識 vs 実際』として見える」。
+    #[test]
+    fn low_tactical_skill_commander_misjudges_the_situation() {
+        let mut scenario = build_army_scenario();
+        scenario.world.set_commander_attrs(
+            scenario.root,
+            organization::CommanderAttrs {
+                tactical_skill: 10,
+                ..Default::default()
+            },
+        );
+        for _ in 0..300 {
+            scenario.world.tick();
+        }
+        let (perceived, actual) = scenario.world.commander_perceived_vs_true(scenario.root);
+        assert_ne!(
+            perceived.force_ratio_permille, actual.force_ratio_permille,
+            "スキルの低い指揮官の認識が実際の値と一致してしまっている（ノイズが効いていない）"
+        );
+    }
+
+    /// 仕様 12 章 M7 の受け入れ条件「アーキタイプを変えると同じシナリオの結果が
+    /// 有意に変わる」。同じ布陣で総大将のアーキタイプだけを変え、その後の
+    /// 部隊の実際の位置（=結果）が有意に違うことを確認する。
+    #[test]
+    fn different_archetypes_change_the_outcome() {
+        fn run(archetype: &str) -> Vec2Fx {
+            // 自軍を数的不利にしておく。慎重な指揮官はここで高地防御に傾き、
+            // 大胆な指揮官はそれでも攻勢の Objective を選び続ける——という
+            // 分岐が起きやすい状況を作る。
+            let mut scenario = build_army_scenario_with(4, 20);
+            let idx = commander_ai::archetype_index(archetype).unwrap();
+            scenario
+                .world
+                .set_commander_archetype(scenario.root, idx, 1);
+            for _ in 0..2000 {
+                scenario.world.tick();
+            }
+            let mut sum = Vec2Fx::ZERO;
+            let mut n = 0i32;
+            for &child in &scenario.children {
+                if let Some(node) = scenario.world.command.node(child) {
+                    sum = sum.add(node.stats.centroid);
+                    n += 1;
+                }
+            }
+            Vec2Fx::new(sum.x / n.max(1), sum.y / n.max(1))
+        }
+
+        let reckless = run("reckless_youth");
+        let cautious = run("cautious_commander");
+        let moved = sim_math::dist(reckless, cautious);
+        assert!(
+            moved > fx_from_mm(500),
+            "アーキタイプを変えても結果（部隊の位置）がほとんど変わっていない: {} mm",
+            sim_math::fx_to_mm(moved)
         );
     }
 }
