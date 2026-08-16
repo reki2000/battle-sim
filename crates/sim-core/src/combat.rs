@@ -565,6 +565,11 @@ impl CombatSystem {
         let mut neighbors = [0u32; MAX_NEIGHBORS];
         let mut next_morale = soldiers.morale.clone();
 
+        // このループは next_morale だけでなく soldiers 側の複数の並列配列
+        // （hot.state, attrs, target, fatigue など）も同じ添字 i で読む SoA
+        // アクセスなので、next_morale だけを iter_mut().enumerate() に
+        // 置き換えても i の使用は消えない。
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             if soldiers.hot.state[i] == State::Dead || soldiers.hot.state[i] == State::Downed {
                 continue;
@@ -629,6 +634,8 @@ impl CombatSystem {
             next_morale[i] = morale.clamp(0, MAX_MORALE as i32) as u16;
         }
 
+        // 同じ理由（上のループ参照）で soldiers 側の複数配列も i で読み書きする
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             if soldiers.hot.state[i] == State::Dead || soldiers.hot.state[i] == State::Downed {
                 continue;
