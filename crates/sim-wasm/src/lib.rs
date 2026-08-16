@@ -8,9 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use sim_core::organization::{Intent, MoveSpeed, Priority, Unit};
+use sim_core::organization::{ApproachStyle, Intent, MoveSpeed, Priority, ShootMode, Side, Unit};
 use sim_core::snapshot::RenderSnapshot;
 use sim_core::soldiers::Attrs;
+use sim_core::structures::StructureKind;
 use sim_core::{World as CoreWorld, WorldConfig};
 use sim_math::{fx, fx_from_mm, Vec2Fx};
 use sim_terrain::TerrainParams;
@@ -497,6 +498,320 @@ impl World {
         }
         out
     }
+
+    /// 指定ノードへ、指揮系統を介さず直接（絶対優先度の）待機命令を出す
+    /// （M8、憑依 UI 用の簡易 API）。
+    #[wasm_bindgen(js_name = issueHold)]
+    pub fn issue_hold(
+        &mut self,
+        node: u32,
+        x_m: i32,
+        y_m: i32,
+        facing_brad: u16,
+        allow_pursuit: bool,
+    ) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Hold {
+                    pos: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    facing: facing_brad,
+                    allow_pursuit,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// `approach`: 0=Deliberate, 1=Aggressive, 2=Cautious。
+    #[wasm_bindgen(js_name = issueAttack)]
+    pub fn issue_attack(&mut self, node: u32, target_node: u32, approach: u8) -> bool {
+        let approach = match approach {
+            1 => ApproachStyle::Aggressive,
+            2 => ApproachStyle::Cautious,
+            _ => ApproachStyle::Deliberate,
+        };
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Attack {
+                    target: target_node,
+                    approach,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 側面攻撃命令。`side_right` が false なら左翼、true なら右翼から。
+    #[wasm_bindgen(js_name = issueFlank)]
+    pub fn issue_flank(&mut self, node: u32, target_node: u32, side_right: bool) -> bool {
+        let side = if side_right { Side::Right } else { Side::Left };
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Flank {
+                    target: target_node,
+                    side,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 退却命令。`fighting` なら戦いながらの後退（隊列を保つ）。
+    #[wasm_bindgen(js_name = issueWithdraw)]
+    pub fn issue_withdraw(&mut self, node: u32, x_m: i32, y_m: i32, fighting: bool) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Withdraw {
+                    to: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    fighting,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 射撃命令。`mode`: 0=Volley, 1=AtWill, 2=Hold。
+    #[wasm_bindgen(js_name = issueShootAt)]
+    pub fn issue_shoot_at(&mut self, node: u32, target_node: u32, mode: u8) -> bool {
+        let mode = match mode {
+            1 => ShootMode::AtWill,
+            2 => ShootMode::Hold,
+            _ => ShootMode::Volley,
+        };
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::ShootAt {
+                    target: target_node,
+                    mode,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 予備として後方待機させる命令。
+    #[wasm_bindgen(js_name = issueReserve)]
+    pub fn issue_reserve(&mut self, node: u32, x_m: i32, y_m: i32) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Reserve {
+                    rally_pos: Vec2Fx::new(fx(x_m), fx(y_m)),
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    // ── M6: 工兵タスク（憑依 UI から築城を指示する簡易 API） ────
+
+    /// 野戦築城タスクを投入する。`kind`: 0=Stakes, 1=Ditch, 2=Abatis,
+    /// 3=Rampart, 4=Palisade。
+    #[wasm_bindgen(js_name = queueBuildStructure)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_build_structure(
+        &mut self,
+        kind: u8,
+        ax_m: i32,
+        ay_m: i32,
+        bx_m: i32,
+        by_m: i32,
+        owner: u8,
+        priority: u8,
+    ) -> u32 {
+        let kind = match kind {
+            1 => StructureKind::Ditch,
+            2 => StructureKind::Abatis,
+            3 => StructureKind::Rampart,
+            4 => StructureKind::Palisade,
+            _ => StructureKind::Stakes,
+        };
+        self.inner.queue_build_structure(
+            kind,
+            Vec2Fx::new(fx(ax_m), fx(ay_m)),
+            Vec2Fx::new(fx(bx_m), fx(by_m)),
+            owner,
+            priority,
+        )
+    }
+
+    // ── M7: 指揮官 AI ──────────────────────────────────
+
+    /// アーキタイプ名の一覧（`setCommanderArchetype` の `archetype` 引数と対応する index）。
+    #[wasm_bindgen(js_name = archetypeNames)]
+    pub fn archetype_names() -> Vec<String> {
+        sim_core::commander_ai::ARCHETYPES
+            .iter()
+            .map(|a| a.name.to_string())
+            .collect()
+    }
+
+    /// この指揮官の性格をアーキタイプから生成して設定する。
+    #[wasm_bindgen(js_name = setCommanderArchetype)]
+    pub fn set_commander_archetype(&mut self, node: u32, archetype: usize, seed_salt: u32) {
+        self.inner
+            .set_commander_archetype(node, archetype, seed_salt);
+    }
+
+    /// 指揮官の性格（10 要素、`CommanderAttrs` のフィールド順）。
+    #[wasm_bindgen(js_name = commanderAttrs)]
+    pub fn commander_attrs(&self, node: u32) -> Vec<i32> {
+        let Some(n) = self.inner.command.node(node) else {
+            return Vec::new();
+        };
+        let a = n.commander_attrs;
+        vec![
+            a.boldness as i32,
+            a.caution as i32,
+            a.initiative as i32,
+            a.obedience as i32,
+            a.tactical_skill as i32,
+            a.ambition as i32,
+            a.charisma as i32,
+            a.flexibility as i32,
+            a.patience as i32,
+            a.ruthlessness as i32,
+        ]
+    }
+
+    /// 認識 vs 実際の戦況評価（仕様 12 章 M7 の受け入れ条件）。
+    /// 前半 8 要素が認識（ノイズ込み）、後半 8 要素が実際の値。
+    /// 各 8 要素: `[force_ratio_permille, momentum, flank_left, flank_right,
+    /// rear_threat, reserve_available, terrain_advantage, time_pressure]`。
+    #[wasm_bindgen(js_name = commanderAssessment)]
+    pub fn commander_assessment(&self, node: u32) -> Vec<i32> {
+        let (perceived, actual) = self.inner.commander_perceived_vs_true(node);
+        let flatten = |a: &sim_core::organization::SituationAssessment| -> [i32; 8] {
+            [
+                a.force_ratio_permille,
+                a.momentum,
+                a.flank_threats[0] as i32,
+                a.flank_threats[1] as i32,
+                a.rear_threat as i32,
+                a.reserve_available as i32,
+                a.terrain_advantage,
+                a.time_pressure,
+            ]
+        };
+        let mut out = Vec::with_capacity(16);
+        out.extend_from_slice(&flatten(&perceived));
+        out.extend_from_slice(&flatten(&actual));
+        out
+    }
+
+    /// 直近の判断ログを JSON 文字列で返す（UI 表示用、低頻度呼び出し想定。
+    /// 仕様 05 章 7 節「なぜそうしたか」）。`chosen`/候補ラベルは Rust の
+    /// `Debug` 表示でクォートするので、そのまま妥当な JSON 文字列になる。
+    #[wasm_bindgen(js_name = commanderDecisionLogJson)]
+    pub fn commander_decision_log_json(&self, node: u32) -> String {
+        let Some(n) = self.inner.command.node(node) else {
+            return "[]".to_string();
+        };
+        let pairs = |items: &[(&'static str, i32)]| -> String {
+            items
+                .iter()
+                .map(|(label, score)| format!("[{label:?},{score}]"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let records: Vec<String> = n
+            .decision_log
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"tick\":{},\"chosen\":{:?},\"score\":{},\"candidates\":[{}],\"breakdown\":[{}]}}",
+                    r.tick,
+                    r.chosen,
+                    r.chosen_score,
+                    pairs(&r.candidates),
+                    pairs(&r.breakdown),
+                )
+            })
+            .collect();
+        format!("[{}]", records.join(","))
+    }
+
+    /// この指揮官の Blackboard が知っている敵部隊（仕様 05 章 5.1 節）。
+    /// 1 件あたり `[node, est_x_cm, est_y_cm, est_strength, confidence,
+    /// observed_tick]` の 6 要素。憑依中の視界制限された表示に使う。
+    #[wasm_bindgen(js_name = blackboardEnemyForces)]
+    pub fn blackboard_enemy_forces(&self, node: u32) -> Vec<i32> {
+        let Some(n) = self.inner.command.node(node) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(n.blackboard.enemy_forces.len() * 6);
+        for f in &n.blackboard.enemy_forces {
+            out.push(f.node as i32);
+            out.push(sim_math::fx_to_mm(f.est_pos.x) / 10);
+            out.push(sim_math::fx_to_mm(f.est_pos.y) / 10);
+            out.push(f.est_strength as i32);
+            out.push(f.confidence as i32);
+            out.push(f.observed_tick as i32);
+        }
+        out
+    }
+
+    // ── 兵士の詳細（M8: 詳細パネル） ─────────────────────
+
+    /// 指定兵士を含む葉部隊（`organization::Unit`）の指揮ノード ID。
+    /// 見つからなければ -1。低頻度（クリック時）呼び出し想定。
+    #[wasm_bindgen(js_name = nodeForSoldier)]
+    pub fn node_for_soldier(&self, id: u32) -> i32 {
+        for node in &self.inner.command.nodes {
+            if let Some(unit) = &node.unit {
+                if unit.soldiers.contains(&id) {
+                    return node.id as i32;
+                }
+            }
+        }
+        -1
+    }
+
+    /// 兵士 1 体の詳細（スナップショットに含まれない warm/cold な値）。
+    /// `[hp, morale, fatigue, ammo, target(-1 なら無し), bravery, discipline,
+    /// skill, weapon_reach_mm]` の 9 要素。低頻度（クリック時）呼び出し想定。
+    #[wasm_bindgen(js_name = soldierDetail)]
+    pub fn soldier_detail(&self, id: u32) -> Vec<i32> {
+        let i = id as usize;
+        if i >= self.inner.soldiers.len() {
+            return Vec::new();
+        }
+        let s = &self.inner.soldiers;
+        let target = s.target[i];
+        let reach_mm = self
+            .inner
+            .combat
+            .weapons
+            .get(i)
+            .map(|w| sim_math::fx_to_mm(w.reach))
+            .unwrap_or(0);
+        vec![
+            s.hp[i] as i32,
+            s.morale[i] as i32,
+            s.fatigue[i] as i32,
+            self.inner.combat.ammo.get(i).copied().unwrap_or(0) as i32,
+            if target == sim_core::soldiers::NO_ID {
+                -1
+            } else {
+                target as i32
+            },
+            s.attrs[i].bravery as i32,
+            s.attrs[i].discipline as i32,
+            s.attrs[i].skill as i32,
+            reach_mm,
+        ]
+    }
 }
 
 /// パニック時に JS のコンソールへスタックトレースを出す。
@@ -571,5 +886,79 @@ mod tests {
         let sites = w.battle_sites();
         assert_eq!(sites.len() % 7, 0);
         assert_eq!(sites.len() / 7, w.battle_site_count() as usize);
+    }
+
+    /// M8: 憑依 UI が使う命令発行バインディングが、指揮系統の応答（命令イベント）
+    /// までちゃんと届くことを確認する（詳細な戦術的帰結は sim-core 側の
+    /// 責務なので、ここでは「命令が受理されるか」だけを見る）。
+    #[test]
+    fn order_bindings_issue_orders_that_reach_the_command_tree() {
+        let mut w = World::new(7, 0, 600, 200);
+        w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
+        w.deploy_block(200, 200, 4, 4, 900, 1, 16, 0, 2);
+        let friendly = w.add_line_unit(0, 0, 16, 4, 0);
+        let enemy = w.add_line_unit(1, 16, 16, 4, 0);
+
+        assert!(w.issue_hold(friendly, 100, 100, 0, false));
+        assert!(w.issue_attack(friendly, enemy, 0));
+        assert!(w.issue_flank(friendly, enemy, true));
+        assert!(w.issue_withdraw(friendly, 90, 90, true));
+        assert!(w.issue_shoot_at(friendly, enemy, 1));
+        assert!(w.issue_reserve(friendly, 80, 80));
+        // 存在しないノードへは出せない。
+        assert!(!w.issue_attack(999, enemy, 0));
+
+        assert!(w.command_event_count() > 0);
+    }
+
+    #[test]
+    fn queue_build_structure_binding_creates_a_task() {
+        let mut w = World::new(7, 0, 600, 200);
+        let before = w.inner.engineering.tasks.len();
+        w.queue_build_structure(0, 100, 100, 100, 110, 0, 5);
+        assert_eq!(w.inner.engineering.tasks.len(), before + 1);
+    }
+
+    #[test]
+    fn commander_attrs_reflect_the_chosen_archetype() {
+        let mut w = World::new(7, 0, 600, 200);
+        w.deploy_block(100, 100, 2, 2, 900, 0, 0, 0, 1);
+        let node = w.add_line_unit(0, 0, 4, 2, 0);
+        w.set_commander_archetype(node, 5, 1); // reckless_youth: boldness 高め・caution 低め
+        let attrs = w.commander_attrs(node);
+        assert_eq!(attrs.len(), 10);
+        let boldness = attrs[0];
+        let caution = attrs[1];
+        assert!(boldness > caution, "boldness={boldness} caution={caution}");
+        assert!(!World::archetype_names().is_empty());
+    }
+
+    #[test]
+    fn commander_assessment_and_decision_log_are_queryable() {
+        let mut w = World::new(7, 0, 600, 200);
+        w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
+        w.deploy_block(300, 300, 4, 4, 900, 1, 16, 0, 2);
+        let friendly = w.add_line_unit(0, 0, 16, 4, 0);
+        let _enemy = w.add_line_unit(1, 16, 16, 4, 0);
+        for _ in 0..200 {
+            w.tick();
+        }
+        let assessment = w.commander_assessment(friendly);
+        assert_eq!(assessment.len(), 16);
+        let json = w.commander_decision_log_json(friendly);
+        assert!(json.starts_with('['), "JSON 配列で始まっていない: {json}");
+    }
+
+    #[test]
+    fn node_for_soldier_and_soldier_detail_resolve() {
+        let mut w = World::new(7, 0, 600, 200);
+        w.deploy_block(100, 100, 3, 3, 900, 0, 0, 0, 1);
+        let node = w.add_line_unit(0, 0, 9, 3, 0);
+        assert_eq!(w.node_for_soldier(0), node as i32);
+        assert_eq!(w.node_for_soldier(9999), -1);
+
+        let detail = w.soldier_detail(0);
+        assert_eq!(detail.len(), 9);
+        assert!(detail[0] > 0, "hp が 0 以下: {}", detail[0]);
     }
 }

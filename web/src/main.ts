@@ -17,11 +17,20 @@ import {
   drawOrderVisualization,
   drawDeathCauseGraph,
   deathCauseLegend,
-  commandTreeSummary,
   type ParsedStats,
 } from "./render/command-overlay";
+import { OrderPanel } from "./ui/orders";
+import { DetailPanel } from "./ui/detail-panel";
+import { SessionPanel } from "./ui/session-panel";
+import { t, onLangChange } from "./i18n";
 
 const TICK_MS = 50;
+/** クリックとドラッグを区別するしきい値（px）。 */
+const CLICK_MOVE_THRESHOLD = 6;
+/** 兵士選択のクリック許容半径（px）。 */
+const SOLDIER_PICK_RADIUS_PX = 24;
+/** 兵士を追従し始めたときの視野幅（m）。 */
+const FOLLOW_VIEW_WIDTH_M = 80;
 
 const terrainCanvas = document.getElementById("terrain-view") as HTMLCanvasElement;
 const soldierCanvas = document.getElementById("soldier-view") as HTMLCanvasElement;
@@ -29,6 +38,9 @@ const overlayCanvas = document.getElementById("overlay-view") as HTMLCanvasEleme
 const overlayCtx = overlayCanvas.getContext("2d", { alpha: true })!;
 const hud = document.getElementById("hud") as HTMLDivElement;
 const commandPanel = document.getElementById("command-panel") as HTMLDivElement;
+const detailPanelEl = document.getElementById("detail-panel") as HTMLDivElement;
+const sessionPanelEl = document.getElementById("session-panel") as HTMLDivElement;
+const battleReportEl = document.getElementById("battle-report") as HTMLDivElement;
 
 const cam = new Camera();
 const terrainGl = new TerrainGlRenderer(terrainCanvas);
@@ -37,6 +49,7 @@ const minimap = new MinimapRenderer();
 const snapshot = new SnapshotView();
 const interp = new InterpolatedPositions();
 let dpr = 1;
+let prevFollowed: number | null = null;
 
 let terrainData: TerrainData | null = null;
 let lastSnapshotAt = performance.now();
@@ -61,10 +74,44 @@ function send(msg: ToWorker, transfer: Transferable[] = []): void {
   worker.postMessage(msg, transfer);
 }
 
+// ── 憑依・詳細パネル・観戦モード / リプレイ（M8）────────────
+
+const orderPanel = new OrderPanel(
+  commandPanel,
+  send,
+  () => {},
+  (node) => send({ type: "queryCommander", node }),
+);
+const detailPanel = new DetailPanel(detailPanelEl);
+const sessionPanel = new SessionPanel(sessionPanelEl, battleReportEl, send);
+
+onLangChange(() => {
+  orderPanel.refreshLang();
+  detailPanel.render();
+  sessionPanel.render();
+});
+
 // ── ワーカーからのメッセージ ────────────────────────────
 
 worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
   const msg = ev.data;
+
+  if (msg.type === "soldierInfo") {
+    detailPanel.showSoldier(msg.id, msg.node, msg.detail);
+    return;
+  }
+  if (msg.type === "commanderInfo") {
+    detailPanel.showCommander(msg.info);
+    return;
+  }
+  if (msg.type === "recording") {
+    sessionPanel.onRecording(msg.recording);
+    return;
+  }
+  if (msg.type === "replayResult") {
+    sessionPanel.onReplayResult(msg);
+    return;
+  }
 
   if (msg.type === "ready") {
     snapshot.setStride(msg.soldierStride);
@@ -75,93 +122,110 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       // レンダラ側の単色・図形フォールバックで状態を確認できるようにする。
       console.error("事前生成アセットの読み込みに失敗しました", error);
     }
-    const t = msg.terrain;
+    const terrain = msg.terrain;
     terrainData = {
-      dim: t.dim,
-      cellM: t.cellM,
-      sizeM: t.sizeM,
-      surface: new Uint8Array(t.surface),
-      height: new Int16Array(t.height),
-      water: new Uint8Array(t.water),
-      waterKind: new Uint8Array(t.waterKind),
-      cliff: new Uint8Array(t.cliff),
+      dim: terrain.dim,
+      cellM: terrain.cellM,
+      sizeM: terrain.sizeM,
+      surface: new Uint8Array(terrain.surface),
+      height: new Int16Array(terrain.height),
+      water: new Uint8Array(terrain.water),
+      waterKind: new Uint8Array(terrain.waterKind),
+      cliff: new Uint8Array(terrain.cliff),
     };
     terrainGl.setTerrain(terrainData);
     minimap.setTerrain(terrainData);
 
-    const siteCount = t.battleSites.length / 7;
+    const siteCount = terrain.battleSites.length / 7;
     if (siteCount > 0) {
-      const best = t.battleSites.slice(0, 7);
+      const best = terrain.battleSites.slice(0, 7);
       console.log(
         `会戦地候補 ${siteCount} 件。最上位: (${best[0]}, ${best[1]}) score=${best[2]}`,
       );
     }
 
-    cam.worldSizeM = t.sizeM;
-    cam.centerX = t.sizeM / 2;
-    cam.centerY = t.sizeM / 2;
+    cam.worldSizeM = terrain.sizeM;
+    cam.centerX = terrain.sizeM / 2;
+    cam.centerY = terrain.sizeM / 2;
     cam.setViewWidthM(600);
 
-    // 両軍を向かい合わせに配置し、指揮ツリーの陣形として互いに向かって進ませる。
-    // 前列同士の目標座標を完全に一致させると、押し合いの逃げ場がなく密着しすぎて
-    // 前列判定が誰も成立しなくなるため、隊列の奥行き＋わずかな隙間ぶんだけ
-    // 後方へずらす（sim-headless の battle サブコマンドと同じ考え方）。
-    const mid = Math.floor(t.sizeM / 2);
-    const FILES = 40;
-    const RANKS = 25;
-    const RANK_SPACING_M = 0.8;
-    const CONTACT_GAP_M = 0.5;
-    const depth = RANK_SPACING_M * (RANKS - 1);
-    const SHIELDWALL = 1; // organization::FORMATION_SHIELDWALL
+    // スナップショット・統計はこの World インスタンスに紐づくので、
+    // init/リプレイ読み込みのどちらでも一度リセットする。
+    heldBuffer = null;
+    lastStats = null;
+    simTick = 0;
+    soldierCount = 0;
+    detailPanel.followedSoldierId = null;
+    detailPanel.clear();
+    orderPanel.possessedNode = null;
+    orderPanel.update([]);
 
-    send({
-      type: "deploy",
-      xM: mid - 16,
-      yM: mid - depth - CONTACT_GAP_M,
-      files: FILES,
-      ranks: RANKS,
-      spacingMm: 800,
-      faction: 0,
-      unitId: 0,
-      troopType: 0,
-      seedSalt: 1,
-    });
-    send({
-      type: "deploy",
-      xM: mid - 16,
-      yM: mid + depth + CONTACT_GAP_M,
-      files: FILES,
-      ranks: RANKS,
-      spacingMm: 800,
-      faction: 1,
-      unitId: 1,
-      troopType: 1,
-      seedSalt: 2,
-    });
+    if (msg.reason === "init") {
+      // 両軍を向かい合わせに配置し、指揮ツリーの陣形として互いに向かって進ませる。
+      // 前列同士の目標座標を完全に一致させると、押し合いの逃げ場がなく密着しすぎて
+      // 前列判定が誰も成立しなくなるため、隊列の奥行き＋わずかな隙間ぶんだけ
+      // 後方へずらす（sim-headless の battle サブコマンドと同じ考え方）。
+      const mid = Math.floor(terrain.sizeM / 2);
+      const FILES = 40;
+      const RANKS = 25;
+      const RANK_SPACING_M = 0.8;
+      const CONTACT_GAP_M = 0.5;
+      const depth = RANK_SPACING_M * (RANKS - 1);
+      const SHIELDWALL = 1; // organization::FORMATION_SHIELDWALL
 
-    const perSide = FILES * RANKS;
-    // organization::formation_goals の回転規約では facing=0 でランクが +Y
-    // （北）へ、facing=180°（32768 brad）で -Y（南）へ伸びる。
-    send({ type: "addLineUnit", faction: 0, firstId: 0, count: perSide, ranks: RANKS, formation: SHIELDWALL });
-    send({ type: "addLineUnit", faction: 1, firstId: perSide, count: perSide, ranks: RANKS, formation: SHIELDWALL });
-    send({
-      type: "issueMoveTo",
-      node: 0,
-      xM: mid,
-      yM: mid - depth - CONTACT_GAP_M,
-      facingBrad: 0,
-      formation: SHIELDWALL,
-    });
-    send({
-      type: "issueMoveTo",
-      node: 1,
-      xM: mid,
-      yM: mid + depth + CONTACT_GAP_M,
-      facingBrad: 32768,
-      formation: SHIELDWALL,
-    });
+      send({
+        type: "deploy",
+        xM: mid - 16,
+        yM: mid - depth - CONTACT_GAP_M,
+        files: FILES,
+        ranks: RANKS,
+        spacingMm: 800,
+        faction: 0,
+        unitId: 0,
+        troopType: 0,
+        seedSalt: 1,
+      });
+      send({
+        type: "deploy",
+        xM: mid - 16,
+        yM: mid + depth + CONTACT_GAP_M,
+        files: FILES,
+        ranks: RANKS,
+        spacingMm: 800,
+        faction: 1,
+        unitId: 1,
+        troopType: 1,
+        seedSalt: 2,
+      });
 
-    setRunning(true);
+      const perSide = FILES * RANKS;
+      // organization::formation_goals の回転規約では facing=0 でランクが +Y
+      // （北）へ、facing=180°（32768 brad）で -Y（南）へ伸びる。
+      send({ type: "addLineUnit", faction: 0, firstId: 0, count: perSide, ranks: RANKS, formation: SHIELDWALL });
+      send({ type: "addLineUnit", faction: 1, firstId: perSide, count: perSide, ranks: RANKS, formation: SHIELDWALL });
+      send({
+        type: "issueMoveTo",
+        node: 0,
+        xM: mid,
+        yM: mid - depth - CONTACT_GAP_M,
+        facingBrad: 0,
+        formation: SHIELDWALL,
+      });
+      send({
+        type: "issueMoveTo",
+        node: 1,
+        xM: mid,
+        yM: mid + depth + CONTACT_GAP_M,
+        facingBrad: 32768,
+        formation: SHIELDWALL,
+      });
+
+      setRunning(true);
+    } else {
+      // リプレイは worker 側で既に running=true にしている。
+      // メインスレッドの表示用フラグだけ合わせる（再送はしない）。
+      running = true;
+    }
     return;
   }
 
@@ -181,6 +245,8 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     lastSnapshotAt = performance.now();
     if (msg.stats) {
       lastStats = parseStats(msg.stats);
+      orderPanel.update(lastStats.nodes);
+      sessionPanel.checkBattleEnd(lastStats.nodes, lastStats.combat);
     }
   }
 };
@@ -189,17 +255,23 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
 
 let dragging = false;
 let lastPointer = { x: 0, y: 0 };
+let pointerDownPos = { x: 0, y: 0 };
 const viewStack = document.getElementById("view-stack") as HTMLDivElement;
 
 viewStack.addEventListener("pointerdown", (e) => {
   dragging = true;
   lastPointer = { x: e.clientX, y: e.clientY };
+  pointerDownPos = { x: e.clientX, y: e.clientY };
   viewStack.setPointerCapture(e.pointerId);
 });
 
 viewStack.addEventListener("pointerup", (e) => {
   dragging = false;
   viewStack.releasePointerCapture(e.pointerId);
+  const moved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+  if (moved < CLICK_MOVE_THRESHOLD) {
+    handleViewClick(e);
+  }
 });
 
 viewStack.addEventListener("pointermove", (e) => {
@@ -207,6 +279,37 @@ viewStack.addEventListener("pointermove", (e) => {
   cam.panByScreen(e.clientX - lastPointer.x, e.clientY - lastPointer.y);
   lastPointer = { x: e.clientX, y: e.clientY };
 });
+
+/**
+ * ドラッグを伴わないクリック。憑依 UI が位置/対象を待っていればそれを消化し、
+ * そうでなければ最寄りの兵士を選んで詳細パネルに問い合わせる。
+ */
+function handleViewClick(e: PointerEvent): void {
+  const rect = viewStack.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const world = cam.screenToWorld(sx, sy);
+  if (orderPanel.handleMapClick(world.x, world.y)) return;
+  selectNearestSoldier(world.x, world.y);
+}
+
+function selectNearestSoldier(xM: number, yM: number): void {
+  if (snapshot.count === 0) return;
+  const thresholdM = SOLDIER_PICK_RADIUS_PX / cam.pxPerM;
+  let bestI = -1;
+  let bestD = thresholdM * thresholdM;
+  for (let i = 0; i < snapshot.count; i++) {
+    const dx = snapshot.x(i) - xM;
+    const dy = snapshot.y(i) - yM;
+    const d = dx * dx + dy * dy;
+    if (d < bestD) {
+      bestD = d;
+      bestI = i;
+    }
+  }
+  if (bestI < 0) return;
+  send({ type: "querySoldier", id: bestI });
+}
 
 viewStack.addEventListener(
   "wheel",
@@ -302,13 +405,26 @@ function frame(now: number): void {
     fpsFrames = 0;
   }
 
+  // 20 Hz のスナップショット間を補間する。倍速時は補間しない
+  const alpha =
+    speed >= 8 ? 1 : Math.min(1, (now - lastSnapshotAt) / (TICK_MS / speed));
+
+  // 一兵士追従モード（M8）。死亡後もその場に留まるので追従を外さない。
+  const followed = detailPanel.followedSoldierId;
+  if (followed !== null && followed < snapshot.count) {
+    if (followed !== prevFollowed) cam.setViewWidthM(FOLLOW_VIEW_WIDTH_M);
+    cam.centerX = interp.x(followed, alpha);
+    cam.centerY = interp.y(followed, alpha);
+  } else if (lastStats) {
+    // 観戦モード（M8）。追従中は競合しないよう止める。
+    sessionPanel.updateSpectator(cam, lastStats.nodes, now);
+  }
+  prevFollowed = followed;
+
   terrainGl.draw(cam);
 
   overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
-  // 20 Hz のスナップショット間を補間する。倍速時は補間しない
-  const alpha =
-    speed >= 8 ? 1 : Math.min(1, (now - lastSnapshotAt) / (TICK_MS / speed));
   if (terrainData) {
     const td = terrainData;
     soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, now / 1000, (x, y) =>
@@ -343,15 +459,12 @@ function frame(now: number): void {
     `tick ${simTick}  ${running ? `▶ ${speed}x` : "⏸"}\n` +
     `兵士 ${soldierCount}（描画 ${soldierRenderer.drawn}）\n` +
     `視野 ${cam.viewWidthM.toFixed(0)} m  ${cam.pxPerM.toFixed(2)} px/m  LOD ${lodNames[cam.lod]}\n` +
-    `${fps.toFixed(0)} fps`;
-
-  if (lastStats) {
-    commandPanel.textContent =
-      `── 指揮系統 ──\n${commandTreeSummary(lastStats.nodes) || "(部隊なし)"}\n\n` +
-      `── 死因内訳 ──\n${deathCauseLegend(lastStats.combat)}\n` +
-      `撃破 ${lastStats.combat.kills}  戦闘不能 ${lastStats.combat.downed}  ` +
-      `誤射 ${lastStats.combat.friendlyFireHits}`;
-  }
+    `${fps.toFixed(0)} fps` +
+    (lastStats
+      ? `\n${t("deathCauses")}: ${deathCauseLegend(lastStats.combat)}\n` +
+        `${t("kills")} ${lastStats.combat.kills}  ${t("downed")} ${lastStats.combat.downed}  ` +
+        `${t("friendlyFire")} ${lastStats.combat.friendlyFireHits}`
+      : "");
 
   requestAnimationFrame(frame);
 }

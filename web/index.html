@@ -61,11 +61,18 @@
         white-space: pre;
         pointer-events: none;
       }
-      #command-panel {
+      #right-stack {
         position: fixed;
         top: 12px;
         right: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: calc(100vh - 24px);
         max-width: 320px;
+      }
+      #command-panel,
+      #detail-panel {
         padding: 10px 14px;
         background: rgba(10, 14, 20, 0.78);
         border: 1px solid rgba(255, 255, 255, 0.12);
@@ -73,8 +80,119 @@
         color: #d8dee6;
         font-size: 11px;
         line-height: 1.6;
+        overflow-y: auto;
+      }
+      #command-panel {
+        max-height: 46vh;
+      }
+      #detail-panel {
+        max-height: 30vh;
+      }
+      #session-panel {
+        position: fixed;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 6px 10px;
+        background: rgba(10, 14, 20, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        color: #d8dee6;
+        font-size: 11px;
+      }
+      #battle-report {
+        display: none;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        padding: 16px 20px;
+        background: rgba(10, 14, 20, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        color: #d8dee6;
+        font-size: 13px;
+        line-height: 1.8;
+        z-index: 10;
+      }
+      .panel-title {
+        font-weight: 600;
+        color: #e8c96a;
+        margin-bottom: 4px;
+      }
+      .panel-subtitle {
+        margin-top: 6px;
+        color: #8c98a6;
+      }
+      .node-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        margin-bottom: 6px;
+      }
+      .node-row {
+        cursor: pointer;
+        padding: 2px 4px;
+        border-radius: 3px;
         white-space: pre;
-        pointer-events: none;
+      }
+      .node-row:hover {
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .node-row.possessed {
+        background: rgba(61, 122, 184, 0.35);
+        outline: 1px solid #3d7ab8;
+      }
+      .node-row.pickable {
+        outline: 1px dashed #d98032;
+      }
+      .order-controls {
+        border-top: 1px solid rgba(255, 255, 255, 0.12);
+        padding-top: 6px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      .order-row {
+        width: 100%;
+        display: flex;
+        gap: 4px;
+      }
+      .pick-hint {
+        margin-top: 6px;
+        padding: 4px 6px;
+        background: rgba(217, 128, 50, 0.2);
+        border: 1px solid #d98032;
+        border-radius: 4px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 6px;
+      }
+      .status-line {
+        margin-top: 4px;
+        color: #7ad17a;
+      }
+      .follow-status {
+        margin-top: 4px;
+        color: #6ac9e8;
+      }
+      button,
+      select {
+        font-family: inherit;
+        font-size: 11px;
+        color: #d8dee6;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 4px;
+        padding: 3px 7px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(255, 255, 255, 0.16);
       }
     </style>
   </head>
@@ -85,10 +203,16 @@
       <canvas id="overlay-view"></canvas>
     </div>
     <div id="hud">起動中…</div>
-    <div id="command-panel"></div>
+    <div id="session-panel"></div>
+    <div id="right-stack">
+      <div id="command-panel"></div>
+      <div id="detail-panel"></div>
+    </div>
+    <div id="battle-report"></div>
     <div id="help">
 ドラッグ  パン
 ホイール  ズーム（対数）
+クリック  部隊/兵士を選択
 Space     一時停止 / 再開
 1〜5      速度 1x / 2x / 4x / 8x / 16x
 Q W E R T 視野 5km / 1km / 200m / 40m / 10m</div>
