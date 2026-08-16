@@ -8,6 +8,7 @@ import type { Camera } from "../render/iso";
 import type { CombatStats, CommandNode } from "../render/command-overlay";
 import type { Recording, ToWorker } from "../sim/protocol";
 import { t, toggleLang } from "../i18n";
+import { cycleQuality, getQualityName } from "../quality";
 
 const SPECTATOR_INTERVAL_MS = 4000;
 const SPECTATOR_VIEW_WIDTH_M = 180;
@@ -168,6 +169,12 @@ export class SessionPanel {
       p.textContent = this.statusText;
       c.appendChild(p);
     }
+
+    const qualityKey = { low: "qualityLow", medium: "qualityMedium", high: "qualityHigh" } as const;
+    const qualityBtn = document.createElement("button");
+    qualityBtn.textContent = t(qualityKey[getQualityName()]);
+    qualityBtn.onclick = () => cycleQuality();
+    c.appendChild(qualityBtn);
 
     const langBtn = document.createElement("button");
     langBtn.textContent = t("lang");

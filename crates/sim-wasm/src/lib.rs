@@ -14,7 +14,8 @@ use sim_core::soldiers::Attrs;
 use sim_core::structures::StructureKind;
 use sim_core::{World as CoreWorld, WorldConfig};
 use sim_math::{fx, fx_from_mm, Vec2Fx};
-use sim_terrain::TerrainParams;
+use sim_terrain::battle_site::BattleSiteCandidate;
+use sim_terrain::{Terrain, TerrainParams, WaterKind};
 use wasm_bindgen::prelude::*;
 
 /// wasm 側のワールドハンドル。
@@ -41,6 +42,62 @@ impl World {
         };
         World {
             inner: CoreWorld::new(&config),
+            snapshot: RenderSnapshot::default(),
+        }
+    }
+
+    /// キャッシュ済みの地形グリッドからワールドを作る（M9: 地形キャッシュ、
+    /// IndexedDB に保存された前回生成分を再利用し、地形生成をスキップする）。
+    ///
+    /// 各グリッドは `terrainDim()` × `terrainDim()`（行優先）で、既存の
+    /// `terrain*Ptr()` 系バインディングが指す先と同じレイアウト。
+    /// `battleSitesFlat` は `battleSites()` と同じ 7 要素 1 組の平坦な配列。
+    /// 呼び出し側は、これらが同じ (seed, sizeM, relief) から生成されたもので
+    /// あることを保証すること（ここでは検証しない）。
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = fromCachedTerrain)]
+    pub fn from_cached_terrain(
+        seed_lo: u32,
+        seed_hi: u32,
+        dim: u32,
+        cell_m: u32,
+        height: Vec<i16>,
+        surface: Vec<u8>,
+        passability: Vec<u8>,
+        water: Vec<u8>,
+        water_kind: Vec<u8>,
+        cliff: Vec<u8>,
+        battle_sites_flat: Vec<i32>,
+    ) -> World {
+        let seed = ((seed_hi as u64) << 32) | seed_lo as u64;
+        let mut battle_sites = Vec::with_capacity(battle_sites_flat.len() / 7);
+        let mut i = 0;
+        while i + 7 <= battle_sites_flat.len() {
+            battle_sites.push(BattleSiteCandidate {
+                x_m: battle_sites_flat[i],
+                y_m: battle_sites_flat[i + 1],
+                score: battle_sites_flat[i + 2],
+                passable_permille: battle_sites_flat[i + 3] as u16,
+                asymmetry_permille: battle_sites_flat[i + 4] as u16,
+                openness_permille: battle_sites_flat[i + 5] as u16,
+                bottleneck_count: battle_sites_flat[i + 6] as u16,
+            });
+            i += 7;
+        }
+        let terrain = Terrain {
+            dim,
+            cell_m,
+            seed,
+            height,
+            surface,
+            passability,
+            water,
+            water_kind: water_kind.iter().map(|&b| WaterKind::from_u8(b)).collect(),
+            cliff,
+            battle_sites,
+        };
+        World {
+            inner: CoreWorld::with_terrain(seed, terrain),
             snapshot: RenderSnapshot::default(),
         }
     }
@@ -960,5 +1017,57 @@ mod tests {
         let detail = w.soldier_detail(0);
         assert_eq!(detail.len(), 9);
         assert!(detail[0] > 0, "hp が 0 以下: {}", detail[0]);
+    }
+
+    /// M9: 地形キャッシュ（IndexedDB からの復元）が、再生成した地形と
+    /// 完全に同じ挙動になることを確認する。地形グリッド自体の一致に加え、
+    /// 同じ操作を続けたときの `state_hash` まで一致することまで見る
+    /// （経路探索・通行判定・地形速度倍率など、地形に依存する全ロジックが
+    /// 復元後も壊れていないことの証明）。
+    #[test]
+    fn from_cached_terrain_matches_a_freshly_generated_world() {
+        let fresh = World::new(42, 0, 500, 300);
+        let t = &fresh.inner.terrain;
+        let mut cached = World::from_cached_terrain(
+            42,
+            0,
+            t.dim,
+            t.cell_m,
+            t.height.clone(),
+            t.surface.clone(),
+            t.passability.clone(),
+            t.water.clone(),
+            t.water_kind.iter().map(|k| *k as u8).collect(),
+            t.cliff.clone(),
+            fresh.battle_sites(),
+        );
+        let mut fresh = fresh;
+
+        assert_eq!(fresh.inner.terrain.height, cached.inner.terrain.height);
+        assert_eq!(fresh.inner.terrain.surface, cached.inner.terrain.surface);
+        assert_eq!(
+            fresh.inner.terrain.passability,
+            cached.inner.terrain.passability
+        );
+        assert_eq!(fresh.inner.terrain.water, cached.inner.terrain.water);
+        assert_eq!(
+            fresh.inner.terrain.water_kind,
+            cached.inner.terrain.water_kind
+        );
+        assert_eq!(fresh.inner.terrain.cliff, cached.inner.terrain.cliff);
+        assert_eq!(fresh.battle_sites(), cached.battle_sites());
+
+        // 地形に依存する経路探索・速度倍率・通行判定を含め、以後の挙動も
+        // 完全に一致することを state_hash で確認する。
+        fresh.deploy_block(100, 100, 6, 6, 900, 0, 0, 0, 1);
+        cached.deploy_block(100, 100, 6, 6, 900, 0, 0, 0, 1);
+        fresh.set_faction_goal(0, 400, 400);
+        cached.set_faction_goal(0, 400, 400);
+        for _ in 0..100 {
+            fresh.tick();
+            cached.tick();
+        }
+        assert_eq!(fresh.state_hash_lo(), cached.state_hash_lo());
+        assert_eq!(fresh.state_hash_hi(), cached.state_hash_hi());
     }
 }

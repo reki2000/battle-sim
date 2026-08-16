@@ -103,8 +103,18 @@ impl World {
     /// 地形を生成し、空のワールドを作る。
     pub fn new(config: &WorldConfig) -> World {
         let terrain = sim_terrain::generate(&config.terrain);
+        Self::with_terrain(config.seed, terrain)
+    }
+
+    /// 既に生成済みの地形から、空のワールドを作る（M9: 地形キャッシュ）。
+    ///
+    /// `terrain` は呼び出し側が用意する。`sim_terrain::generate` と同じ
+    /// (seed, size_m, relief, ...) から作られたものと同一であることは
+    /// 呼び出し側の責任（ここでは検証しない。ブラウザの IndexedDB に
+    /// 保存された地形グリッドを、再生成せずそのまま復元する用途を想定）。
+    pub fn with_terrain(seed: u64, terrain: sim_terrain::Terrain) -> World {
         World {
-            seed: config.seed,
+            seed,
             tick: 0,
             terrain,
             soldiers: Soldiers::default(),

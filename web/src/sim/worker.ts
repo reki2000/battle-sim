@@ -29,6 +29,7 @@ import type {
   ToWorker,
 } from "./protocol";
 import { buildCommanderInfo, parseSoldierDetail } from "./detail";
+import { loadCachedTerrain, saveCachedTerrain, terrainCacheKey } from "./terrain-cache";
 
 let world: World | null = null;
 let memory: WebAssembly.Memory | null = null;
@@ -134,21 +135,43 @@ function loop(): void {
   if (running) {
     const elapsed = Math.min(250, now - lastRealMs);
     accumulatorMs += elapsed * speed;
-    let n = 0;
-    while (accumulatorMs >= TICK_MS && n < MAX_TICKS_PER_FRAME) {
-      drainReplayQueue();
-      world.tick();
-      accumulatorMs -= TICK_MS;
-      n++;
-      if (
-        replayTargetTick >= 0 &&
-        world.tickCount() >= replayTargetTick &&
-        replayQueue.length === 0
-      ) {
-        finishReplay();
-      }
+    let due = Math.min(Math.floor(accumulatorMs / TICK_MS), MAX_TICKS_PER_FRAME);
+    // tickMany は複数 tick をまとめて進めるため、リプレイの目標 tick を
+    // 一気に飛び越えてしまうと、そこで比較するはずの state_hash がずれた
+    // 時点のものになる。目標 tick をちょうど跨がないよう上限を切る。
+    if (replayTargetTick >= 0) {
+      due = Math.min(due, Math.max(0, replayTargetTick - world.tickCount()));
     }
-    if (n === MAX_TICKS_PER_FRAME) {
+    if (due > 0) {
+      if (replayQueue.length === 0) {
+        // リプレイのコマンドを tick 単位で差し込む必要が無ければ、
+        // 境界を跨ぐ呼び出し回数を減らすため tickMany でまとめて進める
+        // （M9: 早送り時の JS/wasm 境界オーバーヘッド削減）。
+        world.tickMany(due);
+        if (
+          replayTargetTick >= 0 &&
+          world.tickCount() >= replayTargetTick &&
+          replayQueue.length === 0
+        ) {
+          finishReplay();
+        }
+      } else {
+        for (let n = 0; n < due; n++) {
+          drainReplayQueue();
+          world.tick();
+          if (
+            replayTargetTick >= 0 &&
+            world.tickCount() >= replayTargetTick &&
+            replayQueue.length === 0
+          ) {
+            finishReplay();
+            break;
+          }
+        }
+      }
+      accumulatorMs -= due * TICK_MS;
+    }
+    if (due === MAX_TICKS_PER_FRAME) {
       // 追いつけなかったぶんは捨てる(時間が伸びるより遅くなる方がまし)
       accumulatorMs = 0;
     }
@@ -311,6 +334,53 @@ function postReady(reason: "init" | "replay"): void {
   );
 }
 
+/**
+ * 地形キャッシュを引きつつ World を作る（M9）。キャッシュがあれば
+ * `fromCachedTerrain` で再生成をスキップし、無ければ通常どおり生成してから
+ * 次回のために非同期で保存する（起動をブロックしない・失敗は握りつぶす）。
+ * `init`・`loadReplay` の両方から使う。
+ */
+async function createWorld(seed: number, sizeM: number, relief: number): Promise<World> {
+  const seedLo = seed >>> 0;
+  const seedHi = Math.floor(seed / 2 ** 32) >>> 0;
+  const cacheKey = terrainCacheKey(seed, sizeM, relief);
+  const cached = await loadCachedTerrain(cacheKey);
+  if (cached) {
+    // 同じグリッドから作るので、以後の挙動は再生成した場合と完全に一致する
+    // （sim-wasm の from_cached_terrain_matches_a_freshly_generated_world
+    // テストで検証済み）。
+    return World.fromCachedTerrain(
+      seedLo,
+      seedHi,
+      cached.dim,
+      cached.cellM,
+      cached.height,
+      cached.surface,
+      cached.passability,
+      cached.water,
+      cached.waterKind,
+      cached.cliff,
+      Int32Array.from(cached.battleSitesFlat),
+    );
+  }
+  const w = new World(seedLo, seedHi, sizeM, relief);
+  const dim = w.terrainDim();
+  const cells = dim * dim;
+  const mem = memory!;
+  void saveCachedTerrain(cacheKey, {
+    dim,
+    cellM: w.terrainCellM(),
+    height: new Int16Array(new Int16Array(mem.buffer, w.terrainHeightPtr(), cells)),
+    surface: new Uint8Array(new Uint8Array(mem.buffer, w.terrainSurfacePtr(), cells)),
+    passability: new Uint8Array(new Uint8Array(mem.buffer, w.terrainPassabilityPtr(), cells)),
+    water: new Uint8Array(new Uint8Array(mem.buffer, w.terrainWaterPtr(), cells)),
+    waterKind: new Uint8Array(new Uint8Array(mem.buffer, w.terrainWaterKindPtr(), cells)),
+    cliff: new Uint8Array(new Uint8Array(mem.buffer, w.terrainCliffPtr(), cells)),
+    battleSitesFlat: Array.from(w.battleSites()),
+  });
+  return w;
+}
+
 self.onmessage = async (ev: MessageEvent<ToWorker>) => {
   const msg = ev.data;
 
@@ -324,12 +394,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
     case "init": {
       const wasm = await init();
       memory = wasm.memory;
-      world = new World(
-        msg.seed >>> 0,
-        Math.floor(msg.seed / 2 ** 32) >>> 0,
-        msg.sizeM,
-        msg.relief,
-      );
+      world = await createWorld(msg.seed, msg.sizeM, msg.relief);
       recordedInit = { seed: msg.seed, sizeM: msg.sizeM, relief: msg.relief };
       recordingLog = [];
       replayQueue = [];
@@ -401,12 +466,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
 
     case "loadReplay": {
       const rec = msg.recording;
-      world = new World(
-        rec.init.seed >>> 0,
-        Math.floor(rec.init.seed / 2 ** 32) >>> 0,
-        rec.init.sizeM,
-        rec.init.relief,
-      );
+      world = await createWorld(rec.init.seed, rec.init.sizeM, rec.init.relief);
       recordedInit = rec.init;
       recordingLog = [];
       replayQueue = rec.log.map((e) => ({ atTick: e.atTick, msg: e.msg }));

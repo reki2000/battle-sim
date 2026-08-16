@@ -62,6 +62,9 @@ const DICT: Record<string, Record<Lang, string>> = {
   replayMismatch: { ja: "リプレイ不一致（tick {tick}）", en: "Replay mismatch (tick {tick})" },
   battleReport: { ja: "会戦報告", en: "Battle report" },
   lang: { ja: "EN", en: "日本語" },
+  qualityLow: { ja: "画質: 低", en: "Quality: Low" },
+  qualityMedium: { ja: "画質: 中", en: "Quality: Medium" },
+  qualityHigh: { ja: "画質: 高", en: "Quality: High" },
 };
 
 let lang: Lang = "ja";
