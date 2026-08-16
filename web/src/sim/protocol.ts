@@ -27,6 +27,61 @@ export interface TerrainPayload {
   battleSites: number[];
 }
 
+/** `init` の再現に必要な最小情報。録画・リプレイで使う。 */
+export interface InitConfig {
+  seed: number;
+  sizeM: number;
+  relief: number;
+}
+
+/**
+ * 憑依 UI から発行できる命令。仕様 05 章 4 節 / 08 章 9 節「命令 UI 全種」。
+ * 「条件付き」命令は仕様側にもまだ具体的な構造がなく、この PR のスコープ外
+ * （`web/src/ui/orders.ts` 冒頭のスコープ注記を参照）。
+ */
+export type OrderCommand =
+  | {
+      type: "issueMoveTo";
+      node: number;
+      xM: number;
+      yM: number;
+      facingBrad: number;
+      formation: number;
+    }
+  | { type: "issueHold"; node: number; xM: number; yM: number; facingBrad: number; allowPursuit: boolean }
+  | { type: "issueAttack"; node: number; targetNode: number; approach: number }
+  | { type: "issueCharge"; node: number; targetNode: number }
+  | { type: "issueFlank"; node: number; targetNode: number; sideRight: boolean }
+  | { type: "issueWithdraw"; node: number; xM: number; yM: number; fighting: boolean }
+  | { type: "issueShootAt"; node: number; targetNode: number; mode: number }
+  | { type: "issueReserve"; node: number; xM: number; yM: number }
+  | { type: "issuePursue"; node: number; targetNode: number; maxDistanceM: number }
+  | {
+      type: "queueBuildStructure";
+      kind: number;
+      axM: number;
+      ayM: number;
+      bxM: number;
+      byM: number;
+      owner: number;
+      priority: number;
+    };
+
+/** 録画された 1 コマンド。`atTick` は発行時点の `world.tickCount()`。 */
+export interface RecordedCommand {
+  atTick: number;
+  msg: OrderCommand;
+}
+
+/** 保存・読み込みできるリプレイの中身。 */
+export interface Recording {
+  init: InitConfig;
+  log: RecordedCommand[];
+  finalTick: number;
+  finalHashLo: number;
+  finalHashHi: number;
+}
+
 export type ToWorker =
   | { type: "init"; seed: number; sizeM: number; relief: number }
   | {
@@ -50,17 +105,15 @@ export type ToWorker =
       ranks: number;
       formation: number;
     }
-  | {
-      type: "issueMoveTo";
-      node: number;
-      xM: number;
-      yM: number;
-      facingBrad: number;
-      formation: number;
-    }
+  | OrderCommand
+  | { type: "setCommanderArchetype"; node: number; archetype: number; seedSalt: number }
   | { type: "setRunning"; running: boolean }
   | { type: "setSpeed"; speed: number }
-  | { type: "recycleBuffer"; buffer: ArrayBuffer };
+  | { type: "recycleBuffer"; buffer: ArrayBuffer }
+  | { type: "querySoldier"; id: number }
+  | { type: "queryCommander"; node: number }
+  | { type: "getRecording" }
+  | { type: "loadReplay"; recording: Recording };
 
 /**
  * M3/M4 の集計データ。毎ティックではなく間引いて送る（仕様 01 章 4 節：
@@ -75,9 +128,71 @@ export interface StatsPayload {
   messengers: number[];
 }
 
+/** `soldierDetail` の 9 要素。`crates/sim-wasm/src/lib.rs::soldier_detail` と一致させること。 */
+export interface SoldierDetail {
+  hp: number;
+  morale: number;
+  fatigue: number;
+  ammo: number;
+  /** 交戦相手の兵士 ID。いなければ null。 */
+  target: number | null;
+  bravery: number;
+  discipline: number;
+  skill: number;
+  weaponReachMm: number;
+}
+
+/** `commanderAttrs` の 10 要素。`organization::CommanderAttrs` と一致させること。 */
+export interface CommanderAttrs {
+  boldness: number;
+  caution: number;
+  initiative: number;
+  obedience: number;
+  tacticalSkill: number;
+  ambition: number;
+  charisma: number;
+  flexibility: number;
+  patience: number;
+  ruthlessness: number;
+}
+
+/** `commanderAssessment` の 8 要素 1 組ぶん。 */
+export interface SituationAssessment {
+  forceRatioPermille: number;
+  momentum: number;
+  flankLeft: number;
+  flankRight: number;
+  rearThreat: number;
+  reserveAvailable: number;
+  terrainAdvantage: number;
+  timePressure: number;
+}
+
+export interface DecisionRecord {
+  tick: number;
+  chosen: string;
+  score: number;
+  candidates: [string, number][];
+  breakdown: [string, number][];
+}
+
+export interface CommanderInfo {
+  node: number;
+  attrs: CommanderAttrs;
+  perceived: SituationAssessment;
+  actual: SituationAssessment;
+  decisionLog: DecisionRecord[];
+  /** Blackboard が知っている敵部隊（憑依中の視界制限表示用）。 */
+  knownEnemies: { node: number; xM: number; yM: number; strength: number; confidence: number; observedTick: number }[];
+}
+
 export type FromWorker =
   | {
       type: "ready";
+      /** `init`: 起動直後（デモ・シナリオを配置してよい）。`replay`: `loadReplay`
+       * による World 再構築（記録済みの命令で再現するので、ここで新たに部隊を
+       * 配置してはいけない）。 */
+      reason: "init" | "replay";
       simVersion: number;
       snapshotVersion: number;
       soldierStride: number;
@@ -89,4 +204,16 @@ export type FromWorker =
       count: number;
       buffer: ArrayBuffer;
       stats?: StatsPayload;
+    }
+  | { type: "soldierInfo"; id: number; node: number; detail: SoldierDetail | null }
+  | { type: "commanderInfo"; info: CommanderInfo }
+  | { type: "recording"; recording: Recording }
+  | {
+      type: "replayResult";
+      matched: boolean;
+      atTick: number;
+      hashLo: number;
+      hashHi: number;
+      expectedHashLo: number;
+      expectedHashHi: number;
     };
