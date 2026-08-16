@@ -313,13 +313,19 @@ impl World {
     fn face_nearest_enemy_if_close(&mut self, i: usize) {
         let pos = self.soldiers.pos(i);
         let mut neighbors = [0u32; MAX_NEIGHBORS];
-        let count = self.hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+        let count = self.hash.query_enemies(
+            &self.soldiers,
+            pos.x,
+            pos.y,
+            self.soldiers.faction[i],
+            &mut neighbors,
+        );
         // 白兵武器の間合い（最長でもパイクの 5 m）より少し広めに取る。
         let detect_r = fx_from_mm(2_500);
         let mut nearest: Option<(i64, Vec2Fx)> = None;
         for &jid in &neighbors[..count] {
             let j = jid as usize;
-            if !self.soldiers.is_alive(j) || self.soldiers.faction[j] == self.soldiers.faction[i] {
+            if !self.soldiers.is_alive(j) {
                 continue;
             }
             let jp = self.soldiers.pos(j);

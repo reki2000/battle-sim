@@ -166,7 +166,8 @@ impl CavalrySystem {
             }
 
             let pos = soldiers.pos(i);
-            let count = hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+            let count =
+                hash.query_enemies(soldiers, pos.x, pos.y, soldiers.faction[i], &mut neighbors);
             let ri = soldiers.radius(i);
             let contact_r = ri + fx_from_mm(CONTACT_RANGE_MM);
             let detect_r = ri + fx_from_mm(SPEAR_WALL_DETECT_MM);
@@ -176,7 +177,7 @@ impl CavalrySystem {
             let mut nearest: Option<(i64, usize)> = None;
             for &jid in &neighbors[..count] {
                 let j = jid as usize;
-                if j == i || !soldiers.is_alive(j) || soldiers.faction[j] == soldiers.faction[i] {
+                if !soldiers.is_alive(j) {
                     continue;
                 }
                 let jp = soldiers.pos(j);

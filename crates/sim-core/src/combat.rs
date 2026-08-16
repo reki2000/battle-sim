@@ -559,17 +559,15 @@ impl CombatSystem {
                 continue;
             }
             let pos = soldiers.pos(i);
-            let count = hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+            let count =
+                hash.query_enemies(soldiers, pos.x, pos.y, soldiers.faction[i], &mut neighbors);
             let mut best: Option<(i64, SoldierId)> = None;
             for &candidate_id in &neighbors[..count] {
                 let j = candidate_id as usize;
-                if j == i || !is_targetable(soldiers.hot.state[j]) {
+                if !is_targetable(soldiers.hot.state[j]) {
                     continue;
                 }
-                if soldiers.faction[i] == soldiers.faction[j]
-                    || (self.phase == BattlePhase::Pursuit
-                        && soldiers.hot.state[j] != State::Broken)
-                {
+                if self.phase == BattlePhase::Pursuit && soldiers.hot.state[j] != State::Broken {
                     continue;
                 }
                 let candidate = soldiers.pos(j);
@@ -615,16 +613,20 @@ impl CombatSystem {
             for &idx in &ranged_seekers {
                 let i = idx as usize;
                 let pos = soldiers.pos(i);
-                let count = ranged_index.query(pos.x, pos.y, &mut buf);
+                let count = ranged_index.query_excluding_faction(
+                    soldiers,
+                    pos.x,
+                    pos.y,
+                    soldiers.faction[i],
+                    &mut buf,
+                );
                 let mut best: Option<(i64, SoldierId)> = None;
                 for &candidate_id in &buf[..count] {
                     let j = candidate_id as usize;
-                    if j == i || !is_targetable(soldiers.hot.state[j]) {
+                    if !is_targetable(soldiers.hot.state[j]) {
                         continue;
                     }
-                    if soldiers.faction[i] == soldiers.faction[j]
-                        || (self.phase == BattlePhase::Pursuit
-                            && soldiers.hot.state[j] != State::Broken)
+                    if self.phase == BattlePhase::Pursuit && soldiers.hot.state[j] != State::Broken
                     {
                         continue;
                     }
@@ -1302,6 +1304,13 @@ impl CombatSystem {
             self.phase = BattlePhase::Complete;
         } else if broken_a * 100 >= active_a * 40 || broken_b * 100 >= active_b * 40 {
             self.phase = BattlePhase::Pursuit;
+        } else {
+            // 崩れた兵が rally で持ち直せば追撃フェーズから引き返す。片道の
+            // ラチェットのままだと、緒戦の局所的な崩れで一度 Pursuit に入った
+            // 後、双方が rally で Broken でなくなっても Pursuit のままに固定され、
+            // 交戦相手探索が Broken 限定のままなので誰も再交戦できず、
+            // 大規模会戦が白兵戦ゼロで停止する（issue #5）。
+            self.phase = BattlePhase::Battle;
         }
     }
 
@@ -1445,7 +1454,17 @@ impl CoarseIndex {
         }
     }
 
-    fn query(&self, x: Fx, y: Fx, out: &mut [u32; MAX_NEIGHBORS]) -> usize {
+    /// 周囲 3×3 セルから、`faction` とは異なる陣営の兵士だけを最大
+    /// [`MAX_NEIGHBORS`] 件集める。同陣営の候補は上限にカウントせず読み飛ばす
+    /// （`SpatialHash::query_enemies` と同じ理由。issue #5）。
+    fn query_excluding_faction(
+        &self,
+        soldiers: &Soldiers,
+        x: Fx,
+        y: Fx,
+        faction: u8,
+        out: &mut [u32; MAX_NEIGHBORS],
+    ) -> usize {
         if self.cols == 0 {
             return 0;
         }
@@ -1465,6 +1484,9 @@ impl CoarseIndex {
                 let c = (ny as usize) * (self.cols as usize) + (nx as usize);
                 let (start, end) = (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
                 for &id in &self.entries[start..end] {
+                    if soldiers.faction[id as usize] == faction {
+                        continue;
+                    }
                     if count >= MAX_NEIGHBORS {
                         return count;
                     }
@@ -1533,12 +1555,16 @@ fn injury_skill(skill: u8, hp: u16) -> i32 {
 }
 
 fn swing_ticks(weapon: Weapon, attrs: Attrs, fatigue: u16, state: State) -> u16 {
+    // skill_factor・fatigue_factor・crowding_factor はいずれもパーミル
+    // （1000 = ×1.0）で、3 つ掛け合わせると 1000^3 = 1e9 倍になる。
+    // 1e6 で割ると 1000 倍大きい ms が残り、剣の 1 振り約 2 秒のはずが
+    // 約 2000 秒（33 分）になって白兵戦がほぼ発生しなくなる（issue #5）。
     let skill_factor = (2000 - attrs.skill as i32 * 4).max(980) as i64;
     let fatigue_factor = if fatigue > 6000 { 1400 } else { 1000 };
     let crowding_factor = if state == State::Wavering { 1200 } else { 1000 };
     let ms =
         weapon.base_swing_ms as i64 * skill_factor * fatigue_factor as i64 * crowding_factor as i64
-            / 1_000_000;
+            / 1_000_000_000;
     ms_to_ticks(ms.max(50).min(u32::MAX as i64) as u32).max(1) as u16
 }
 
