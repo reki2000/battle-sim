@@ -23,6 +23,10 @@ export interface CombatStats {
   bleedKills: number;
   shotsFired: number;
   friendlyFireHits: number;
+  /** 以下 M5（騎兵）。 */
+  chargeKills: number;
+  dismounts: number;
+  horseRefusals: number;
 }
 
 export function parseCombatStats(flat: number[]): CombatStats {
@@ -39,6 +43,9 @@ export function parseCombatStats(flat: number[]): CombatStats {
     bleedKills = 0,
     shotsFired = 0,
     friendlyFireHits = 0,
+    chargeKills = 0,
+    dismounts = 0,
+    horseRefusals = 0,
   ] = flat;
   return {
     attacks,
@@ -53,6 +60,9 @@ export function parseCombatStats(flat: number[]): CombatStats {
     bleedKills,
     shotsFired,
     friendlyFireHits,
+    chargeKills,
+    dismounts,
+    horseRefusals,
   };
 }
 
