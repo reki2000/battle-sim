@@ -25,6 +25,7 @@ import type {
   InitConfig,
   OrderCommand,
   Recording,
+  ScenarioInfo,
   StatsPayload,
   ToWorker,
 } from "./protocol";
@@ -34,6 +35,8 @@ import { loadCachedTerrain, saveCachedTerrain, terrainCacheKey } from "./terrain
 let world: World | null = null;
 let memory: WebAssembly.Memory | null = null;
 let running = false;
+/** `loop()` が既に回っているか。会戦を選び直しても 2 本目を始めない。 */
+let looping = false;
 let speed = 1;
 let accumulatorMs = 0;
 let lastRealMs = 0;
@@ -288,7 +291,7 @@ const MUTATING_TYPES = new Set<ToWorker["type"]>([
 ]);
 
 /** `init` 直後・`loadReplay` での World 再構築後、共通の地形ペイロードを組み立てて送る。 */
-function postReady(reason: "init" | "replay"): void {
+function postReady(reason: "init" | "replay", scenarios?: ScenarioInfo[]): void {
   if (!world || !memory) return;
   soldierStride = World.soldierStride();
 
@@ -318,6 +321,8 @@ function postReady(reason: "init" | "replay"): void {
       simVersion: World.simVersion(),
       snapshotVersion: World.snapshotVersion(),
       soldierStride,
+      ...(recordedInit?.scenario !== undefined ? { scenario: recordedInit.scenario } : {}),
+      ...(scenarios ? { scenarios } : {}),
       terrain: {
         dim,
         cellM: world.terrainCellM(),
@@ -340,30 +345,53 @@ function postReady(reason: "init" | "replay"): void {
  * 次回のために非同期で保存する（起動をブロックしない・失敗は握りつぶす）。
  * `init`・`loadReplay` の両方から使う。
  */
-async function createWorld(seed: number, sizeM: number, relief: number): Promise<World> {
+async function createWorld(config: InitConfig): Promise<World> {
+  const { seed, sizeM, relief, scenario } = config;
   const seedLo = seed >>> 0;
   const seedHi = Math.floor(seed / 2 ** 32) >>> 0;
-  const cacheKey = terrainCacheKey(seed, sizeM, relief);
+  // 会戦プリセットの地形は生成後に整形される（森の縁・泥濘・緩斜面）ので、
+  // 同じ (seed, sizeM, relief) でも中身が違う。キャッシュキーを分ける。
+  const cacheKey = terrainCacheKey(seed, sizeM, relief, scenario);
   const cached = await loadCachedTerrain(cacheKey);
   if (cached) {
     // 同じグリッドから作るので、以後の挙動は再生成した場合と完全に一致する
-    // （sim-wasm の from_cached_terrain_matches_a_freshly_generated_world
-    // テストで検証済み）。
-    return World.fromCachedTerrain(
-      seedLo,
-      seedHi,
-      cached.dim,
-      cached.cellM,
-      cached.height,
-      cached.surface,
-      cached.passability,
-      cached.water,
-      cached.waterKind,
-      cached.cliff,
-      Int32Array.from(cached.battleSitesFlat),
-    );
+    // （sim-wasm の from_cached_terrain_matches_a_freshly_generated_world /
+    // scenario_from_cached_terrain_matches_a_freshly_built_one で検証済み）。
+    const restored =
+      scenario === undefined
+        ? World.fromCachedTerrain(
+            seedLo,
+            seedHi,
+            cached.dim,
+            cached.cellM,
+            cached.height,
+            cached.surface,
+            cached.passability,
+            cached.water,
+            cached.waterKind,
+            cached.cliff,
+            Int32Array.from(cached.battleSitesFlat),
+          )
+        : World.fromScenarioCachedTerrain(
+            scenario,
+            cached.dim,
+            cached.cellM,
+            cached.height,
+            cached.surface,
+            cached.passability,
+            cached.water,
+            cached.waterKind,
+            cached.cliff,
+            Int32Array.from(cached.battleSitesFlat),
+          );
+    if (restored) return restored;
   }
-  const w = new World(seedLo, seedHi, sizeM, relief);
+  // プリセットの index が未知なら（記録が新しい版で作られた等）、
+  // 従来の手続き生成へ落として起動だけは通す。
+  const w =
+    scenario === undefined
+      ? new World(seedLo, seedHi, sizeM, relief)
+      : (World.fromScenario(scenario) ?? new World(seedLo, seedHi, sizeM, relief));
   const dim = w.terrainDim();
   const cells = dim * dim;
   const mem = memory!;
@@ -392,20 +420,31 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
 
   switch (msg.type) {
     case "init": {
-      const wasm = await init();
-      memory = wasm.memory;
-      world = await createWorld(msg.seed, msg.sizeM, msg.relief);
-      recordedInit = { seed: msg.seed, sizeM: msg.sizeM, relief: msg.relief };
+      if (!memory) {
+        const wasm = await init();
+        memory = wasm.memory;
+      }
+      recordedInit = {
+        seed: msg.seed,
+        sizeM: msg.sizeM,
+        relief: msg.relief,
+        ...(msg.scenario !== undefined ? { scenario: msg.scenario } : {}),
+      };
+      world = await createWorld(recordedInit);
       recordingLog = [];
       replayQueue = [];
       replayTargetTick = -1;
       replayExpected = null;
 
       lastStatsTick = -STATS_INTERVAL_TICKS;
-      postReady("init");
+      postReady("init", JSON.parse(World.scenarioListJson()) as ScenarioInfo[]);
 
       lastRealMs = performance.now();
-      loop();
+      // `init` は会戦を選び直すたびに来る。ループは 1 本だけ回す。
+      if (!looping) {
+        looping = true;
+        loop();
+      }
       break;
     }
 
@@ -466,8 +505,8 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
 
     case "loadReplay": {
       const rec = msg.recording;
-      world = await createWorld(rec.init.seed, rec.init.sizeM, rec.init.relief);
       recordedInit = rec.init;
+      world = await createWorld(rec.init);
       recordingLog = [];
       replayQueue = rec.log.map((e) => ({ atTick: e.atTick, msg: e.msg }));
       replayTargetTick = rec.finalTick;

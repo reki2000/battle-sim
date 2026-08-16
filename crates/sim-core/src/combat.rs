@@ -833,11 +833,36 @@ impl CombatSystem {
             if candidates.is_empty() || !rng.chance_permille(hit_chance) {
                 continue;
             }
-            let hit_id = candidates
-                .iter()
-                .find(|&&(_, id)| id == shot.target)
-                .map(|&(_, id)| id)
-                .unwrap_or(candidates[0].1);
+            // 当たった相手を選ぶ。狙った相手が着弾点にまだ立っていれば、
+            // それが当たった相手。
+            //
+            // 近傍集合（`query_neighbors`）は密集地では上限
+            // （[`MAX_NEIGHBORS`]）で先着順に切れるので、狙った相手が
+            // そこに入っている保証がない（`query_enemies` の注記と同じ
+            // 事情）。集合だけを見て「一番近い者」に当てると、白兵の塊へ
+            // 射ち込んだ矢がほぼ毎回手前の味方に当たり、密集した射撃部隊が
+            // 自分の前列を撃ち崩してしまう。狙った相手を直接確かめることで
+            // これを避ける。誤射（流れ矢）は、狙った相手がその場を離れた
+            // ときに残る。
+            let target_still_at_aim = soldiers
+                .index_if_present(shot.target)
+                .filter(|&j| is_targetable(soldiers.hot.state[j]))
+                .is_some_and(|j| {
+                    dist_sq(shot.aim_point, soldiers.pos(j)) <= AIM_POINT_TOLERANCE_SQ
+                });
+            let shooter_faction = soldiers.faction.get(shot.attacker as usize).copied();
+            let hit_id = if target_still_at_aim {
+                shot.target
+            } else {
+                candidates
+                    .iter()
+                    // 狙いを外れた矢も、着弾点に敵がいるなら味方より先に敵へ当たる。
+                    .find(|&&(_, id)| {
+                        shooter_faction.is_some_and(|f| soldiers.faction[id as usize] != f)
+                    })
+                    .map(|&(_, id)| id)
+                    .unwrap_or(candidates[0].1)
+            };
             let hit_idx = hit_id as usize;
 
             let location = hit_location(&mut rng);
@@ -1161,7 +1186,12 @@ impl CombatSystem {
             morale -= local_dead * 8;
             morale += enemy_broken * 8;
             morale -= soldiers.fatigue[i] as i32 / 5000;
-            if soldiers.target[i] != NO_ID {
+            // 白兵の間合いで組み合っている圧力。射撃兵が遠くの敵を狙っている
+            // だけの状態はこれに当たらない——撃ち返されているとは限らないし、
+            // 撃つ側の士気が撃つほど下がるのは実態と逆になる。この区別が無いと、
+            // 射程 120 m の長弓兵は接触の何分も前から士気を削られ、一度も
+            // 撃たれないまま崩れる。
+            if soldiers.target[i] != NO_ID && !self.weapons[i].ranged {
                 morale -= 25.min(morale.max(0));
             }
             self.morale_pressure[i] = u8::from(
@@ -1447,6 +1477,12 @@ fn hit_location(rng: &mut Rng) -> HitLocation {
     }
 }
 
+/// 矢が「狙ったところに落ちた」とみなす許容半径（mm）。着弾点からこの距離に
+/// 標的がまだ立っていれば、当たったのはその標的。
+const AIM_POINT_TOLERANCE_MM: i32 = 1_000;
+const AIM_POINT_TOLERANCE_SQ: i64 =
+    (fx_from_mm(AIM_POINT_TOLERANCE_MM) as i64) * (fx_from_mm(AIM_POINT_TOLERANCE_MM) as i64);
+
 fn type_factor(damage_type: DamageType, armor: ArmorClass) -> i32 {
     match (damage_type, armor) {
         (DamageType::Cut, ArmorClass::ClothLeather) => 1000,
@@ -1656,6 +1692,82 @@ mod tests {
         assert!(
             soldiers.hp[1] < start_hp || combat.stats.shots_fired > 1,
             "矢が着弾も再発射もしていない"
+        );
+    }
+
+    /// 遠くの敵を狙っているだけの射撃兵は、白兵の圧力による士気低下を受けない。
+    /// 受けてしまうと、射程 120 m の長弓兵は接触の何分も前から士気を削られ、
+    /// 一度も撃たれないまま崩れる。
+    #[test]
+    fn shooting_at_a_distant_enemy_does_not_drain_morale_like_melee_does() {
+        let drain = |ranged: bool| {
+            let mut soldiers = Soldiers::default();
+            let mut combat = CombatSystem::default();
+            if ranged {
+                // 長弓の射程内・白兵の間合いの外に敵を置く。
+                soldiers.push(fx(10), fx(10), brad_from_deg(90), 0, 0, attrs(200, 200), 0);
+                soldiers.push(fx(10), fx(70), brad_from_deg(270), 0, 1, attrs(20, 20), 0);
+                combat.ensure_len(soldiers.len());
+                combat.set_loadout(0, Weapon::longbow(), Armor::cloth());
+            } else {
+                soldiers = soldiers_pair();
+                combat.ensure_len(soldiers.len());
+            }
+            let mut hash = SpatialHash::default();
+            let before = soldiers.morale[0];
+            for tick in 0..20 {
+                hash.rebuild(&soldiers);
+                combat.tick(5, tick, &mut soldiers, &hash);
+            }
+            assert_eq!(soldiers.target[0], 1, "標的を捕捉していない");
+            before as i32 - soldiers.morale[0] as i32
+        };
+        assert!(drain(false) > 100, "白兵の圧力で士気が下がっていない");
+        assert!(drain(true) <= 0, "射撃だけで士気が削られている");
+    }
+
+    /// 味方の密集の向こうにいる敵を狙った矢は、狙った相手に当たる。
+    ///
+    /// 着弾点の近傍集合は上限で先着順に切れるため、ここで標的を直接
+    /// 確かめないと、混戦へ射ち込んだ矢が毎回手前の味方に当たり、密集した
+    /// 射撃部隊が自分の前列を撃ち崩してしまう。
+    #[test]
+    fn arrows_reach_the_soldier_they_were_aimed_at_through_a_friendly_crowd() {
+        let mut soldiers = Soldiers::default();
+        // 射手。
+        soldiers.push(fx(10), fx(10), brad_from_deg(90), 0, 0, attrs(220, 220), 0);
+        // 標的（敵）。射手から 30 m 先。
+        soldiers.push(fx(10), fx(40), brad_from_deg(270), 0, 1, attrs(20, 20), 0);
+        // 標的を取り囲む味方の塊。近傍集合の枠を先に埋める。
+        for k in 0..MAX_NEIGHBORS as i32 {
+            let dx = fx_from_mm(300 * (k % 4 - 2));
+            let dy = fx_from_mm(300 * (k / 4 - 1));
+            soldiers.push(
+                fx(10) + dx,
+                fx(40) + dy,
+                brad_from_deg(90),
+                0,
+                0,
+                attrs(120, 120),
+                0,
+            );
+        }
+        let mut hash = SpatialHash::default();
+        let mut combat = CombatSystem::default();
+        combat.ensure_len(soldiers.len());
+        combat.set_loadout(0, Weapon::longbow(), Armor::cloth());
+        for i in 1..soldiers.len() {
+            combat.set_loadout(i as SoldierId, Weapon::dagger(), Armor::cloth());
+        }
+
+        for tick in 0..600 {
+            hash.rebuild(&soldiers);
+            combat.tick(31, tick, &mut soldiers, &hash);
+        }
+        assert!(combat.stats.shots_fired > 0, "矢が発射されていない");
+        assert_eq!(
+            combat.stats.friendly_fire_hits, 0,
+            "狙った敵がその場に立っているのに味方へ当たっている"
         );
     }
 

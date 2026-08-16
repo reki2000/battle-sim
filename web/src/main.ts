@@ -22,6 +22,7 @@ import {
 import { OrderPanel } from "./ui/orders";
 import { DetailPanel } from "./ui/detail-panel";
 import { SessionPanel } from "./ui/session-panel";
+import { ScenarioPanel } from "./ui/scenario-panel";
 import { t, onLangChange } from "./i18n";
 import { getQuality, onQualityChange } from "./quality";
 
@@ -41,7 +42,16 @@ const hud = document.getElementById("hud") as HTMLDivElement;
 const commandPanel = document.getElementById("command-panel") as HTMLDivElement;
 const detailPanelEl = document.getElementById("detail-panel") as HTMLDivElement;
 const sessionPanelEl = document.getElementById("session-panel") as HTMLDivElement;
+const scenarioPanelEl = document.getElementById("scenario-panel") as HTMLDivElement;
 const battleReportEl = document.getElementById("battle-report") as HTMLDivElement;
+
+/**
+ * 会戦プリセットを選んでいないときの起動設定（従来の対称デモ配置）。
+ * `?soldiers=N` による規模の上書きもこちらだけに効く。
+ */
+const SANDBOX_INIT = { seed: 0x5eed1234, sizeM: 2000, relief: 400 };
+/** `?scenario=` をまだ消化していないか。効かせるのは起動直後の 1 回だけ。 */
+let urlScenarioPending = true;
 
 const cam = new Camera();
 const terrainGl = new TerrainGlRenderer(terrainCanvas);
@@ -85,11 +95,13 @@ const orderPanel = new OrderPanel(
 );
 const detailPanel = new DetailPanel(detailPanelEl);
 const sessionPanel = new SessionPanel(sessionPanelEl, battleReportEl, send);
+const scenarioPanel = new ScenarioPanel(scenarioPanelEl, send, SANDBOX_INIT);
 
 onLangChange(() => {
   orderPanel.refreshLang();
   detailPanel.render();
   sessionPanel.render();
+  scenarioPanel.render();
 });
 
 onQualityChange(() => {
@@ -166,7 +178,26 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     orderPanel.possessedNode = null;
     orderPanel.update([]);
 
-    if (msg.reason === "init") {
+    if (msg.scenarios) {
+      scenarioPanel.setScenarios(msg.scenarios, msg.scenario);
+      // `?scenario=agincourt_1415`（id でも index でも可）で、起動直後に
+      // そのプリセットへ切り替える。効かせるのは最初の 1 回だけ——毎回見ると、
+      // UI からデモ配置へ戻したときに URL が上書きし返してしまう。
+      const requested = urlScenarioPending
+        ? new URLSearchParams(location.search).get("scenario")
+        : null;
+      urlScenarioPending = false;
+      if (requested !== null && msg.scenario === undefined) {
+        const byId = msg.scenarios.findIndex((s) => s.id === requested);
+        const index = byId >= 0 ? byId : Number(requested);
+        if (Number.isInteger(index) && index >= 0 && index < msg.scenarios.length) {
+          scenarioPanel.selectFromUrl(index);
+          return;
+        }
+      }
+    }
+
+    if (msg.reason === "init" && msg.scenario === undefined) {
       // 両軍を向かい合わせに配置し、指揮ツリーの陣形として互いに向かって進ませる。
       // 前列同士の目標座標を完全に一致させると、押し合いの逃げ場がなく密着しすぎて
       // 前列判定が誰も成立しなくなるため、隊列の奥行き＋わずかな隙間ぶんだけ
@@ -229,6 +260,11 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
         formation: SHIELDWALL,
       });
 
+      setRunning(true);
+    } else if (msg.reason === "init") {
+      // 会戦プリセットは両軍・指揮系統・築城までワーカー側で配置済み。
+      // ここから命令は出さない——動き出すのは指揮官 AI の判断による。
+      cam.setViewWidthM(msg.terrain.sizeM * 0.6);
       setRunning(true);
     } else {
       // リプレイは worker 側で既に running=true にしている。
@@ -482,4 +518,4 @@ requestAnimationFrame(frame);
 
 // ── 起動 ────────────────────────────────────────────────
 
-send({ type: "init", seed: 0x5eed1234, sizeM: 2000, relief: 400 });
+send({ type: "init", ...SANDBOX_INIT });

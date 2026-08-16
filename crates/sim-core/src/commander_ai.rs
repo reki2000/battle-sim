@@ -202,7 +202,14 @@ fn update_blackboard(
     let mut seen: Vec<KnownForce> = Vec::new();
     let mut unseen_ids: Vec<NodeId> = Vec::new();
     for other in &command.nodes {
-        if other.faction == faction || other.unit.is_none() || other.stats.alive == 0 {
+        if other.faction == faction || other.unit.is_none() {
+            continue;
+        }
+        if other.stats.alive == 0 {
+            // 全滅した部隊は「そこに居るはずだが見当たらない」ものとして扱い、
+            // 確信を減衰させる。ここを素通りさせると、消えた部隊が満額の確信の
+            // まま Blackboard に残り続け、指揮官がそれを標的に選び続ける。
+            unseen_ids.push(other.id);
             continue;
         }
         let dist_mm = sim_math::fx_to_mm(dist(observer_pos, other.stats.centroid));
@@ -576,11 +583,19 @@ fn choose_objective(
             .find(|(o, _)| objective_kind(*o) == objective_kind(cur))
             .map(|(_, s)| s.score)
     });
+    // 包囲の標的が消滅していたら、同じ種類の目的でも選び直す。ここを見ないと
+    // 「もう居ない部隊を包囲し続ける」状態から抜けられない——`objective_kind` は
+    // 標的を区別しないので、スコアは同点のまま維持され続けてしまう。
+    let target_gone = matches!(
+        node.strategic_objective,
+        Some(Objective::Envelop { target })
+            if command.node(target).map_or(true, |n| n.stats.alive == 0)
+    );
     let switch_margin = (255 - attrs.flexibility as i32) * 2;
     let should_switch = match (node.strategic_objective, current_score) {
         (None, _) => true,
         (Some(_), None) => true,
-        (Some(_), Some(cur)) => best.score > cur + switch_margin,
+        (Some(_), Some(cur)) => target_gone || best.score > cur + switch_margin,
     };
     if !should_switch {
         return None;
@@ -1243,6 +1258,88 @@ mod tests {
             confidence_after < confidence_seen,
             "見えなくなっても confidence が下がっていない: before={confidence_seen} after={confidence_after}"
         );
+    }
+
+    /// 包囲していた敵部隊が全滅したら、指揮官は別の敵へ目的を組み直す。
+    ///
+    /// `objective_kind` は標的を区別しないので、ここで標的の消滅を見ないと
+    /// 「もう居ない部隊を包囲し続ける」状態から抜けられず、会戦が止まる。
+    #[test]
+    fn envelop_retargets_once_the_enveloped_force_is_wiped_out() {
+        let mut command = CommandTree::new();
+        let terrain = small_terrain(1);
+        let mut soldiers = Soldiers::default();
+
+        let leader = soldiers.push(fx(200), fx(200), 0, 0, 0, Attrs::default(), 0);
+        let child = soldiers.push(fx(201), fx(200), 0, 0, 0, Attrs::default(), 0);
+        let doomed = soldiers.push(fx(210), fx(200), 0, 0, 1, Attrs::default(), 0);
+        let survivor = soldiers.push(fx(190), fx(200), 0, 0, 1, Attrs::default(), 0);
+
+        let root = command.add_node(None, 0, 0, leader, vec![], None);
+        let _child_node = command.add_node(
+            Some(root),
+            1,
+            0,
+            child,
+            vec![],
+            Some(leaf_unit(vec![child], Vec2Fx::new(fx(201), fx(200)), 0)),
+        );
+        let doomed_node = command.add_node(
+            None,
+            1,
+            1,
+            doomed,
+            vec![],
+            Some(leaf_unit(vec![doomed], Vec2Fx::new(fx(210), fx(200)), 0)),
+        );
+        let _survivor_node = command.add_node(
+            None,
+            1,
+            1,
+            survivor,
+            vec![],
+            Some(leaf_unit(vec![survivor], Vec2Fx::new(fx(190), fx(200)), 0)),
+        );
+        set_archetype(
+            &mut command,
+            root,
+            archetype_index("honor_hungry_knight").unwrap(),
+            7,
+            1,
+        );
+
+        // まず両方の敵を見せ、どちらかを包囲の標的に選ばせる。
+        for tick in 0..3 {
+            command.tick(&mut soldiers, &terrain, tick);
+            update_blackboard(root, &mut command, &soldiers, &terrain, tick);
+        }
+        let Some((objective, ..)) = choose_objective(root, &command, &terrain, 7, 3) else {
+            panic!("最初の目的が選ばれていない");
+        };
+        command.node_mut(root).unwrap().strategic_objective = Some(objective);
+        let first_target = match objective {
+            Objective::Envelop { target } => target,
+            other => panic!("包囲が選ばれていない: {other:?}"),
+        };
+
+        // 標的だけを全滅させる。もう一方は健在なまま。
+        let dead_soldier = if first_target == doomed_node {
+            doomed
+        } else {
+            survivor
+        };
+        soldiers.hot.state[dead_soldier as usize] = crate::soldiers::State::Dead;
+        for tick in 3..8 {
+            command.tick(&mut soldiers, &terrain, tick);
+            update_blackboard(root, &mut command, &soldiers, &terrain, tick);
+        }
+
+        let Some((next, ..)) = choose_objective(root, &command, &terrain, 7, 8) else {
+            panic!("標的が消えたのに目的を選び直していない");
+        };
+        if let Objective::Envelop { target } = next {
+            assert_ne!(target, first_target, "全滅した部隊を包囲し続けている");
+        }
     }
 
     /// 仕様 12 章 M7 の受け入れ条件「ambition の高い騎士が命令を無視して

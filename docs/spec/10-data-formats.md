@@ -344,6 +344,28 @@ broken_cascade_coef = 6
 
 ## 10. シナリオ
 
+### 実装済みの範囲
+
+TOML の実行時ローダー（`sim-data`）はまだ無い。`data/scenarios/*.toml` は
+人間が読む正本で、実際に読まれるのは同じ内容を写した
+`sim_core::scenario` の定数（`data/formations.toml` と
+`organization::formation_def` の関係と同じ）。
+
+下のスキーマのうち、現時点で解釈できるのは次の範囲。
+
+| 節 | 状態 |
+|---|---|
+| `[terrain]` | 生成パラメータ + シナリオ固有の地形整形（03 章 3.3 節） |
+| `[[army]]` | 軍 → 部隊の 2 階層。中間階層（Battle/Banner/Company）はまだ作らない |
+| `army.contingent` | 兵科・練度・装備・陣形・配置・杭列 |
+| `commander` | アーキタイプ（性格）と、軍単位の会戦プラン |
+| `[time]` | 未実装（準備時間・開始時刻） |
+| `[victory]` | 未実装（勝敗は死傷と残存で読む） |
+| `weather` | 未実装。結果である泥濘を地形整形で焼き込んで代用する |
+
+シナリオは**命令を持たない**。両軍は陣形の上に立つだけで、動き出すのは
+各軍の指揮官 AI（05 章）が性格と会戦プランから下す判断による。
+
 ```toml
 [scenario]
 id = "agincourt_like"

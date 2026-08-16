@@ -27,11 +27,56 @@ export interface TerrainPayload {
   battleSites: number[];
 }
 
-/** `init` の再現に必要な最小情報。録画・リプレイで使う。 */
+/**
+ * `init` の再現に必要な最小情報。録画・リプレイで使う。
+ *
+ * `scenario` が付いていれば、地形も両軍もそのプリセット（`sim_core::scenario`）
+ * から決まるので、`seed`/`sizeM`/`relief` は無視される。プリセットを選んだ
+ * 会戦のリプレイは、プリセットの index さえあれば再現できる。
+ */
 export interface InitConfig {
   seed: number;
   sizeM: number;
   relief: number;
+  /** 会戦プリセットの index。省略時は従来の対称デモ配置。 */
+  scenario?: number;
+}
+
+/** `scenarioListJson()` の 1 要素。`crates/sim-wasm` の `scenario_json` と一致させること。 */
+export interface ScenarioContingentInfo {
+  nameJa: string;
+  commanderJa: string;
+  archetype: string;
+  count: number;
+  troopType: number;
+}
+
+export interface ScenarioArmyInfo {
+  faction: number;
+  nameJa: string;
+  commanderJa: string;
+  archetype: string;
+  /** 開始時の会戦プラン。指揮官 AI に任せる場合は "-"。 */
+  battlePlan: string;
+  soldiers: number;
+  contingents: ScenarioContingentInfo[];
+}
+
+export interface ScenarioInfo {
+  id: string;
+  nameJa: string;
+  nameEn: string;
+  year: number;
+  placeJa: string;
+  summaryJa: string;
+  historicalStrengthJa: string;
+  scaleNoteJa: string;
+  sizeM: number;
+  relief: number;
+  seedLo: number;
+  seedHi: number;
+  soldiers: number;
+  armies: ScenarioArmyInfo[];
 }
 
 /**
@@ -83,7 +128,7 @@ export interface Recording {
 }
 
 export type ToWorker =
-  | { type: "init"; seed: number; sizeM: number; relief: number }
+  | { type: "init"; seed: number; sizeM: number; relief: number; scenario?: number }
   | {
       type: "deploy";
       xM: number;
@@ -197,6 +242,11 @@ export type FromWorker =
       snapshotVersion: number;
       soldierStride: number;
       terrain: TerrainPayload;
+      /** 会戦プリセットから作られたなら、その index。両軍はワーカー側で
+       * 配置済みなので、メインスレッドはデモ配置を送ってはいけない。 */
+      scenario?: number;
+      /** 選択できる会戦プリセットの一覧（`init` のときだけ付く）。 */
+      scenarios?: ScenarioInfo[];
     }
   | {
       type: "snapshot";

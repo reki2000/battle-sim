@@ -72,7 +72,8 @@
         max-width: 320px;
       }
       #command-panel,
-      #detail-panel {
+      #detail-panel,
+      #scenario-panel {
         padding: 10px 14px;
         background: rgba(10, 14, 20, 0.78);
         border: 1px solid rgba(255, 255, 255, 0.12);
@@ -87,6 +88,14 @@
       }
       #detail-panel {
         max-height: 30vh;
+      }
+      #scenario-panel {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        margin-top: 132px;
+        max-width: 300px;
+        max-height: 52vh;
       }
       #session-panel {
         position: fixed;
@@ -204,6 +213,7 @@
     </div>
     <div id="hud">起動中…</div>
     <div id="session-panel"></div>
+    <div id="scenario-panel"></div>
     <div id="right-stack">
       <div id="command-panel"></div>
       <div id="detail-panel"></div>
