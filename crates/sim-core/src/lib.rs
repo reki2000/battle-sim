@@ -3,29 +3,36 @@
 //! このクレートは wasm に依存しない。ネイティブでテストとベンチができる
 //! （`sim-headless`）ことが、バランス調整と性能計測の前提になっている。
 //!
-//! M0〜M2 の移動基盤に加え、M3 の指揮ツリー・命令・陣形を実装する。
-//! M4 の白兵戦・負傷・士気の基礎も実装する（`docs/spec/12-roadmap.md`）。
+//! M0〜M2 の移動基盤に加え、M3 の指揮ツリー・命令・陣形、M4 の白兵戦・負傷・
+//! 士気、M5 の騎兵突撃、M6 の工兵（作業タスク・野戦築城・地形改修・矢の補給・
+//! 負傷者回収）を実装する（`docs/spec/12-roadmap.md`）。
 
 #![forbid(unsafe_code)]
 
 pub mod cavalry;
 pub mod combat;
+pub mod engineering;
 pub mod organization;
 pub mod pathing;
 pub mod snapshot;
 pub mod soldiers;
 pub mod spatial;
+pub mod structures;
 
 use cavalry::CavalrySystem;
 use combat::CombatSystem;
+use engineering::EngineeringSystem;
 use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
 use sim_terrain::{Terrain, TerrainParams, SURFACE_EFFECTS};
 use soldiers::{flags, Attrs, SoldierId, Soldiers, State};
 use spatial::{SpatialHash, MAX_NEIGHBORS};
+use structures::StructureSystem;
 
 /// シミュレーションのロジックバージョン。リプレイの互換性判定に使う。
-pub const SIM_VERSION: u32 = 3;
+///
+/// M6 で工兵（野戦築城・地形改修・矢の補給・負傷者回収）を追加したため 3 → 4。
+pub const SIM_VERSION: u32 = 4;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -65,6 +72,10 @@ pub struct World {
     pub combat: CombatSystem,
     /// M5 の騎兵：突撃のモメンタム・馬の忌避・衝撃・落馬後の徒歩化。
     pub cavalry: CavalrySystem,
+    /// M6 の野戦築城・地形改修の対象（杭列・堀・鹿砦・土塁・馬防柵・橋）。
+    pub structures: StructureSystem,
+    /// M6 の工兵：作業タスク・矢の補給・負傷者回収。
+    pub engineering: EngineeringSystem,
     /// 各兵士の目標位置。M2 で陣形スロットに置き換わる
     goal: Vec<Vec2Fx>,
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
@@ -97,6 +108,8 @@ impl World {
             command: CommandTree::new(),
             combat: CombatSystem::default(),
             cavalry: CavalrySystem::default(),
+            structures: StructureSystem::default(),
+            engineering: EngineeringSystem::default(),
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
@@ -141,6 +154,7 @@ impl World {
         );
         self.combat.register();
         self.cavalry.register();
+        self.engineering.register();
         if soldier_flags & flags::MOUNTED != 0 {
             self.combat.set_mounted(id, true);
         }
@@ -223,6 +237,99 @@ impl World {
             .change_formation(node, formation, &self.soldiers, self.tick)
     }
 
+    // ------------------------------------------------------------------
+    // M6: 工兵タスク・野戦築城・地形改修・補給・負傷者回収
+    // ------------------------------------------------------------------
+
+    /// 野戦築城タスクを投入する（杭列・堀・鹿砦・土塁・馬防柵、仕様 07 章 2 節）。
+    pub fn queue_build_structure(
+        &mut self,
+        kind: structures::StructureKind,
+        a: Vec2Fx,
+        b: Vec2Fx,
+        owner: u8,
+        priority: u8,
+    ) -> engineering::TaskId {
+        self.engineering
+            .queue_build_structure(&mut self.structures, kind, a, b, owner, priority)
+    }
+
+    /// 敵構造物の破壊工作タスクを投入する。
+    pub fn queue_destroy_structure(
+        &mut self,
+        structure: structures::StructureId,
+        owner: u8,
+        priority: u8,
+    ) -> Option<engineering::TaskId> {
+        self.engineering
+            .queue_destroy_structure(&self.structures, structure, owner, priority)
+    }
+
+    /// 架橋タスクを投入する（仕様 07 章 3.1 節）。`a`-`b` の直線上に水面が
+    /// なければ `None`。
+    pub fn queue_build_bridge(
+        &mut self,
+        a: Vec2Fx,
+        b: Vec2Fx,
+        owner: u8,
+        priority: u8,
+    ) -> Option<engineering::TaskId> {
+        self.engineering
+            .queue_build_bridge(&self.terrain, a, b, owner, priority)
+    }
+
+    /// 橋の破壊工作タスクを投入する。
+    pub fn queue_destroy_bridge(
+        &mut self,
+        bridge_task: engineering::TaskId,
+        owner: u8,
+        priority: u8,
+    ) -> Option<engineering::TaskId> {
+        self.engineering
+            .queue_destroy_bridge(bridge_task, owner, priority)
+    }
+
+    /// 伐採タスクを投入する（仕様 07 章 3.3 節）。矩形内に森がなければ `None`。
+    pub fn queue_clear_forest(
+        &mut self,
+        min: Vec2Fx,
+        max: Vec2Fx,
+        owner: u8,
+        priority: u8,
+    ) -> Option<engineering::TaskId> {
+        self.engineering
+            .queue_clear_forest(&self.terrain, min, max, owner, priority)
+    }
+
+    /// 補給拠点を配置する（仕様 07 章 5.1 節）。
+    pub fn spawn_supply_depot(
+        &mut self,
+        pos: Vec2Fx,
+        owner: u8,
+        arrows: u32,
+        bolts: u32,
+        stones: u32,
+    ) -> engineering::DepotId {
+        self.engineering
+            .spawn_depot(pos, owner, arrows, bolts, stones)
+    }
+
+    /// 矢の補給を要求する。
+    pub fn request_arrow_resupply(
+        &mut self,
+        depot: engineering::DepotId,
+        rally_point: Vec2Fx,
+        owner: u8,
+    ) {
+        self.engineering
+            .request_arrow_resupply(depot, rally_point, owner);
+    }
+
+    /// 倒れた兵士の回収を要求する（仕様 07 章 5.2 節）。
+    pub fn request_wounded_recovery(&mut self, patient: SoldierId, owner: u8) {
+        self.engineering.request_wounded_recovery(patient, owner);
+    }
+
     /// 1 ティック進める。
     ///
     /// フェーズの順序は仕様 02 章 5 節に従う。M0 では未実装のフェーズを飛ばす。
@@ -242,10 +349,24 @@ impl World {
             &mut self.soldiers,
             &self.hash,
             &mut self.combat,
+            &mut self.structures,
             map_limit,
         );
         self.combat
             .tick(self.seed, self.tick, &mut self.soldiers, &self.hash);
+        // 工兵（M6）は白兵・射撃・騎兵の交戦判定の後に置く。こうすると、
+        // 実戦闘に引き込まれた工兵の `State` はすでに書き換わっており、
+        // `engineering.tick` はそれを見て作業を打ち切るだけでよい
+        // （`engineering` モジュール冒頭のドキュメント参照）。
+        self.engineering.tick(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &mut self.structures,
+            &mut self.terrain,
+            &mut self.combat,
+            &mut self.goal,
+        );
         self.steer();
         self.integrate_motion();
         self.resolve_collisions();
@@ -369,6 +490,15 @@ impl World {
         let surface = self.terrain.surface_at(pos.x, pos.y);
         let eff = &SURFACE_EFFECTS[surface as usize];
         let after_terrain = sim_math::fx_scale_permille(per_tick, eff.move_mult as i32);
+        // 野戦築城（仕様 07 章 2 節、M6）: 杭列・堀・鹿砦・土塁・馬防柵は
+        // 歩兵を減速させる。騎兵に対しては速度を落とすのではなく
+        // `integrate_motion` で進入そのものを塞ぐので、ここでは歩兵にだけ適用する。
+        let after_terrain = if mounted {
+            after_terrain
+        } else {
+            let (structure_move_mult, _cohesion_mult) = self.structures.infantry_effect_at(pos);
+            sim_math::fx_scale_permille(after_terrain, structure_move_mult as i32)
+        };
 
         // 疲労 10000 で 40% 減。騎乗中は馬自身の疲労も掛け合わせる
         // （仕様「馬の疲労は騎手より早く蓄積する」）。
@@ -415,6 +545,19 @@ impl World {
             let (cx, cy) = self.terrain.world_to_cell(next_x, next_y);
             let idx = self.terrain.idx(cx, cy);
             if self.terrain.passability[idx] == 0 {
+                self.soldiers.hot.vel_x[i] = 0;
+                self.soldiers.hot.vel_y[i] = 0;
+                continue;
+            }
+
+            // 完成した堀・鹿砦・土塁・馬防柵は騎兵の進入そのものを塞ぐ
+            // （仕様 07 章 2 節、M6。杭列は塞がず `cavalry::CavalrySystem` 側の
+            // 忌避判定に任せる）。
+            if self.soldiers.hot.flags[i] & flags::MOUNTED != 0
+                && self
+                    .structures
+                    .blocks_cavalry_at(Vec2Fx::new(next_x, next_y))
+            {
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
                 continue;
@@ -584,6 +727,8 @@ impl World {
         mix(self.command.state_hash());
         mix(self.combat.state_hash());
         mix(self.cavalry.state_hash());
+        mix(self.structures.state_hash());
+        mix(self.engineering.state_hash());
         for i in 0..self.soldiers.len() {
             mix(self.soldiers.hot.pos_x[i] as u32 as u64);
             mix(self.soldiers.hot.pos_y[i] as u32 as u64);
@@ -973,5 +1118,101 @@ mod tests {
             "騎兵突撃が誰にも損害を与えていない (damage={damage_a}, attacks={attacks_a})"
         );
         let _ = (damage_b, attacks_b);
+    }
+
+    /// 仕様 12 章 M6 の受け入れ条件「杭列が騎兵突撃を実際に止める」を、
+    /// 上と同じ指揮系統込みの `World` シナリオで確認する。杭列を敵陣の手前に
+    /// 完成させておくと、素通しの場合（上のテスト）に比べて騎兵が敵陣へ
+    /// 与える損害が明確に少なくなる。
+    #[test]
+    fn completed_stakes_reduce_cavalry_charge_damage_end_to_end() {
+        fn run(with_stakes: bool) -> u32 {
+            let mut w = small_world();
+            let rider = w.spawn(
+                Vec2Fx::new(fx(100), fx(100)),
+                0,
+                0,
+                0,
+                Attrs::new(160, 160, 160, 160, 160, 160, 160, 160, 160, 120, 160, 160),
+                flags::MOUNTED,
+            );
+            if with_stakes {
+                let id = w.structures.build(
+                    structures::StructureKind::Stakes,
+                    Vec2Fx::new(fx(90), fx(140)),
+                    Vec2Fx::new(fx(115), fx(140)),
+                    1,
+                );
+                w.structures.set_completion(id, 1000);
+            }
+            let victims: Vec<SoldierId> = (0..4)
+                .map(|k| {
+                    w.spawn(
+                        Vec2Fx::new(fx(100 + k), fx(180)),
+                        sim_math::brad_from_deg(180),
+                        0,
+                        1,
+                        Attrs::default(),
+                        0,
+                    )
+                })
+                .collect();
+
+            let army = w.add_command_node(None, 0, 0, rider, vec![], None);
+            let friendly_unit = organization::Unit {
+                soldiers: vec![rider],
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(fx(100), fx(100)),
+                formation_facing: 0,
+                ranks: 1,
+                file_spacing: fx_from_mm(800),
+                rank_spacing: fx_from_mm(800),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(fx(100), fx(100)),
+                pursuit_leash: None,
+            };
+            let friendly = w.add_command_node(Some(army), 1, 0, rider, vec![], Some(friendly_unit));
+            let enemy_unit = organization::Unit {
+                soldiers: victims.clone(),
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(fx(100), fx(180)),
+                formation_facing: 0,
+                ranks: 1,
+                file_spacing: fx_from_mm(800),
+                rank_spacing: fx_from_mm(800),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(fx(100), fx(180)),
+                pursuit_leash: None,
+            };
+            let enemy = w.add_command_node(Some(army), 1, 1, victims[0], vec![], Some(enemy_unit));
+
+            w.issue_order(
+                army,
+                friendly,
+                organization::Intent::Charge { target: enemy },
+                organization::Priority::Absolute,
+            );
+
+            for _ in 0..900 {
+                w.tick();
+            }
+            victims
+                .iter()
+                .map(|&v| (soldiers::MAX_HP - w.soldiers.hp[v as usize]) as u32)
+                .sum()
+        }
+
+        let damage_without_stakes = run(false);
+        let damage_with_stakes = run(true);
+        assert!(
+            damage_with_stakes < damage_without_stakes,
+            "杭列があっても突撃の損害が減っていない: with={damage_with_stakes} without={damage_without_stakes}"
+        );
     }
 }

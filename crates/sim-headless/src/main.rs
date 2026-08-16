@@ -9,11 +9,14 @@
 //! sim-headless terrain  --size 2000 --relief 600
 //! sim-headless battle   --soldiers 4000                 会戦を最後まで回して死因・所要時間を見る
 //! sim-headless winrate  --soldiers 2000 --runs 200       対称な兵力を繰り返し戦わせて勝率を見る
+//! sim-headless prep     --soldiers 2000 --runs 100       準備時間の長短が防御側の勝率に効くか見る（M6）
 //! ```
 
 use std::time::Instant;
 
 use sim_core::combat::BattlePhase;
+use sim_core::soldiers::{flags, Attrs};
+use sim_core::structures::StructureKind;
 use sim_core::{deploy_block, World, WorldConfig};
 use sim_math::{fx, fx_from_mm, Vec2Fx};
 use sim_terrain::{SeaEdge, TerrainParams};
@@ -29,6 +32,7 @@ fn main() {
         "terrain" => terrain_report(&opts),
         "battle" => battle(&opts),
         "winrate" => winrate(&opts),
+        "prep" => prep_experiment(&opts),
         _ => {
             eprintln!(
                 "使い方:\n  \
@@ -37,7 +41,10 @@ fn main() {
                  terrain [--size M] [--relief 0-1000] [--seed N]            地形の統計を出す\n          \
                  [--river-density 0-1000] [--roads N] [--sea north|east|south|west]\n  \
                  battle  [--soldiers N] [--seed N] [--max-ticks N]          会戦を最後まで回し、死因内訳・所要時間を出す（M4 受け入れ条件）\n  \
-                 winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る"
+                 winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る\n  \
+                 prep    [--soldiers N] [--runs N] [--prep-short N] [--prep-long N]\n          \
+                 防御側（陣営 1）に杭列・堀を築かせる準備時間を短/長で比較し、\n          \
+                 勝率が有意に変わるか見る（M6 受け入れ条件）"
             );
             std::process::exit(2);
         }
@@ -55,6 +62,8 @@ struct Opts {
     sea_edge: SeaEdge,
     runs: u32,
     max_ticks: u32,
+    prep_short: u32,
+    prep_long: u32,
 }
 
 impl Opts {
@@ -72,6 +81,9 @@ impl Opts {
             // 仕様の受け入れ条件（会戦は 20 分〜3 時間）の上限に、判定の余白を
             // 少し足した値。ここに達したら「3 時間以内に終わらなかった」とみなす。
             max_ticks: 4 * 3600 * 20,
+            // 準備なし（0 分）と、たっぷり準備できた場合（12.5 分）の対比。
+            prep_short: 0,
+            prep_long: 15_000,
         };
         let mut i = 1;
         while i + 1 < args.len() {
@@ -86,6 +98,8 @@ impl Opts {
                 "--roads" => o.road_count = v.parse().unwrap_or(o.road_count),
                 "--runs" => o.runs = v.parse().unwrap_or(o.runs),
                 "--max-ticks" => o.max_ticks = v.parse().unwrap_or(o.max_ticks),
+                "--prep-short" => o.prep_short = v.parse().unwrap_or(o.prep_short),
+                "--prep-long" => o.prep_long = v.parse().unwrap_or(o.prep_long),
                 "--sea" => {
                     o.sea_edge = match v.as_str() {
                         "north" => SeaEdge::North,
@@ -119,6 +133,26 @@ fn build_world(o: &Opts) -> World {
 /// 起伏を落として通行不能地形（崖・水域）が進路を塞がないようにする。
 /// `bench`/`verify` は決着まで回さないので `o.relief` をそのまま使う。
 fn build_world_with_relief(o: &Opts, relief: u16) -> World {
+    let mut w = deploy_two_armies(o, relief);
+
+    // 互いに向かって進ませ、中央でぶつかるようにする
+    let mid = (o.size_m / 2) as i32;
+    for i in 0..w.soldiers.len() {
+        let target_y = if w.soldiers.faction[i] == 0 {
+            fx(mid + 200)
+        } else {
+            fx(mid - 200)
+        };
+        w.set_goal(i as u32, Vec2Fx::new(w.soldiers.pos(i).x, target_y));
+    }
+    w
+}
+
+/// 地形を生成し、両軍を向かい合わせに配置するだけで、まだ動かさない。
+/// `build_world_with_relief` はこの直後に個々の兵士へ前進の目標を与えるが、
+/// `run_prep_battle` は指揮ツリーの陣形（`form_battle_units`）を組むまで
+/// 兵士を `Idle` のまま留めておきたいので、こちらを直接使う。
+fn deploy_two_armies(o: &Opts, relief: u16) -> World {
     let config = WorldConfig {
         seed: o.seed,
         terrain: TerrainParams {
@@ -159,16 +193,6 @@ fn build_world_with_relief(o: &Opts, relief: u16) -> World {
         1,
         2,
     );
-
-    // 互いに向かって進ませ、中央でぶつかるようにする
-    for i in 0..w.soldiers.len() {
-        let target_y = if w.soldiers.faction[i] == 0 {
-            fx(mid + 200)
-        } else {
-            fx(mid - 200)
-        };
-        w.set_goal(i as u32, Vec2Fx::new(w.soldiers.pos(i).x, target_y));
-    }
     w
 }
 
@@ -182,7 +206,15 @@ fn build_world_with_relief(o: &Opts, relief: u16) -> World {
 /// ——実際の中世会戦の隊列維持に近い挙動になる。
 fn build_battle_world(o: &Opts) -> World {
     let mut w = build_world_with_relief(o, 0);
+    form_battle_units(&mut w, o);
+    w
+}
 
+/// 両軍を指揮ツリーの陣形（`Unit`）として組む（`build_battle_world` の後半）。
+/// これを呼ぶまでは兵士は `Idle` のままその場に留まるので、`prep_experiment`
+/// はこの呼び出しを遅らせることで「会戦開始前の準備時間」（仕様 07 章 7 節）を
+/// 表現する。
+fn form_battle_units(w: &mut World, o: &Opts) {
     let per_side = o.soldiers / 2;
     let files = 40u32;
     let ranks = per_side.div_ceil(files);
@@ -212,8 +244,12 @@ fn build_battle_world(o: &Opts) -> World {
     let target1 = Vec2Fx::new(mid, mid + depth + contact_gap);
 
     for faction in 0u8..2 {
+        // 準備フェーズ用の工兵（`flags::ENGINEER`）は戦列に組み込まない。
+        // 非戦闘員なので、隊列に混ざって前列判定を受けさせたくない。
         let ids: Vec<u32> = (0..w.soldiers.len())
-            .filter(|&i| w.soldiers.faction[i] == faction)
+            .filter(|&i| {
+                w.soldiers.faction[i] == faction && w.soldiers.hot.flags[i] & flags::ENGINEER == 0
+            })
             .map(|i| i as u32)
             .collect();
         if ids.is_empty() {
@@ -239,14 +275,13 @@ fn build_battle_world(o: &Opts) -> World {
         };
         w.add_command_node(None, 0, faction, commander, deputies, Some(unit));
     }
-    w
 }
 
 /// 各陣営の 4 人に 1 人へ弓を持たせる。両陣営に同じ規則（index % 4）で
 /// 適用するので、装備構成は対称になる（`winrate` の前提）。
 fn equip_symmetric_army(w: &mut World) {
     for i in 0..w.soldiers.len() {
-        if i % 4 == 0 {
+        if i % 4 == 0 && w.soldiers.hot.flags[i] & flags::ENGINEER == 0 {
             w.combat.set_loadout(
                 i as u32,
                 sim_core::combat::Weapon::longbow(),
@@ -284,6 +319,11 @@ struct BattleReport {
 fn run_battle(o: &Opts) -> BattleReport {
     let mut w = build_battle_world(o);
     equip_symmetric_army(&mut w);
+    finish_battle(w, o)
+}
+
+/// 決着がつくか `max_ticks` に達するまで tick を回し、結果をまとめる。
+fn finish_battle(mut w: World, o: &Opts) -> BattleReport {
     let mut timed_out = true;
     for _ in 0..o.max_ticks {
         w.tick();
@@ -304,6 +344,109 @@ fn run_battle(o: &Opts) -> BattleReport {
         timed_out,
         stats: w.combat.stats,
     }
+}
+
+/// 陣営 1（防御側）に工兵を配置し、`prep_ticks` の間だけ両軍が本隊を組む前に
+/// 杭列・堀を築かせてから、通常どおり戦列を組ませて決着まで戦わせる
+/// （仕様 07 章 7 節「会戦前フェーズ」、12 章 M6 の受け入れ条件）。
+///
+/// `form_battle_units` を呼ぶまで両軍の本隊は指揮ツリーに入らず `Idle` の
+/// ままその場に留まるので、`prep_ticks` の間は工兵の作業だけが進む。
+fn run_prep_battle(o: &Opts, prep_ticks: u32) -> BattleReport {
+    let mut w = deploy_two_armies(o, 0);
+
+    let mid = fx((o.size_m / 2) as i32);
+    let engineer_attrs = Attrs::new(120, 120, 140, 150, 120, 120, 140, 150, 100, 140, 140, 140);
+    let engineer_count = 12u32;
+    let stakes_span = fx_from_mm(6_000);
+    for k in 0..engineer_count {
+        let x = mid - stakes_span / 2 + (stakes_span * k as i32) / (engineer_count.max(1) as i32);
+        w.spawn(
+            Vec2Fx::new(x, mid + fx_from_mm(3_000)),
+            0,
+            0,
+            1,
+            engineer_attrs,
+            flags::ENGINEER,
+        );
+    }
+    // 防御側の正面に杭列を、その後ろに堀を築かせる（仕様 07 章 2 節の表の
+    // 組み合わせ例）。どちらも防御側（陣営 1）の所有。
+    w.queue_build_structure(
+        StructureKind::Stakes,
+        Vec2Fx::new(mid - stakes_span / 2, mid),
+        Vec2Fx::new(mid + stakes_span / 2, mid),
+        1,
+        10,
+    );
+    w.queue_build_structure(
+        StructureKind::Ditch,
+        Vec2Fx::new(mid - stakes_span / 2, mid + fx_from_mm(1_500)),
+        Vec2Fx::new(mid + stakes_span / 2, mid + fx_from_mm(1_500)),
+        1,
+        8,
+    );
+
+    for _ in 0..prep_ticks {
+        w.tick();
+    }
+
+    form_battle_units(&mut w, o);
+    equip_symmetric_army(&mut w);
+    finish_battle(w, o)
+}
+
+fn prep_experiment(o: &Opts) {
+    let t0 = Instant::now();
+    let mut wins_defender_short = 0u32;
+    let mut wins_defender_long = 0u32;
+    let mut decisive_short = 0u32;
+    let mut decisive_long = 0u32;
+    for run in 0..o.runs {
+        let seed = (o.seed.wrapping_add(run as u64 * 0x9E37_79B9)) | 1;
+        let run_opts = Opts {
+            seed,
+            ..clone_opts(o)
+        };
+        let short = run_prep_battle(&run_opts, o.prep_short);
+        if let Some(winner) = short.winner {
+            decisive_short += 1;
+            if winner == 1 {
+                wins_defender_short += 1;
+            }
+        }
+        let long = run_prep_battle(&run_opts, o.prep_long);
+        if let Some(winner) = long.winner {
+            decisive_long += 1;
+            if winner == 1 {
+                wins_defender_long += 1;
+            }
+        }
+    }
+    let rate = |wins: u32, decisive: u32| {
+        if decisive == 0 {
+            0.0
+        } else {
+            wins as f64 * 100.0 / decisive as f64
+        }
+    };
+    let rate_short = rate(wins_defender_short, decisive_short);
+    let rate_long = rate(wins_defender_long, decisive_long);
+
+    println!("{{");
+    println!("  \"runs\": {},", o.runs);
+    println!("  \"prep_short_ticks\": {},", o.prep_short);
+    println!("  \"prep_long_ticks\": {},", o.prep_long);
+    println!("  \"defender_win_rate_short_pct\": {rate_short:.1},");
+    println!("  \"defender_win_rate_long_pct\": {rate_long:.1},");
+    println!("  \"win_rate_delta_pct\": {:.1},", rate_long - rate_short);
+    println!("  \"wall_clock_s\": {:.1}", t0.elapsed().as_secs_f64());
+    println!("}}");
+
+    eprintln!(
+        "\n防御側の勝率: 準備なし {rate_short:.1}% → 十分な準備 {rate_long:.1}%（差 {:.1} pt）",
+        rate_long - rate_short
+    );
 }
 
 fn battle(o: &Opts) {
@@ -431,6 +574,8 @@ fn clone_opts(o: &Opts) -> Opts {
         sea_edge: o.sea_edge,
         runs: o.runs,
         max_ticks: o.max_ticks,
+        prep_short: o.prep_short,
+        prep_long: o.prep_long,
     }
 }
 

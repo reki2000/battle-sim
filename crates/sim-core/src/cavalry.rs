@@ -14,8 +14,9 @@
 use sim_math::{dist_sq, fx_from_mm, fx_scale_permille, within_arc, Fx, Purpose, Rng, Vec2Fx};
 
 use crate::combat::CombatSystem;
-use crate::soldiers::{flags, SoldierId, Soldiers, State};
+use crate::soldiers::{flags, SoldierId, Soldiers, State, NO_ID};
 use crate::spatial::{SpatialHash, MAX_NEIGHBORS};
+use crate::structures::StructureSystem;
 
 /// 助走距離がこれに達すると、疲労のない馬ではモメンタムが 1000‰（全開）になる。
 /// 仕様 06 章 4.1 節「最高速に達するには平地で約 100 m」。
@@ -56,6 +57,13 @@ const SPEAR_WALL_DETECT_MM: i32 = 3_000;
 const SPEAR_REACH_MM: i32 = 2_000;
 /// 接触（忌避判定・衝撃）を行う間合い（衝突半径の和に加える分）。
 const CONTACT_RANGE_MM: i32 = 1_500;
+
+/// 杭列（仕様 07 章 2 節）を忌避せずに踏み抜いたときの、馬への基準ダメージ。
+/// モメンタム 1000‰ でこの値が満額入る。槍衾を突破したときの
+/// [`BASE_IMPACT_DAMAGE`] よりずっと大きい（「大ダメージ」）。
+const STAKES_IMPACT_DAMAGE: i32 = 150;
+/// 杭列を踏み抜いたときに構造物側が受ける耐久ダメージ（「杭が折れる」）。
+const STAKES_STRUCTURE_DAMAGE: u16 = 10;
 
 /// M5 の騎兵固有の per-soldier 状態。配列の index は `SoldierId` と一致する。
 /// 徒歩の兵士では常に 0。
@@ -118,6 +126,7 @@ impl CavalrySystem {
         soldiers: &mut Soldiers,
         hash: &SpatialHash,
         combat: &mut CombatSystem,
+        structures: &mut StructureSystem,
         map_limit: Fx,
     ) {
         self.ensure_len(soldiers.len());
@@ -199,20 +208,33 @@ impl CavalrySystem {
                 }
             }
 
-            let Some((_, target)) = nearest else {
-                continue;
+            // 杭列（仕様 07 章 2 節）: 忌避判定を極端に厳しくする。杭だけが
+            // 立っていて隣に生身の防御側がいなくても検知できるよう、
+            // `nearest`（接触しうる兵士）とは独立に調べる。
+            let stakes_id =
+                structures.stakes_ahead(pos, soldiers.hot.facing[i], half_arc, detect_r);
+
+            let target = match nearest {
+                Some((_, j)) => Some(j),
+                None if stakes_id.is_some() => None,
+                None => continue,
             };
 
-            let defender_formed = !matches!(
-                soldiers.hot.state[target],
-                State::Broken | State::Wavering | State::Downed
-            );
+            let defender_formed = target.map_or(true, |t| {
+                !matches!(
+                    soldiers.hot.state[t],
+                    State::Broken | State::Wavering | State::Downed
+                )
+            });
             let mut refusal = 30i32;
             refusal += spear_wall.min(6) * 220;
             refusal += if defender_formed { 200 } else { -400 };
             refusal += self.horse_fear[i] as i32 / 5;
             refusal -= soldiers.attrs[i].skill as i32 / 8;
             refusal -= self.momentum_permille[i] as i32 / 10;
+            if let Some(id) = stakes_id {
+                refusal += structures.stakes_refusal_bonus_permille(id) as i32;
+            }
             let refusal = refusal.clamp(20, 970) as u32;
 
             let mut rng = Rng::stream(world_seed, i as u32, Purpose::HorseRefusal, tick);
@@ -227,11 +249,43 @@ impl CavalrySystem {
                 self.charge_run_mm[i] = 0;
                 soldiers.morale[i] = soldiers.morale[i].saturating_sub(REFUSAL_MORALE_SHOCK);
                 combat.stats.horse_refusals = combat.stats.horse_refusals.saturating_add(1);
-                combat.record_horse_refusal(i as SoldierId, target as SoldierId, tick);
+                combat.record_horse_refusal(
+                    i as SoldierId,
+                    target.map_or(NO_ID, |t| t as SoldierId),
+                    tick,
+                );
                 continue;
             }
 
             let m = self.momentum_permille[i] as i32;
+
+            // 忌避せずに杭を踏み抜いた: 馬に大ダメージ、杭も傷む
+            // （仕様「突撃してきた馬に大ダメージ」「杭が折れる」）。
+            if let Some(id) = stakes_id {
+                let stakes_damage = ((STAKES_IMPACT_DAMAGE * m) / 1000).max(15) as u16;
+                combat.apply_impact_damage(
+                    i as SoldierId,
+                    i as SoldierId,
+                    stakes_damage,
+                    soldiers,
+                    tick,
+                );
+                structures.damage(id, STAKES_STRUCTURE_DAMAGE);
+                if !soldiers.is_alive(i) {
+                    continue;
+                }
+            }
+
+            let Some(target) = target else {
+                // 杭だけを踏み抜き、隣に人はいなかった: 馬が動揺して足を止める。
+                self.momentum_permille[i] = 0;
+                self.charge_run_mm[i] = 0;
+                soldiers.hot.vel_x[i] = 0;
+                soldiers.hot.vel_y[i] = 0;
+                soldiers.hot.state[i] = State::Wavering;
+                continue;
+            };
+
             let damage = ((BASE_IMPACT_DAMAGE * m) / 1000).max(6) as u16;
             combat.apply_impact_damage(i as SoldierId, target as SoldierId, damage, soldiers, tick);
 
@@ -249,7 +303,9 @@ impl CavalrySystem {
             // 突撃後は速度を失い、弱い Engaged 状態へ落ちる（仕様 06 章 4.1 節）。
             self.momentum_permille[i] = 0;
             self.charge_run_mm[i] = 0;
-            soldiers.hot.state[i] = State::Engaged;
+            if soldiers.is_alive(i) {
+                soldiers.hot.state[i] = State::Engaged;
+            }
         }
     }
 
@@ -338,12 +394,14 @@ mod tests {
 
             let mut hash = SpatialHash::default();
             hash.rebuild(&soldiers);
+            let mut structures = StructureSystem::default();
             cavalry.tick(
                 world_seed,
                 trial as u32,
                 &mut soldiers,
                 &hash,
                 &mut combat,
+                &mut structures,
                 fx(1000),
             );
 
@@ -355,6 +413,129 @@ mod tests {
             refused * 3 >= trials * 2,
             "槍衾への正面突撃が十分な頻度で失敗していない: {refused}/{trials}"
         );
+    }
+
+    /// 仕様 12 章 M6 の受け入れ条件「杭列が騎兵突撃を実際に止める」。
+    /// 隣に防御側の兵士が誰もいなくても、杭列そのものが忌避判定を厳しくする
+    /// （`StructureSystem::stakes_ahead` は兵士の探索とは独立に働く）。
+    #[test]
+    fn charging_into_completed_stakes_alone_is_usually_refused() {
+        let world_seed = 0xC0FFEE_u64;
+        let mut refused = 0;
+        let trials = 24;
+        for trial in 0..trials {
+            let mut soldiers = Soldiers::default();
+            let rider = soldiers.push(
+                fx(10),
+                fx(10 + trial),
+                brad_from_deg(0),
+                0,
+                0,
+                rider_attrs(),
+                flags::MOUNTED,
+            );
+            let mut combat = CombatSystem::default();
+            combat.register();
+            combat.set_mounted(rider, true);
+
+            let mut structures = StructureSystem::default();
+            let stakes = structures.build(
+                crate::structures::StructureKind::Stakes,
+                Vec2Fx::new(fx(13), fx(5 + trial)),
+                Vec2Fx::new(fx(13), fx(15 + trial)),
+                1,
+            );
+            structures.set_completion(stakes, 1000);
+
+            let mut cavalry = CavalrySystem::default();
+            spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+            set_charging(&mut soldiers, rider as usize, 400);
+
+            let mut hash = SpatialHash::default();
+            hash.rebuild(&soldiers);
+            cavalry.tick(
+                world_seed,
+                trial as u32,
+                &mut soldiers,
+                &hash,
+                &mut combat,
+                &mut structures,
+                fx(1000),
+            );
+
+            if soldiers.hot.state[rider as usize] == State::Wavering {
+                refused += 1;
+            }
+        }
+        assert!(
+            refused * 3 >= trials * 2,
+            "杭列だけでも正面突撃が十分な頻度で失敗していない: {refused}/{trials}"
+        );
+    }
+
+    /// 忌避せずに杭列へ突っ込んだ馬は大ダメージを受け、杭も傷む。
+    #[test]
+    fn charging_through_stakes_hurts_the_horse_and_damages_the_stakes() {
+        let mut soldiers = Soldiers::default();
+        let rider = soldiers.push(
+            fx(10),
+            fx(10),
+            brad_from_deg(0),
+            0,
+            0,
+            rider_attrs(),
+            flags::MOUNTED,
+        );
+        let mut combat = CombatSystem::default();
+        combat.register();
+        combat.set_mounted(rider, true);
+        let horse_hp_before = combat.horse_hp(rider);
+
+        let mut structures = StructureSystem::default();
+        let stakes = structures.build(
+            crate::structures::StructureKind::Stakes,
+            Vec2Fx::new(fx(13), fx(5)),
+            Vec2Fx::new(fx(13), fx(15)),
+            1,
+        );
+        structures.set_completion(stakes, 1000);
+        let hp_before = structures.get(stakes).unwrap().hp;
+
+        let mut cavalry = CavalrySystem::default();
+        spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+        set_charging(&mut soldiers, rider as usize, 400);
+
+        let mut hash = SpatialHash::default();
+        hash.rebuild(&soldiers);
+        // seed を探すのではなく、忌避 vs 突破のどちらでも「杭を踏んだ結果として
+        // 何か実害が起きている」ことを何 tick か回して確認する
+        // （毎 tick 判定するので、いずれかの tick で必ず突破が起きる）。
+        let mut breached = false;
+        for tick in 0..40 {
+            cavalry.tick(
+                1,
+                tick,
+                &mut soldiers,
+                &hash,
+                &mut combat,
+                &mut structures,
+                fx(1000),
+            );
+            if combat.horse_hp(rider) < horse_hp_before
+                || structures.get(stakes).unwrap().hp < hp_before
+            {
+                breached = true;
+                break;
+            }
+            if soldiers.hot.state[rider as usize] != State::Charging {
+                // 忌避して足を止めた、あるいは衝撃で Engaged に落ちた:
+                // このテストでは「踏み抜いたときに実害が出るか」だけを見たいので、
+                // 再突撃させて次の機会を待つ。
+                set_charging(&mut soldiers, rider as usize, 400);
+                spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+            }
+        }
+        assert!(breached, "杭を踏み抜いても馬にも杭にも実害が出ていない");
     }
 
     #[test]
@@ -394,7 +575,15 @@ mod tests {
 
         let mut hash = SpatialHash::default();
         hash.rebuild(&soldiers);
-        cavalry.tick(1, 0, &mut soldiers, &hash, &mut combat, fx(1000));
+        cavalry.tick(
+            1,
+            0,
+            &mut soldiers,
+            &hash,
+            &mut combat,
+            &mut StructureSystem::default(),
+            fx(1000),
+        );
 
         assert_eq!(
             soldiers.hot.state[rider as usize],
@@ -448,7 +637,15 @@ mod tests {
         let mut cavalry = CavalrySystem::default();
         let mut hash = SpatialHash::default();
         hash.rebuild(&soldiers);
-        cavalry.tick(1, 0, &mut soldiers, &hash, &mut combat, fx(1000));
+        cavalry.tick(
+            1,
+            0,
+            &mut soldiers,
+            &hash,
+            &mut combat,
+            &mut StructureSystem::default(),
+            fx(1000),
+        );
 
         assert_eq!(cavalry.momentum_permille(rider), 0);
         assert_eq!(combat.stats.charge_kills, 0);
@@ -475,7 +672,15 @@ mod tests {
         let hash = SpatialHash::default();
 
         for _ in 0..300 {
-            cavalry.tick(1, 0, &mut soldiers, &hash, &mut combat, fx(1000));
+            cavalry.tick(
+                1,
+                0,
+                &mut soldiers,
+                &hash,
+                &mut combat,
+                &mut StructureSystem::default(),
+                fx(1000),
+            );
         }
         assert!(
             cavalry.momentum_permille(rider) > 500,
