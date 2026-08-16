@@ -6,7 +6,7 @@
  */
 
 /** 兵士 1 体あたりのバイト数。 */
-export const SOLDIER_STRIDE = 16;
+export const SOLDIER_STRIDE = 20;
 
 /** State enum。crates/sim-core/src/soldiers.rs と一致させること。 */
 export enum SoldierState {
@@ -34,7 +34,16 @@ export enum SoldierState {
  */
 export class SnapshotView {
   private view = new DataView(new ArrayBuffer(0));
+  private stride = SOLDIER_STRIDE;
   count = 0;
+
+  /** v1(16 B) を読みながら v2(20 B) Wasm を再生成できる移行用。 */
+  setStride(stride: number): void {
+    if (stride !== 16 && stride !== SOLDIER_STRIDE) {
+      throw new Error(`未対応の兵士スナップショットstrideです: ${stride}`);
+    }
+    this.stride = stride;
+  }
 
   /**
    * バッファに貼り直す。
@@ -45,7 +54,7 @@ export class SnapshotView {
   bind(buffer: ArrayBufferLike, byteOffset = 0, byteLen?: number): void {
     const len = byteLen ?? buffer.byteLength - byteOffset;
     this.view = new DataView(buffer as ArrayBuffer, byteOffset, len);
-    this.count = (len / SOLDIER_STRIDE) | 0;
+    this.count = (len / this.stride) | 0;
   }
 
   /**
@@ -59,22 +68,22 @@ export class SnapshotView {
 
   /** X 座標（m）。 */
   x(i: number): number {
-    return this.view.getFloat32(i * SOLDIER_STRIDE, true);
+    return this.view.getFloat32(i * this.stride, true);
   }
 
   /** Y 座標（m）。 */
   y(i: number): number {
-    return this.view.getFloat32(i * SOLDIER_STRIDE + 4, true);
+    return this.view.getFloat32(i * this.stride + 4, true);
   }
 
   /** 標高（m）。 */
   z(i: number): number {
-    return this.view.getInt16(i * SOLDIER_STRIDE + 8, true) / 100;
+    return this.view.getInt16(i * this.stride + 8, true) / 100;
   }
 
   /** 向き（brad、0..65535）。 */
   facing(i: number): number {
-    return this.view.getUint16(i * SOLDIER_STRIDE + 10, true);
+    return this.view.getUint16(i * this.stride + 10, true);
   }
 
   /** 向き（ラジアン）。 */
@@ -83,15 +92,25 @@ export class SnapshotView {
   }
 
   unitId(i: number): number {
-    return this.view.getUint16(i * SOLDIER_STRIDE + 12, true);
+    return this.view.getUint16(i * this.stride + 12, true);
+  }
+
+  troopType(i: number): number {
+    return this.stride === 16 ? this.unitId(i) : this.view.getUint16(i * this.stride + 14, true);
   }
 
   state(i: number): SoldierState {
-    return this.view.getUint8(i * SOLDIER_STRIDE + 14) as SoldierState;
+    return this.view.getUint8(i * this.stride + (this.stride === 16 ? 14 : 16)) as SoldierState;
   }
 
   flags(i: number): number {
-    return this.view.getUint8(i * SOLDIER_STRIDE + 15);
+    return this.view.getUint8(i * this.stride + (this.stride === 16 ? 15 : 17));
+  }
+
+  faction(i: number): number {
+    return this.stride === 16
+      ? this.unitId(i) & 1
+      : this.view.getUint8(i * this.stride + 18);
   }
 
   /** 生存しているか（Downed / Dead でない）。 */

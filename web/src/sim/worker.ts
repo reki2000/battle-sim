@@ -11,7 +11,6 @@
 
 import init, { World } from "../wasm/sim.js";
 import type { ToWorker, FromWorker, StatsPayload } from "./protocol";
-import { SOLDIER_STRIDE } from "./snapshot";
 
 let world: World | null = null;
 let memory: WebAssembly.Memory | null = null;
@@ -19,6 +18,7 @@ let running = false;
 let speed = 1;
 let accumulatorMs = 0;
 let lastRealMs = 0;
+let soldierStride = 16;
 
 /** シミュレーションの刻み（ms）。sim-math の TICK_MS と一致させること。 */
 const TICK_MS = 50;
@@ -69,8 +69,8 @@ function publishSnapshot(): void {
 
   post(
     stats
-      ? { type: "snapshot", tick, count: (len / SOLDIER_STRIDE) | 0, buffer: buf, stats }
-      : { type: "snapshot", tick, count: (len / SOLDIER_STRIDE) | 0, buffer: buf },
+      ? { type: "snapshot", tick, count: (len / soldierStride) | 0, buffer: buf, stats }
+      : { type: "snapshot", tick, count: (len / soldierStride) | 0, buffer: buf },
     [buf],
   );
 }
@@ -113,6 +113,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
         msg.sizeM,
         msg.relief,
       );
+      soldierStride = World.soldierStride();
 
       // 地形グリッドは 1 度だけ渡す。以降は工兵の作業で
       // 変更されたチャンクだけを差分で送る（M6）。
@@ -140,7 +141,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
           type: "ready",
           simVersion: World.simVersion(),
           snapshotVersion: World.snapshotVersion(),
-          soldierStride: World.soldierStride(),
+          soldierStride,
           terrain: {
             dim,
             cellM: world.terrainCellM(),
@@ -170,6 +171,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
         msg.spacingMm,
         msg.faction,
         msg.unitId,
+        msg.troopType,
         msg.seedSalt,
       );
       break;

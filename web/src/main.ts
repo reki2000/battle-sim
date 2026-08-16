@@ -67,6 +67,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
   const msg = ev.data;
 
   if (msg.type === "ready") {
+    snapshot.setStride(msg.soldierStride);
     try {
       await Promise.all([terrainGl.loadAssets(), soldierRenderer.loadAssets()]);
     } catch (error) {
@@ -122,6 +123,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       spacingMm: 800,
       faction: 0,
       unitId: 0,
+      troopType: 0,
       seedSalt: 1,
     });
     send({
@@ -133,6 +135,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       spacingMm: 800,
       faction: 1,
       unitId: 1,
+      troopType: 1,
       seedSalt: 2,
     });
 
@@ -308,7 +311,7 @@ function frame(now: number): void {
     speed >= 8 ? 1 : Math.min(1, (now - lastSnapshotAt) / (TICK_MS / speed));
   if (terrainData) {
     const td = terrainData;
-    soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, (x, y) =>
+    soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, now / 1000, (x, y) =>
       terrainGl.heightAt(td, x, y),
     );
   }

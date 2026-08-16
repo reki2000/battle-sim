@@ -88,7 +88,7 @@ export class MinimapRenderer {
     for (let i = 0; i < n; i++) {
       const x = (interp.x(i, 1) / world) * size;
       const y = (interp.y(i, 1) / world) * size;
-      const faction = snap.unitId(i) % FACTION_COLORS.length;
+      const faction = snap.faction(i) % FACTION_COLORS.length;
       ctx.fillStyle = FACTION_COLORS[faction]!;
       ctx.fillRect(x - dpr, y - dpr, 2 * dpr, 2 * dpr);
     }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Battle Sprite Generator"
+  short_description: "Research and generate simulator-defined battle sprites"
+  default_prompt: "Use $generate-battle-sprites to import the simulator visual profile, research cited historical equipment, and create validated ImageGen sprite assets."

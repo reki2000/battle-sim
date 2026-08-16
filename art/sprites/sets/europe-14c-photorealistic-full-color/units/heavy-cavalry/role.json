@@ -1,0 +1,341 @@
+{
+  "schemaVersion": 2,
+  "role": "heavy-cavalry",
+  "assetSet": {
+    "id": "europe-14c-photorealistic-full-color",
+    "periodId": "14c",
+    "regionId": "europe",
+    "styleId": "photorealistic-full-color"
+  },
+  "displayName": "Heavy cavalry",
+  "displayNameJa": "重騎兵",
+  "simulation": {
+    "profile": "medieval_western",
+    "troopTypeId": "heavy_cavalry",
+    "troopTypeIndex": 3,
+    "description": "軍馬に騎乗し、隊形を整えた突撃と騎乗白兵戦を担う重装の戦闘員。騎手・馬具・武器・防具の具体像は史料調査で確定する。",
+    "stateActions": {
+      "idle": "idle",
+      "marching": "walk",
+      "repositioning": "walk",
+      "advancing": "walk",
+      "charging": "run",
+      "engaged": "combat",
+      "shooting": "combat",
+      "reloading": "idle",
+      "wavering": "idle",
+      "broken": "run",
+      "rallying": "idle",
+      "working": "idle",
+      "downed": "combat",
+      "dead": "dead"
+    }
+  },
+  "actions": [
+    "idle",
+    "walk",
+    "run",
+    "combat",
+    "dead"
+  ],
+  "identity": {
+    "period": "14th century CE",
+    "region": "Europe",
+    "silhouette": "",
+    "garments": "",
+    "armor": "",
+    "weapons": "",
+    "handedness": "",
+    "palette": "",
+    "invariants": []
+  },
+  "renderStyle": {
+    "preset": "photorealistic-full-color",
+    "prompt": "full-color photorealistic historical character cutout; physically plausible human anatomy; natural skin texture; visible cloth weave, worn leather grain, wood grain, and realistic metal reflections; neutral color-accurate studio lighting; production-quality game character photography",
+    "avoid": [
+      "monochrome",
+      "grayscale",
+      "sepia",
+      "illustration",
+      "anime",
+      "pixel art",
+      "painterly concept art",
+      "cartoon",
+      "toy-like 3D render",
+      "motion blur",
+      "depth of field",
+      "film grain",
+      "watermark"
+    ],
+    "referenceImages": []
+  },
+  "research": {
+    "status": "needs-research",
+    "sourceIds": []
+  },
+  "actionPlayback": {
+    "idle": {
+      "mode": "variant-loop",
+      "variantCount": 4,
+      "framesPerVariant": 2,
+      "framesPerSecond": 2,
+      "loop": true
+    },
+    "walk": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "run": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "combat": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "dead": {
+      "mode": "static-variants",
+      "variantCount": 8,
+      "framesPerVariant": 1,
+      "framesPerSecond": 0,
+      "loop": false
+    }
+  },
+  "framePlans": {
+    "idle": [
+      {
+        "frame": 0,
+        "variant": 0,
+        "phase": "0/2",
+        "pose": "variant 0 steady guard; inhale with weight evenly planted"
+      },
+      {
+        "frame": 1,
+        "variant": 0,
+        "phase": "1/2",
+        "pose": "variant 0 steady guard; exhale and settle back without changing stance"
+      },
+      {
+        "frame": 2,
+        "variant": 1,
+        "phase": "0/2",
+        "pose": "variant 1 alert watch; head and gaze begin a small scan to anatomical left"
+      },
+      {
+        "frame": 3,
+        "variant": 1,
+        "phase": "1/2",
+        "pose": "variant 1 alert watch; head and gaze return to center while feet stay planted"
+      },
+      {
+        "frame": 4,
+        "variant": 2,
+        "phase": "0/2",
+        "pose": "variant 2 equipment-ready stance; hands make a subtle grip check"
+      },
+      {
+        "frame": 5,
+        "variant": 2,
+        "phase": "1/2",
+        "pose": "variant 2 equipment-ready stance; grip and shoulders relax to the starting pose"
+      },
+      {
+        "frame": 6,
+        "variant": 3,
+        "phase": "0/2",
+        "pose": "variant 3 rested guard; weight shifts subtly toward the anatomical left foot"
+      },
+      {
+        "frame": 7,
+        "variant": 3,
+        "phase": "1/2",
+        "pose": "variant 3 rested guard; weight returns toward center with no step"
+      }
+    ],
+    "walk": [
+      {
+        "frame": 0,
+        "phase": "0/8",
+        "pose": "left heel contact; right toe leaves the ground; weight moving forward"
+      },
+      {
+        "frame": 1,
+        "phase": "1/8",
+        "pose": "left leg compresses under weight; right foot begins its forward swing"
+      },
+      {
+        "frame": 2,
+        "phase": "2/8",
+        "pose": "left leg passes under torso; right knee advances; center of mass rises"
+      },
+      {
+        "frame": 3,
+        "phase": "3/8",
+        "pose": "left heel rises; right lower leg reaches forward; equipment follows through"
+      },
+      {
+        "frame": 4,
+        "phase": "4/8",
+        "pose": "right heel contact; left toe leaves the ground; weight moving forward"
+      },
+      {
+        "frame": 5,
+        "phase": "5/8",
+        "pose": "right leg compresses under weight; left foot begins its forward swing"
+      },
+      {
+        "frame": 6,
+        "phase": "6/8",
+        "pose": "right leg passes under torso; left knee advances; center of mass rises"
+      },
+      {
+        "frame": 7,
+        "phase": "7/8",
+        "pose": "right heel rises; left lower leg reaches forward; equipment returns toward phase 0"
+      }
+    ],
+    "run": [
+      {
+        "frame": 0,
+        "phase": "0/8",
+        "pose": "left foot contact; right leg trailing; torso committed forward"
+      },
+      {
+        "frame": 1,
+        "phase": "1/8",
+        "pose": "left leg compresses; right knee drives forward; equipment lags"
+      },
+      {
+        "frame": 2,
+        "phase": "2/8",
+        "pose": "airborne passing phase; left foot leaves ground; right thigh advances"
+      },
+      {
+        "frame": 3,
+        "phase": "3/8",
+        "pose": "right foot reaches for landing; arms and carried equipment counter-swing"
+      },
+      {
+        "frame": 4,
+        "phase": "4/8",
+        "pose": "right foot contact; left leg trailing; torso committed forward"
+      },
+      {
+        "frame": 5,
+        "phase": "5/8",
+        "pose": "right leg compresses; left knee drives forward; equipment lags"
+      },
+      {
+        "frame": 6,
+        "phase": "6/8",
+        "pose": "airborne passing phase; right foot leaves ground; left thigh advances"
+      },
+      {
+        "frame": 7,
+        "phase": "7/8",
+        "pose": "left foot reaches for landing; arms and equipment return toward phase 0"
+      }
+    ],
+    "combat": [
+      {
+        "frame": 0,
+        "phase": "0/8",
+        "pose": "guarded ready position; weight balanced; weapon at start of attack cycle"
+      },
+      {
+        "frame": 1,
+        "phase": "1/8",
+        "pose": "anticipation; weight loads rearward; weapon draws back without changing grip"
+      },
+      {
+        "frame": 2,
+        "phase": "2/8",
+        "pose": "attack begins; hips and shoulders rotate; lead foot remains planted"
+      },
+      {
+        "frame": 3,
+        "phase": "3/8",
+        "pose": "weapon accelerates toward contact; center of mass moves through the strike"
+      },
+      {
+        "frame": 4,
+        "phase": "4/8",
+        "pose": "contact phase; full extension without over-sampling impact"
+      },
+      {
+        "frame": 5,
+        "phase": "5/8",
+        "pose": "follow-through; weapon passes contact line; cloth and straps trail"
+      },
+      {
+        "frame": 6,
+        "phase": "6/8",
+        "pose": "recovery begins; weight returns; weapon withdraws along a safe arc"
+      },
+      {
+        "frame": 7,
+        "phase": "7/8",
+        "pose": "guard nearly restored; equipment settles continuously toward phase 0"
+      }
+    ],
+    "dead": [
+      {
+        "frame": 0,
+        "variant": 0,
+        "phase": "static",
+        "pose": "variant 0 motionless supine fall; limbs and equipment settled naturally"
+      },
+      {
+        "frame": 1,
+        "variant": 1,
+        "phase": "static",
+        "pose": "variant 1 motionless prone fall; face turned safely aside; equipment settled"
+      },
+      {
+        "frame": 2,
+        "variant": 2,
+        "phase": "static",
+        "pose": "variant 2 motionless fall on anatomical left side; compact readable silhouette"
+      },
+      {
+        "frame": 3,
+        "variant": 3,
+        "phase": "static",
+        "pose": "variant 3 motionless fall on anatomical right side; compact readable silhouette"
+      },
+      {
+        "frame": 4,
+        "variant": 4,
+        "phase": "static",
+        "pose": "variant 4 motionless supine diagonal sprawl; no active muscle tension"
+      },
+      {
+        "frame": 5,
+        "variant": 5,
+        "phase": "static",
+        "pose": "variant 5 motionless prone diagonal sprawl; weapon resting separately but still present"
+      },
+      {
+        "frame": 6,
+        "variant": 6,
+        "phase": "static",
+        "pose": "variant 6 motionless curled side fall; role-defining equipment remains visible"
+      },
+      {
+        "frame": 7,
+        "variant": 7,
+        "phase": "static",
+        "pose": "variant 7 motionless collapsed kneel-to-side fall; body fully at rest on ground"
+      }
+    ]
+  }
+}

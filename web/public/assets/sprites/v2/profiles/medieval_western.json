@@ -1,0 +1,191 @@
+{
+  "schemaVersion": 1,
+  "id": "medieval_western",
+  "assetSetId": "europe-14c-photorealistic-full-color",
+  "historicalContext": {
+    "period": {
+      "id": "14c",
+      "label": "14th century CE"
+    },
+    "region": {
+      "id": "europe",
+      "label": "Europe"
+    }
+  },
+  "styleId": "photorealistic-full-color",
+  "actionPlayback": {
+    "idle": {
+      "mode": "variant-loop",
+      "variantCount": 4,
+      "framesPerVariant": 2,
+      "framesPerSecond": 2,
+      "loop": true
+    },
+    "walk": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "run": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "combat": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "shoot": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "reload": {
+      "mode": "cycle",
+      "variantCount": 1,
+      "framesPerVariant": 8,
+      "framesPerSecond": 8,
+      "loop": true
+    },
+    "dead": {
+      "mode": "static-variants",
+      "variantCount": 8,
+      "framesPerVariant": 1,
+      "framesPerSecond": 0,
+      "loop": false
+    }
+  },
+  "roles": [
+    {
+      "id": "men-at-arms",
+      "troopTypeId": "men_at_arms",
+      "troopTypeIndex": 0,
+      "name": "Men-at-arms",
+      "description": "徒歩で隊列戦と白兵戦を担う、比較的重装備の職業的戦闘員。特定の服装や武具形式はスキルが14世紀ヨーロッパの史料から確定する。",
+      "actions": [
+        "idle",
+        "walk",
+        "run",
+        "combat",
+        "dead"
+      ],
+      "stateActions": {
+        "idle": "idle",
+        "marching": "walk",
+        "repositioning": "walk",
+        "advancing": "walk",
+        "charging": "run",
+        "engaged": "combat",
+        "shooting": "combat",
+        "reloading": "idle",
+        "wavering": "idle",
+        "broken": "run",
+        "rallying": "idle",
+        "working": "idle",
+        "downed": "combat",
+        "dead": "dead"
+      }
+    },
+    {
+      "id": "spearman",
+      "troopTypeId": "spearmen",
+      "troopTypeIndex": 1,
+      "name": "Spearman",
+      "description": "長柄の槍を主武器として密集隊形を作り、歩兵戦と対騎兵防御を担う徒歩兵。具体的装備は史料調査で確定する。",
+      "actions": [
+        "idle",
+        "walk",
+        "run",
+        "combat",
+        "dead"
+      ],
+      "stateActions": {
+        "idle": "idle",
+        "marching": "walk",
+        "repositioning": "walk",
+        "advancing": "walk",
+        "charging": "run",
+        "engaged": "combat",
+        "shooting": "combat",
+        "reloading": "idle",
+        "wavering": "idle",
+        "broken": "run",
+        "rallying": "idle",
+        "working": "idle",
+        "downed": "combat",
+        "dead": "dead"
+      }
+    },
+    {
+      "id": "longbowman",
+      "troopTypeId": "longbowmen",
+      "troopTypeIndex": 2,
+      "name": "Longbowman",
+      "description": "長弓による集団射撃を主務とし、必要時には近接戦闘にも参加する徒歩射手。弓具・矢筒・副武器・防具の姿は史料調査で確定する。",
+      "actions": [
+        "idle",
+        "walk",
+        "run",
+        "combat",
+        "shoot",
+        "reload",
+        "dead"
+      ],
+      "stateActions": {
+        "idle": "idle",
+        "marching": "walk",
+        "repositioning": "walk",
+        "advancing": "walk",
+        "charging": "run",
+        "engaged": "combat",
+        "shooting": "shoot",
+        "reloading": "reload",
+        "wavering": "idle",
+        "broken": "run",
+        "rallying": "idle",
+        "working": "idle",
+        "downed": "combat",
+        "dead": "dead"
+      }
+    },
+    {
+      "id": "heavy-cavalry",
+      "troopTypeId": "heavy_cavalry",
+      "troopTypeIndex": 3,
+      "name": "Heavy cavalry",
+      "description": "軍馬に騎乗し、隊形を整えた突撃と騎乗白兵戦を担う重装の戦闘員。騎手・馬具・武器・防具の具体像は史料調査で確定する。",
+      "actions": [
+        "idle",
+        "walk",
+        "run",
+        "combat",
+        "dead"
+      ],
+      "stateActions": {
+        "idle": "idle",
+        "marching": "walk",
+        "repositioning": "walk",
+        "advancing": "walk",
+        "charging": "run",
+        "engaged": "combat",
+        "shooting": "combat",
+        "reloading": "idle",
+        "wavering": "idle",
+        "broken": "run",
+        "rallying": "idle",
+        "working": "idle",
+        "downed": "combat",
+        "dead": "dead"
+      }
+    }
+  ]
+}

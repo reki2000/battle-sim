@@ -2,6 +2,7 @@
 
 id = "medieval_western"
 name_ja = "西欧封建軍"
+visual_profile = "medieval_western"
 
 [[echelon]]
 name = "Army"

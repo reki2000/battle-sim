@@ -146,6 +146,8 @@ pub struct Soldiers {
     // コールド: 生成時に決まる
     pub attrs: Vec<Attrs>,
     pub faction: Vec<u8>,
+    /// `data/visual-profiles/*.toml` の troop_type_index。
+    pub troop_type: Vec<u16>,
 }
 
 /// 最大体力。
@@ -195,6 +197,22 @@ impl Soldiers {
         attrs: Attrs,
         flags: u8,
     ) -> SoldierId {
+        self.push_typed(pos_x, pos_y, facing, unit_id, faction, 0, attrs, flags)
+    }
+
+    /// 兵科を明示して兵士を追加する。既存のテスト用 `push` は兵科 0 を使う。
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_typed(
+        &mut self,
+        pos_x: Fx,
+        pos_y: Fx,
+        facing: Brad,
+        unit_id: u16,
+        faction: u8,
+        troop_type: u16,
+        attrs: Attrs,
+        flags: u8,
+    ) -> SoldierId {
         let id = self.len() as SoldierId;
         self.hot.pos_x.push(pos_x);
         self.hot.pos_y.push(pos_y);
@@ -218,6 +236,7 @@ impl Soldiers {
 
         self.attrs.push(attrs);
         self.faction.push(faction);
+        self.troop_type.push(troop_type);
         id
     }
 

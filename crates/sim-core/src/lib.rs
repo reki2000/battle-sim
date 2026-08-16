@@ -109,9 +109,31 @@ impl World {
         attrs: Attrs,
         soldier_flags: u8,
     ) -> SoldierId {
-        let id = self
-            .soldiers
-            .push(pos.x, pos.y, facing, unit_id, faction, attrs, soldier_flags);
+        self.spawn_typed(pos, facing, unit_id, faction, 0, attrs, soldier_flags)
+    }
+
+    /// 兵科 index を明示して兵士を追加する。
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_typed(
+        &mut self,
+        pos: Vec2Fx,
+        facing: sim_math::Brad,
+        unit_id: u16,
+        faction: u8,
+        troop_type: u16,
+        attrs: Attrs,
+        soldier_flags: u8,
+    ) -> SoldierId {
+        let id = self.soldiers.push_typed(
+            pos.x,
+            pos.y,
+            facing,
+            unit_id,
+            faction,
+            troop_type,
+            attrs,
+            soldier_flags,
+        );
         self.combat.register();
         self.goal.push(pos);
         self.push_x.push(0);
@@ -539,6 +561,24 @@ pub fn deploy_block(
     unit_id: u16,
     seed_salt: u32,
 ) {
+    deploy_block_typed(
+        world, origin, files, ranks, spacing_mm, faction, unit_id, 0, seed_salt,
+    );
+}
+
+/// 視覚プロファイルの兵科 index を付けて、方陣を組んだ部隊を配置する。
+#[allow(clippy::too_many_arguments)]
+pub fn deploy_block_typed(
+    world: &mut World,
+    origin: Vec2Fx,
+    files: u32,
+    ranks: u32,
+    spacing_mm: i32,
+    faction: u8,
+    unit_id: u16,
+    troop_type: u16,
+    seed_salt: u32,
+) {
     let spacing = fx_from_mm(spacing_mm);
     let mut rng = sim_math::Rng::stream(world.seed, seed_salt, sim_math::Purpose::Spawn, 0);
     for r in 0..ranks {
@@ -561,7 +601,7 @@ pub fn deploy_block(
                 origin.x + (f as Fx) * spacing,
                 origin.y + (r as Fx) * spacing,
             );
-            world.spawn(pos, 0, unit_id, faction, attrs, 0);
+            world.spawn_typed(pos, 0, unit_id, faction, troop_type, attrs, 0);
         }
     }
 }
