@@ -156,6 +156,54 @@ impl SpatialHash {
         count
     }
 
+    /// 指定位置の周囲 3×3 セルから、`faction` とは異なる陣営の兵士だけを
+    /// 最大 [`MAX_NEIGHBORS`] 件集める。同陣営の候補は上限にカウントせず
+    /// 読み飛ばす。
+    ///
+    /// [`query_neighbors`](Self::query_neighbors) は陣営を問わず先着順で
+    /// 打ち切るため、密集陣形（ファイル間隔 1 m 未満）では自陣の兵士だけで
+    /// 12 件の枠が埋まってしまい、1 m 先にいる敵に気づけなくなる
+    /// （issue #5）。交戦相手探しのように「敵だけ」を探す用途ではこちらを使う。
+    pub fn query_enemies(
+        &self,
+        soldiers: &Soldiers,
+        x: Fx,
+        y: Fx,
+        faction: u8,
+        out: &mut [u32; MAX_NEIGHBORS],
+    ) -> usize {
+        if self.cols == 0 {
+            return 0;
+        }
+        let (cx, cy) = self.cell_coords(x, y);
+        let mut count = 0;
+        for dy in -1..=1i32 {
+            let ny = cy + dy;
+            if ny < 0 || ny >= self.rows as i32 {
+                continue;
+            }
+            for dx in -1..=1i32 {
+                let nx = cx + dx;
+                if nx < 0 || nx >= self.cols as i32 {
+                    continue;
+                }
+                let c = (ny as usize) * (self.cols as usize) + (nx as usize);
+                let (start, end) = (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
+                for &id in &self.entries[start..end] {
+                    if soldiers.faction[id as usize] == faction {
+                        continue;
+                    }
+                    if count >= MAX_NEIGHBORS {
+                        return count;
+                    }
+                    out[count] = id;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     /// 半径 `r` 以内の兵士を集める（近傍セルからさらに距離で絞る）。
     pub fn query_radius(
         &self,
