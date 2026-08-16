@@ -1,9 +1,8 @@
 /**
  * エントリポイント。
  *
- * 地形は WebGL2（terrain-gl.ts）、兵士とオーバーレイは Canvas2D
- * （soldiers.ts、透明な上乗せキャンバス）に分けている。兵士のインスタンス
- * 描画を WebGL2 に統合するのは M2 の仕事（仕様 08 章 4 節）。
+ * 地形と兵士はそれぞれ WebGL2 キャンバス、UI とミニマップは透明な Canvas2D
+ * キャンバスへ描く。兵士は M2 のインスタンス描画で 1 ドローコールにまとめる。
  */
 
 import { Camera } from "./render/iso";
@@ -17,13 +16,14 @@ import type { FromWorker, ToWorker } from "./sim/protocol";
 const TICK_MS = 50;
 
 const terrainCanvas = document.getElementById("terrain-view") as HTMLCanvasElement;
+const soldierCanvas = document.getElementById("soldier-view") as HTMLCanvasElement;
 const overlayCanvas = document.getElementById("overlay-view") as HTMLCanvasElement;
 const overlayCtx = overlayCanvas.getContext("2d", { alpha: true })!;
 const hud = document.getElementById("hud") as HTMLDivElement;
 
 const cam = new Camera();
 const terrainGl = new TerrainGlRenderer(terrainCanvas);
-const soldierRenderer = new SoldierRenderer();
+const soldierRenderer = new SoldierRenderer(soldierCanvas);
 const minimap = new MinimapRenderer();
 const snapshot = new SnapshotView();
 const interp = new InterpolatedPositions();
@@ -52,10 +52,17 @@ function send(msg: ToWorker, transfer: Transferable[] = []): void {
 
 // ── ワーカーからのメッセージ ────────────────────────────
 
-worker.onmessage = (ev: MessageEvent<FromWorker>) => {
+worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
   const msg = ev.data;
 
   if (msg.type === "ready") {
+    try {
+      await Promise.all([terrainGl.loadAssets(), soldierRenderer.loadAssets()]);
+    } catch (error) {
+      // アセットが一時的に取得できない場合もシミュレーション自体は起動し、
+      // レンダラ側の単色・図形フォールバックで状態を確認できるようにする。
+      console.error("事前生成アセットの読み込みに失敗しました", error);
+    }
     const t = msg.terrain;
     terrainData = {
       dim: t.dim,
@@ -223,7 +230,7 @@ function resize(): void {
   const w = Math.floor(window.innerWidth * dpr);
   const h = Math.floor(window.innerHeight * dpr);
 
-  for (const c of [terrainCanvas, overlayCanvas]) {
+  for (const c of [terrainCanvas, soldierCanvas, overlayCanvas]) {
     c.width = w;
     c.height = h;
     c.style.width = `${window.innerWidth}px`;

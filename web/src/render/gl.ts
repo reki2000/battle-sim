@@ -6,9 +6,12 @@
  * 具体的な頂点レイアウトは呼び出し側（terrain.ts, soldiers.ts）が持つ。
  */
 
-export function createContext(canvas: HTMLCanvasElement): WebGL2RenderingContext {
+export function createContext(
+  canvas: HTMLCanvasElement,
+  options: { alpha?: boolean } = {},
+): WebGL2RenderingContext {
   const gl = canvas.getContext("webgl2", {
-    alpha: false,
+    alpha: options.alpha ?? false,
     antialias: false,
     depth: true,
     // 地形は 1 枚のクアッドなので深度は使わないが、M2 で兵士のインスタンス
