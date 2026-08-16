@@ -41,13 +41,19 @@
   "identity": {
     "period": "14th century CE",
     "region": "Europe",
-    "silhouette": "",
-    "garments": "",
-    "armor": "",
-    "weapons": "",
-    "handedness": "",
-    "palette": "",
-    "invariants": []
+    "silhouette": "Compact, broad-shouldered adult foot soldier in a pointed visored bascinet, mail aventail and fitted short surcoat over layered armor; articulated plate at forearms, knees and shins gives a segmented lower-body silhouette without a bulky full plate cuirass.",
+    "garments": "Quilted arming doublet and padded chausses beneath a close-fitting knee-to-mid-thigh wool surcoat/jupon, muted madder red with a narrow deep-blue vertical accent; simple hems, no theatrical tabard or modern tailoring.",
+    "armor": "Steel visored bascinet with visible leather edging and mail aventail; dark iron mail shirt at shoulders and torso; hourglass gauntlets; small plate rerebraces and vambraces; poleyns and greaves over padded legs; plain functional finish with natural scuffs.",
+    "weapons": "One straight single-handed arming sword, approximately body-length, drawn and held in the anatomical right hand in combat-ready poses; the empty dark leather scabbard remains attached at the anatomical left hip. Plain cruciform guard, dark leather grip, simple wheel pommel; no second weapon or shield.",
+    "handedness": "Anatomical right hand is the dominant sword hand and holds the drawn blade; the empty scabbard remains on the anatomical left hip. Keep belt buckle, scabbard and sword side assignments fixed and never mirror them between directions.",
+    "palette": "Cool gray steel, charcoal-black mail, muted madder red wool, deep blue accent cloth, dark brown leather and scabbard, small warm brass fittings, natural light skin only where the face is visible.",
+    "invariants": [
+      "Exactly one adult human men-at-arms identity in every frame.",
+      "Visored bascinet and mail aventail remain present and consistent.",
+      "Sword remains on the anatomical left hip with the dominant right hand.",
+      "No shield, bow, spear, horse, heraldic crest, extra weapon, or modern item.",
+      "Camera, scale, lighting direction, foot anchor and transparent alpha remain fixed."
+    ]
   },
   "renderStyle": {
     "preset": "photorealistic-full-color",
@@ -70,8 +76,15 @@
     "referenceImages": []
   },
   "research": {
-    "status": "needs-research",
-    "sourceIds": []
+    "status": "ready",
+    "sourceIds": [
+      "met-fashion-armor-1300-1400",
+      "met-visored-bascinet",
+      "royal-armouries-hundred-years-war",
+      "met-function-of-armor",
+      "met-decoration-armor"
+    ],
+    "sourceFile": "research.json"
   },
   "actionPlayback": {
     "idle": {
@@ -116,175 +129,175 @@
         "frame": 0,
         "variant": 0,
         "phase": "0/2",
-        "pose": "variant 0 steady guard; inhale with weight evenly planted"
+        "pose": "variant 0 steady sword guard; both feet planted shoulder-width; right hand rests lightly near the scabbard throat while the left hand hangs relaxed"
       },
       {
         "frame": 1,
         "variant": 0,
         "phase": "1/2",
-        "pose": "variant 0 steady guard; exhale and settle back without changing stance"
+        "pose": "variant 0 steady sword guard; visor and shoulders settle after a breath; feet and sword belt remain fixed"
       },
       {
         "frame": 2,
         "variant": 1,
         "phase": "0/2",
-        "pose": "variant 1 alert watch; head and gaze begin a small scan to anatomical left"
+        "pose": "variant 1 alert watch; helmeted head turns slightly toward anatomical left while right hand stays near the sword grip"
       },
       {
         "frame": 3,
         "variant": 1,
         "phase": "1/2",
-        "pose": "variant 1 alert watch; head and gaze return to center while feet stay planted"
+        "pose": "variant 1 alert watch; head and gaze return to center; both knees stay unlocked without a step"
       },
       {
         "frame": 4,
         "variant": 2,
         "phase": "0/2",
-        "pose": "variant 2 equipment-ready stance; hands make a subtle grip check"
+        "pose": "variant 2 equipment check; dominant right hand briefly checks the sword grip while left fingers touch the belt"
       },
       {
         "frame": 5,
         "variant": 2,
         "phase": "1/2",
-        "pose": "variant 2 equipment-ready stance; grip and shoulders relax to the starting pose"
+        "pose": "variant 2 equipment check; hands relax back to the starting guard and the surcoat settles"
       },
       {
         "frame": 6,
         "variant": 3,
         "phase": "0/2",
-        "pose": "variant 3 rested guard; weight shifts subtly toward the anatomical left foot"
+        "pose": "variant 3 rested guard; weight shifts subtly toward anatomical left foot, sword remains secured on left hip"
       },
       {
         "frame": 7,
         "variant": 3,
         "phase": "1/2",
-        "pose": "variant 3 rested guard; weight returns toward center with no step"
+        "pose": "variant 3 rested guard; weight returns toward center with no step and no change to equipment sides"
       }
     ],
     "walk": [
       {
         "frame": 0,
         "phase": "0/8",
-        "pose": "left heel contact; right toe leaves the ground; weight moving forward"
+        "pose": "left heel contact; right toe leaves the ground; dominant right hand steadies the sword belt as the body moves forward"
       },
       {
         "frame": 1,
         "phase": "1/8",
-        "pose": "left leg compresses under weight; right foot begins its forward swing"
+        "pose": "left leg compresses under weight; right foot swings forward; mail and surcoat lag slightly behind the torso"
       },
       {
         "frame": 2,
         "phase": "2/8",
-        "pose": "left leg passes under torso; right knee advances; center of mass rises"
+        "pose": "left leg passes under torso; right knee advances; sword scabbard swings a few degrees but stays on left hip"
       },
       {
         "frame": 3,
         "phase": "3/8",
-        "pose": "left heel rises; right lower leg reaches forward; equipment follows through"
+        "pose": "left heel rises; right lower leg reaches forward; left hand counter-swings while visor and aventail remain aligned"
       },
       {
         "frame": 4,
         "phase": "4/8",
-        "pose": "right heel contact; left toe leaves the ground; weight moving forward"
+        "pose": "right heel contact; left toe leaves the ground; right hand returns close to the sword grip"
       },
       {
         "frame": 5,
         "phase": "5/8",
-        "pose": "right leg compresses under weight; left foot begins its forward swing"
+        "pose": "right leg compresses under weight; left foot begins forward swing; surcoat hem follows the step"
       },
       {
         "frame": 6,
         "phase": "6/8",
-        "pose": "right leg passes under torso; left knee advances; center of mass rises"
+        "pose": "right leg passes under torso; left knee advances; scabbard and mail continue the forward inertia"
       },
       {
         "frame": 7,
         "phase": "7/8",
-        "pose": "right heel rises; left lower leg reaches forward; equipment returns toward phase 0"
+        "pose": "right heel rises; left lower leg reaches forward; equipment settles continuously toward left-heel-contact phase 0"
       }
     ],
     "run": [
       {
         "frame": 0,
         "phase": "0/8",
-        "pose": "left foot contact; right leg trailing; torso committed forward"
+        "pose": "left foot contact; right leg trails; torso leans forward and right hand clamps the sword grip to prevent the scabbard from striking"
       },
       {
         "frame": 1,
         "phase": "1/8",
-        "pose": "left leg compresses; right knee drives forward; equipment lags"
+        "pose": "left leg compresses; right knee drives forward; left arm counter-swings while the surcoat trails"
       },
       {
         "frame": 2,
         "phase": "2/8",
-        "pose": "airborne passing phase; left foot leaves ground; right thigh advances"
+        "pose": "airborne passing phase; left foot leaves ground; right thigh advances and the sword belt lifts with the torso"
       },
       {
         "frame": 3,
         "phase": "3/8",
-        "pose": "right foot reaches for landing; arms and carried equipment counter-swing"
+        "pose": "right foot reaches for landing; left arm counterbalances; dominant right hand keeps the blade sheathed and stable"
       },
       {
         "frame": 4,
         "phase": "4/8",
-        "pose": "right foot contact; left leg trailing; torso committed forward"
+        "pose": "right foot contact; left leg trails; torso remains committed forward with mail and cloth following"
       },
       {
         "frame": 5,
         "phase": "5/8",
-        "pose": "right leg compresses; left knee drives forward; equipment lags"
+        "pose": "right leg compresses; left knee drives forward; sword scabbard and belt lag behind the hips"
       },
       {
         "frame": 6,
         "phase": "6/8",
-        "pose": "airborne passing phase; right foot leaves ground; left thigh advances"
+        "pose": "airborne passing phase; right foot leaves ground; left thigh advances and the visor stays fixed to the head"
       },
       {
         "frame": 7,
         "phase": "7/8",
-        "pose": "left foot reaches for landing; arms and equipment return toward phase 0"
+        "pose": "left foot reaches for landing; arms and sword belt return toward the left-foot-contact phase without changing grip"
       }
     ],
     "combat": [
       {
         "frame": 0,
         "phase": "0/8",
-        "pose": "guarded ready position; weight balanced; weapon at start of attack cycle"
+        "pose": "one-handed arming-sword guard; right hand on grip at the left hip; left foot slightly forward and weight balanced"
       },
       {
         "frame": 1,
         "phase": "1/8",
-        "pose": "anticipation; weight loads rearward; weapon draws back without changing grip"
+        "pose": "anticipation; weight loads toward the rear leg; right hand draws the sword back along a compact diagonal while left hand guards the torso"
       },
       {
         "frame": 2,
         "phase": "2/8",
-        "pose": "attack begins; hips and shoulders rotate; lead foot remains planted"
+        "pose": "attack begins; hips and shoulders rotate toward anatomical left; lead left foot remains planted and sword rises behind the right shoulder"
       },
       {
         "frame": 3,
         "phase": "3/8",
-        "pose": "weapon accelerates toward contact; center of mass moves through the strike"
+        "pose": "sword accelerates through a controlled right-to-left cut; center of mass advances while the left arm counterbalances"
       },
       {
         "frame": 4,
         "phase": "4/8",
-        "pose": "contact phase; full extension without over-sampling impact"
+        "pose": "contact phase; sword reaches full one-handed extension across the forward line; both gauntlets and wrists remain anatomically aligned"
       },
       {
         "frame": 5,
         "phase": "5/8",
-        "pose": "follow-through; weapon passes contact line; cloth and straps trail"
+        "pose": "follow-through; blade passes the contact line and the red surcoat hem trails the hip rotation"
       },
       {
         "frame": 6,
         "phase": "6/8",
-        "pose": "recovery begins; weight returns; weapon withdraws along a safe arc"
+        "pose": "recovery begins; right hand withdraws the sword along a safe arc; weight returns toward both feet and scabbard stays at left hip"
       },
       {
         "frame": 7,
         "phase": "7/8",
-        "pose": "guard nearly restored; equipment settles continuously toward phase 0"
+        "pose": "guard nearly restored; sword point lowers toward the ready line and mail and belt settle continuously toward frame 0"
       }
     ],
     "dead": [
@@ -292,49 +305,49 @@
         "frame": 0,
         "variant": 0,
         "phase": "static",
-        "pose": "variant 0 motionless supine fall; limbs and equipment settled naturally"
+        "pose": "motionless supine fall; visor closed, sword still belted at left hip, arms and legs settled naturally"
       },
       {
         "frame": 1,
         "variant": 1,
         "phase": "static",
-        "pose": "variant 1 motionless prone fall; face turned safely aside; equipment settled"
+        "pose": "motionless prone fall; helmet turned safely aside, sword and scabbard visible along the left flank"
       },
       {
         "frame": 2,
         "variant": 2,
         "phase": "static",
-        "pose": "variant 2 motionless fall on anatomical left side; compact readable silhouette"
+        "pose": "motionless fall on anatomical left side; knees bent compactly and sword belt remains attached"
       },
       {
         "frame": 3,
         "variant": 3,
         "phase": "static",
-        "pose": "variant 3 motionless fall on anatomical right side; compact readable silhouette"
+        "pose": "motionless fall on anatomical right side; right gauntlet forward and scabbard visible behind the hips"
       },
       {
         "frame": 4,
         "variant": 4,
         "phase": "static",
-        "pose": "variant 4 motionless supine diagonal sprawl; no active muscle tension"
+        "pose": "motionless supine diagonal sprawl; sword lies in its scabbard across the left-side silhouette"
       },
       {
         "frame": 5,
         "variant": 5,
         "phase": "static",
-        "pose": "variant 5 motionless prone diagonal sprawl; weapon resting separately but still present"
+        "pose": "motionless prone diagonal sprawl; legs extended at different angles and belt and aventail remain readable"
       },
       {
         "frame": 6,
         "variant": 6,
         "phase": "static",
-        "pose": "variant 6 motionless curled side fall; role-defining equipment remains visible"
+        "pose": "motionless curled side fall; knees drawn in, one gauntleted hand near the face, no active muscle tension"
       },
       {
         "frame": 7,
         "variant": 7,
         "phase": "static",
-        "pose": "variant 7 motionless collapsed kneel-to-side fall; body fully at rest on ground"
+        "pose": "motionless collapsed kneel-to-side fall; torso and helmet at rest, sword secured and fully inside the cell"
       }
     ]
   }

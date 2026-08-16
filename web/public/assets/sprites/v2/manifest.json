@@ -1,0 +1,124 @@
+{
+  "version": 2,
+  "cell": {
+    "width": 200,
+    "height": 300
+  },
+  "columns": {
+    "kind": "direction",
+    "values": [
+      "south",
+      "southeast",
+      "east",
+      "northeast",
+      "north",
+      "northwest",
+      "west",
+      "southwest"
+    ]
+  },
+  "rows": {
+    "kind": "frame",
+    "values": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "rowSemantics": "per-role-actionPlayback",
+  "sets": {
+    "europe-14c-photorealistic-full-color": {
+      "period": {
+        "id": "14c",
+        "label": "14th century CE"
+      },
+      "region": {
+        "id": "europe",
+        "label": "Europe"
+      },
+      "styleId": "photorealistic-full-color",
+      "simulationProfile": "medieval_western",
+      "declaredRoles": [
+        "men-at-arms",
+        "spearman",
+        "longbowman",
+        "heavy-cavalry"
+      ],
+      "roles": {
+        "men-at-arms": {
+          "actions": {
+            "combat": "sprites/v2/sets/europe-14c-photorealistic-full-color/men-at-arms/combat.png",
+            "idle": "sprites/v2/sets/europe-14c-photorealistic-full-color/men-at-arms/idle.png",
+            "walk": "sprites/v2/sets/europe-14c-photorealistic-full-color/men-at-arms/walk.png",
+            "run": "sprites/v2/sets/europe-14c-photorealistic-full-color/men-at-arms/run.png",
+            "dead": "sprites/v2/sets/europe-14c-photorealistic-full-color/men-at-arms/dead.png"
+          },
+          "simulation": {
+            "profile": "medieval_western",
+            "troopTypeId": "men_at_arms",
+            "troopTypeIndex": 0,
+            "description": "徒歩で隊列戦と白兵戦を担う、比較的重装備の職業的戦闘員。特定の服装や武具形式はスキルが14世紀ヨーロッパの史料から確定する。",
+            "stateActions": {
+              "idle": "idle",
+              "marching": "walk",
+              "repositioning": "walk",
+              "advancing": "walk",
+              "charging": "run",
+              "engaged": "combat",
+              "shooting": "combat",
+              "reloading": "idle",
+              "wavering": "idle",
+              "broken": "run",
+              "rallying": "idle",
+              "working": "idle",
+              "downed": "combat",
+              "dead": "dead"
+            }
+          },
+          "actionPlayback": {
+            "idle": {
+              "mode": "variant-loop",
+              "variantCount": 4,
+              "framesPerVariant": 2,
+              "framesPerSecond": 2,
+              "loop": true
+            },
+            "walk": {
+              "mode": "cycle",
+              "variantCount": 1,
+              "framesPerVariant": 8,
+              "framesPerSecond": 8,
+              "loop": true
+            },
+            "run": {
+              "mode": "cycle",
+              "variantCount": 1,
+              "framesPerVariant": 8,
+              "framesPerSecond": 8,
+              "loop": true
+            },
+            "combat": {
+              "mode": "cycle",
+              "variantCount": 1,
+              "framesPerVariant": 8,
+              "framesPerSecond": 8,
+              "loop": true
+            },
+            "dead": {
+              "mode": "static-variants",
+              "variantCount": 8,
+              "framesPerVariant": 1,
+              "framesPerSecond": 0,
+              "loop": false
+            }
+          }
+        }
+      }
+    }
+  }
+}

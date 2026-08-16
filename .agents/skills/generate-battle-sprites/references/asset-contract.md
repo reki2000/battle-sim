@@ -80,7 +80,9 @@ Use top-left image origin. Fix the ground/foot anchor at `(100, 276)` in every 2
 - Delivery frame: exactly 200x300 px.
 - Working master: generate/edit at 800x1200 or larger with the same 2:3 aspect ratio when possible, then downsample once.
 - Color: non-interlaced 8-bit sRGB RGBA PNG with straight alpha.
-- Background: real transparency. No white/gray/checkerboard background, scenery, floor plane, border, text, label, or baked shadow.
+- Raw-generation background: a uniform solid `#00ff00` chroma-key field is mandatory. The exact `#00ff00` color must never appear in the subject or its materials, and no checkerboard, white, gray, black, gradient, scenery, floor plane, border, text, label, or baked shadow may be generated.
+- Final background: real transparency after post-processing. Run `scripts/chroma_key_green.py` on every raw reference/frame before resizing or canonical placement. The pass replaces exact `#00ff00` pixels with `A=0, RGB=0,0,0`; fail if the source contains no key pixels. Never treat a checkerboard preview as transparency and never attempt to key a checkerboard.
+- Final transparent pixels: `A=0` and `RGB=0,0,0`. Partial alpha is only for antialiased edges or genuinely translucent material after the chroma-key pass.
 - Transparent pixels: `A=0` and `RGB=0,0,0`. Partial alpha is only for antialiased edges or genuinely translucent material.
 - Framing: full body and role-defining equipment fit without clipping; body height and equipment scale stay fixed.
 - Rendering: follow the locked `renderStyle`. The default is full-color photorealism with readable silhouette and physically plausible materials at 200x300. No depth of field, motion blur, grain, bloom, or drifting outlines unless a user-selected style explicitly requires a listed treatment that does not harm animation consistency.
@@ -89,7 +91,7 @@ Long weapons and mounts must fit the universal cell. Never silently change cell 
 
 ## Style and ImageGen contract
 
-Use the `$imagegen` skill's built-in `image_gen` tool for every generated reference and animation frame. Stay in built-in mode for normal generation, reference-based derivation, transparency, quality, and file-placement requests. Use the CLI/API fallback only after the user explicitly asks for or confirms that mode. Generate one distinct asset per call; “batch” never means combining different frames into one generation.
+Use the `$imagegen` skill's built-in `image_gen` tool for every generated reference and animation frame. Stay in built-in mode for normal generation, reference-based derivation, quality, and file-placement requests. Use the CLI/API fallback only after the user explicitly asks for or confirms that mode. Generate one distinct asset per call; “batch” never means combining different frames into one generation. Request a uniform solid `#00ff00` background for raw output and perform the deterministic chroma-key pass before any contract validation. Do not request or accept ImageGen-native transparency or a checkerboard.
 
 Store the set-wide style in `set.json` and copy the exact same object into every member `role.json` so each role remains self-describing:
 
@@ -119,18 +121,18 @@ Use case: photorealistic-natural
 Asset type: transparent battle-sim soldier sprite frame
 Input images: Image 1 front identity reference; Image 2 back identity reference; additional images labeled as style or temporal-pose references
 Primary request: render exactly one <role>, <action>, <direction>, frame slot K of 8 using its framePlans entry
-Scene/backdrop: genuinely transparent background; no floor or environment
+Scene/backdrop: uniform solid `#00ff00` chroma-key background for raw generation; after the call, replace exact `#00ff00` pixels with transparent alpha using `scripts/chroma_key_green.py`; no floor or environment
 Subject: identity and equipment invariants from role.json; identity.period; identity.region; exact framePlans pose and playback semantics
 Style/medium: renderStyle.prompt verbatim
 Composition/framing: orthographic quarter-view; full body; fixed scale and foot anchor; 2:3 portrait
 Lighting/mood: fixed neutral screen-space lighting; color-accurate materials
 Color palette: role palette; full color unless the selected style explicitly says otherwise
 Materials/textures: preserve the approved skin, cloth, leather, wood, and metal treatment
-Constraints: preserve period and regional accuracy, identity, garment construction, handedness, equipment side/count/size, camera, anchor, style, and alpha; no text; no watermark
-Avoid: renderStyle.avoid plus checkerboard, background, floor, baked shadow, clipping, extra equipment, mirrored anatomy
+Constraints: preserve period and regional accuracy, identity, garment construction, handedness, equipment side/count/size, camera, anchor, and style; subject must not contain `#00ff00`; no text; no watermark
+Avoid: renderStyle.avoid plus checkerboard, white/gray/black/gradient backgrounds, floor, baked shadow, clipping, extra equipment, mirrored anatomy
 ```
 
-For the default style use the exact ImageGen taxonomy slug `photorealistic-natural`. For a user-selected non-photorealistic style use `stylized-concept`. Style references guide generation and are not edit targets. Ask ImageGen for genuine transparency, preserve the alpha channel, inspect the result, and copy an approved project-bound image from the generated-images location into its canonical workspace path.
+For the default style use the exact ImageGen taxonomy slug `photorealistic-natural`. For a user-selected non-photorealistic style use `stylized-concept`. Style references guide generation and are not edit targets. Ask ImageGen for a uniform solid `#00ff00` background, inspect the raw result, run `scripts/chroma_key_green.py`, inspect the transparent result for leftover green and checkerboard pixels, and copy the approved project-bound RGBA image from the generated-images location into its canonical workspace path. Preserve the raw source outside canonical paths.
 
 ## Layout and path contract
 
