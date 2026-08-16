@@ -18,11 +18,27 @@ import { SoldierState } from "../sim/snapshot";
 import { loadSoldierSprite } from "./generated-assets";
 import { loadSpriteRuntime } from "./sprite-atlas";
 import type { SpriteRuntime } from "./sprite-atlas";
+import { getQuality } from "../quality";
 
 /** 陣営色。色覚多様性に配慮し、赤/青ではなく青/橙にする（仕様 09 章 9 節）。 */
 const FACTION_COLORS = ["#3d7ab8", "#d98032"];
 
 const INSTANCE_STRIDE = 16;
+
+/**
+ * 会戦・戦域 LOD（個体が数 px 以下の点になる距離）での間引き目標。
+ *
+ * この距離では 1 体ずつ描いても見た目はほぼ変わらないが、フレームごとに
+ * インスタンスバッファへ書き込む JS 側のループ（GPU 側のインスタンス
+ * 描画そのものではない）が兵士数に比例して重くなる。M9 の 50,000 体規模で
+ * 60 fps を保つため、視覚的に意味のある密度まで間引く（仕様 12 章 M9
+ * 「描画の最適化（視錐台カリング、L3/L4 の間引き）」）。目標値は品質
+ * プリセット（`quality.ts`）で変わる。
+ */
+function thinningStride(n: number, lod: Lod): number {
+  if (lod < Lod.Battle) return 1;
+  return Math.max(1, Math.floor(n / getQuality().thinTargetInstances));
+}
 
 const VERT_SRC = `#version 300 es
 in vec2 a_quad;
@@ -341,6 +357,9 @@ export class SoldierRenderer {
       spriteHeight = battleSideHeight + (unitSideHeight - battleSideHeight) * tUnitVsBattle;
       dotBlend = 1;
     }
+    // 低品質プリセットではスプライトのテクスチャサンプリング・アニメーション
+    // 計算を丸ごと省き、常に点/矩形表現にする（`quality.ts`）。
+    if (getQuality().forceDotsOnly) dotBlend = 1;
     const spriteWidth = dotBlend < 1 ? spriteHeight * (200 / 300) : spriteHeight;
 
     if (n === 0) {
@@ -355,6 +374,7 @@ export class SoldierRenderer {
     // 少数個体では毎個体の射影判定の方が高くつく。GPU は画面外のクアッドを
     // そのままクリップできるため、5,000 体規模でだけ CPU カリングを有効にする。
     const shouldCull = n > 3000;
+    const stride = thinningStride(n, cam.lod);
     type DrawGroup = {
       texture: WebGLTexture;
       columns: number;
@@ -373,7 +393,7 @@ export class SoldierRenderer {
     };
     const useSprites = this.assetsReady && dotBlend < 0.999;
     let visibleCount = 0;
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < n; i += stride) {
       const x = interp.x(i, alpha);
       const y = interp.y(i, alpha);
       const z = groundHeight(x, y);
@@ -503,9 +523,10 @@ export class SoldierRenderer {
     const pxPerM = cam.pxPerM;
     const size = Math.max(1, 0.7 * pxPerM);
     const margin = size * 4;
+    const stride = thinningStride(n, cam.lod);
     let drawn = 0;
     ctx.save();
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < n; i += stride) {
       const x = interp.x(i, alpha);
       const y = interp.y(i, alpha);
       const p = cam.worldToScreen(x, y, groundHeight(x, y));

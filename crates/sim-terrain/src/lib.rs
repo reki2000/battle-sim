@@ -228,6 +228,19 @@ pub enum WaterKind {
     Sea = 3,
 }
 
+impl WaterKind {
+    /// discriminant から復元する（M9: IndexedDB からの地形キャッシュ復元用）。
+    /// 未知の値は防御的に `None` に丸める。
+    pub fn from_u8(v: u8) -> WaterKind {
+        match v {
+            1 => WaterKind::Lake,
+            2 => WaterKind::River,
+            3 => WaterKind::Sea,
+            _ => WaterKind::None,
+        }
+    }
+}
+
 /// 生成された地形。
 ///
 /// 各グリッドは行優先（`y * dim + x`）。

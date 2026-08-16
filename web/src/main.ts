@@ -23,6 +23,7 @@ import { OrderPanel } from "./ui/orders";
 import { DetailPanel } from "./ui/detail-panel";
 import { SessionPanel } from "./ui/session-panel";
 import { t, onLangChange } from "./i18n";
+import { getQuality, onQualityChange } from "./quality";
 
 const TICK_MS = 50;
 /** クリックとドラッグを区別するしきい値（px）。 */
@@ -88,6 +89,11 @@ const sessionPanel = new SessionPanel(sessionPanelEl, battleReportEl, send);
 onLangChange(() => {
   orderPanel.refreshLang();
   detailPanel.render();
+  sessionPanel.render();
+});
+
+onQualityChange(() => {
+  resize();
   sessionPanel.render();
 });
 
@@ -166,8 +172,11 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       // 前列判定が誰も成立しなくなるため、隊列の奥行き＋わずかな隙間ぶんだけ
       // 後方へずらす（sim-headless の battle サブコマンドと同じ考え方）。
       const mid = Math.floor(terrain.sizeM / 2);
-      const FILES = 40;
-      const RANKS = 25;
+      // `?soldiers=N` で総兵数を上書きできる（M9: 50,000 体規模の性能検証用）。
+      // 既定の縦横比（40:25）を保ったまま、片陣営あたり N/2 体になるよう調整する。
+      const soldiersParam = Number(new URLSearchParams(location.search).get("soldiers"));
+      const FILES = soldiersParam > 0 ? Math.round(Math.sqrt((soldiersParam / 2) * (40 / 25))) : 40;
+      const RANKS = soldiersParam > 0 ? Math.max(1, Math.round(soldiersParam / 2 / FILES)) : 25;
       const RANK_SPACING_M = 0.8;
       const CONTACT_GAP_M = 0.5;
       const depth = RANK_SPACING_M * (RANKS - 1);
@@ -376,7 +385,7 @@ function setSpeed(v: number): void {
 // ── 描画ループ ──────────────────────────────────────────
 
 function resize(): void {
-  dpr = Math.min(2, window.devicePixelRatio || 1);
+  dpr = Math.min(getQuality().dprCap, window.devicePixelRatio || 1);
   const w = Math.floor(window.innerWidth * dpr);
   const h = Math.floor(window.innerHeight * dpr);
 

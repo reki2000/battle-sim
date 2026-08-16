@@ -19,6 +19,7 @@ import type { TerrainData } from "../sim/terrain-data";
 import type { Camera } from "./iso";
 import type { InterpolatedPositions, SnapshotView } from "../sim/snapshot";
 import { FACTION_COLORS } from "./soldiers";
+import { getQuality } from "../quality";
 
 /** ミニマップの一辺（CSS px）。 */
 const SIZE_PX = 200;
@@ -85,7 +86,8 @@ export class MinimapRenderer {
 
     const world = this.terrain.sizeM;
     const n = snap.count;
-    for (let i = 0; i < n; i++) {
+    const stride = Math.max(1, Math.floor(n / getQuality().thinTargetMinimapDots));
+    for (let i = 0; i < n; i += stride) {
       const x = (interp.x(i, 1) / world) * size;
       const y = (interp.y(i, 1) / world) * size;
       const faction = snap.faction(i) % FACTION_COLORS.length;
