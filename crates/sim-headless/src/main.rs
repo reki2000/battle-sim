@@ -235,6 +235,7 @@ fn build_battle_world(o: &Opts) -> World {
             formation_change: None,
             path: Vec::new(),
             path_final: target,
+            pursuit_leash: None,
         };
         w.add_command_node(None, 0, faction, commander, deputies, Some(unit));
     }

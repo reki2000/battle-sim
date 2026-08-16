@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cavalry;
 pub mod combat;
 pub mod organization;
 pub mod pathing;
@@ -15,6 +16,7 @@ pub mod snapshot;
 pub mod soldiers;
 pub mod spatial;
 
+use cavalry::CavalrySystem;
 use combat::CombatSystem;
 use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
@@ -61,6 +63,8 @@ pub struct World {
     pub command: CommandTree,
     /// M4 の白兵戦・負傷・士気・追撃フェーズ。
     pub combat: CombatSystem,
+    /// M5 の騎兵：突撃のモメンタム・馬の忌避・衝撃・落馬後の徒歩化。
+    pub cavalry: CavalrySystem,
     /// 各兵士の目標位置。M2 で陣形スロットに置き換わる
     goal: Vec<Vec2Fx>,
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
@@ -92,6 +96,7 @@ impl World {
             hash: SpatialHash::default(),
             command: CommandTree::new(),
             combat: CombatSystem::default(),
+            cavalry: CavalrySystem::default(),
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
@@ -135,6 +140,10 @@ impl World {
             soldier_flags,
         );
         self.combat.register();
+        self.cavalry.register();
+        if soldier_flags & flags::MOUNTED != 0 {
+            self.combat.set_mounted(id, true);
+        }
         self.goal.push(pos);
         self.push_x.push(0);
         self.push_y.push(0);
@@ -218,10 +227,23 @@ impl World {
     ///
     /// フェーズの順序は仕様 02 章 5 節に従う。M0 では未実装のフェーズを飛ばす。
     pub fn tick(&mut self) {
-        self.command.tick(&self.soldiers, &self.terrain, self.tick);
+        self.command
+            .tick(&mut self.soldiers, &self.terrain, self.tick);
         self.command
             .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
+        // 騎兵の忌避・衝撃は白兵戦の通常交戦より先に解決する。こうすると、
+        // 忌避で Wavering に、衝撃で Engaged に落ちた騎兵を、同じ tick 内で
+        // combat.tick の通常交戦ロジックがそのまま拾える（仕様 12 章 M5）。
+        let map_limit = fx(self.terrain.size_m() as i32) - FX_ONE;
+        self.cavalry.tick(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &self.hash,
+            &mut self.combat,
+            map_limit,
+        );
         self.combat
             .tick(self.seed, self.tick, &mut self.soldiers, &self.hash);
         self.steer();
@@ -318,8 +340,23 @@ impl World {
     ///
     /// 地表の速度倍率と疲労を反映する（仕様 06 章 2.1 の簡略版）。
     fn desired_speed(&self, i: usize) -> Fx {
-        // 基準 1.2 m/s に能力値で ±0.8 m/s
-        let base_mm_per_s = 1200 + (self.soldiers.attrs[i].speed as i32) * 3;
+        let id = i as SoldierId;
+        let mounted = self.soldiers.hot.flags[i] & flags::MOUNTED != 0;
+        // 基準 1.2 m/s（徒歩）/ 2.2 m/s（騎乗の常歩）に能力値で ±0.8 m/s。
+        // 突撃中はモメンタムに応じて最高速 8 m/s まで上がる
+        // （仕様 06 章 4.1 節「最高速 8 m/s」「加速には距離が要る」）。
+        let base_mm_per_s = if mounted {
+            2200 + (self.soldiers.attrs[i].speed as i32) * 4
+        } else {
+            1200 + (self.soldiers.attrs[i].speed as i32) * 3
+        };
+        let base_mm_per_s = if mounted && self.soldiers.hot.state[i] == State::Charging {
+            const CHARGE_TOP_MM_PER_S: i32 = 8000;
+            let m = self.cavalry.momentum_permille(id) as i32;
+            base_mm_per_s + (CHARGE_TOP_MM_PER_S - base_mm_per_s) * m / 1000
+        } else {
+            base_mm_per_s
+        };
         let per_tick = per_sec_to_per_tick(fx_from_mm(base_mm_per_s));
 
         let pos = self.soldiers.pos(i);
@@ -327,9 +364,17 @@ impl World {
         let eff = &SURFACE_EFFECTS[surface as usize];
         let after_terrain = sim_math::fx_scale_permille(per_tick, eff.move_mult as i32);
 
-        // 疲労 10000 で 40% 減
+        // 疲労 10000 で 40% 減。騎乗中は馬自身の疲労も掛け合わせる
+        // （仕様「馬の疲労は騎手より早く蓄積する」）。
         let fatigue = self.soldiers.fatigue[i] as i32;
         let fatigue_permille = 1000 - (fatigue * 400 / soldiers::MAX_FATIGUE as i32);
+        let fatigue_permille = if mounted {
+            let horse_fatigue = self.cavalry.horse_fatigue(id) as i32;
+            let horse_permille = 1000 - (horse_fatigue * 500 / 10_000);
+            fatigue_permille * horse_permille / 1000
+        } else {
+            fatigue_permille
+        };
         let injury_permille = match combat::InjuryStage::from_hp(self.soldiers.hp[i]) {
             combat::InjuryStage::Light => 950,
             combat::InjuryStage::Medium => 800,
@@ -532,6 +577,7 @@ impl World {
         mix(self.tick as u64);
         mix(self.command.state_hash());
         mix(self.combat.state_hash());
+        mix(self.cavalry.state_hash());
         for i in 0..self.soldiers.len() {
             mix(self.soldiers.hot.pos_x[i] as u32 as u64);
             mix(self.soldiers.hot.pos_y[i] as u32 as u64);
@@ -796,5 +842,130 @@ mod tests {
             w.tick();
         }
         assert_eq!(w.soldiers.pos(id as usize), before);
+    }
+
+    /// 仕様 12 章 M5：騎乗している兵士は徒歩より速く動ける（常歩でも）。
+    /// 突撃状態でなくても最低限の機動力の差はある。
+    #[test]
+    fn mounted_soldiers_cover_more_ground_than_infantry() {
+        let mut w = small_world();
+        let rider = w.spawn(
+            Vec2Fx::new(fx(100), fx(100)),
+            0,
+            0,
+            0,
+            Attrs::default(),
+            flags::MOUNTED,
+        );
+        let footman = w.spawn(Vec2Fx::new(fx(100), fx(105)), 0, 0, 0, Attrs::default(), 0);
+        let goal_r = Vec2Fx::new(fx(100), fx(400));
+        let goal_f = Vec2Fx::new(fx(100), fx(405));
+        w.set_goal(rider, goal_r);
+        w.set_goal(footman, goal_f);
+        for _ in 0..200 {
+            w.tick();
+        }
+        let rider_traveled = sim_math::dist(
+            Vec2Fx::new(fx(100), fx(100)),
+            w.soldiers.pos(rider as usize),
+        );
+        let footman_traveled = sim_math::dist(
+            Vec2Fx::new(fx(100), fx(105)),
+            w.soldiers.pos(footman as usize),
+        );
+        assert!(
+            rider_traveled > footman_traveled,
+            "騎乗兵が徒歩より速く進んでいない: rider={rider_traveled} footman={footman_traveled}"
+        );
+    }
+
+    /// 仕様 12 章 M5 の受け入れ条件を指揮系統込みの `World` レベルで確認する:
+    /// Charge 命令を出した騎兵が実際に加速し、敵にぶつかって損害を与える。
+    /// 決定論（同じ入力で同じ結果）も併せて確認する。
+    #[test]
+    fn end_to_end_charge_order_deals_damage_deterministically() {
+        let run = || {
+            let mut w = small_world();
+            let rider = w.spawn(
+                Vec2Fx::new(fx(100), fx(100)),
+                0,
+                0,
+                0,
+                Attrs::new(160, 160, 160, 160, 160, 160, 160, 160, 160, 120, 160, 160),
+                flags::MOUNTED,
+            );
+            let victims: Vec<SoldierId> = (0..4)
+                .map(|k| {
+                    w.spawn(
+                        Vec2Fx::new(fx(100 + k), fx(180)),
+                        sim_math::brad_from_deg(180),
+                        0,
+                        1,
+                        Attrs::default(),
+                        0,
+                    )
+                })
+                .collect();
+
+            let army = w.add_command_node(None, 0, 0, rider, vec![], None);
+            let friendly_unit = organization::Unit {
+                soldiers: vec![rider],
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(fx(100), fx(100)),
+                formation_facing: 0,
+                ranks: 1,
+                file_spacing: fx_from_mm(800),
+                rank_spacing: fx_from_mm(800),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(fx(100), fx(100)),
+                pursuit_leash: None,
+            };
+            let friendly = w.add_command_node(Some(army), 1, 0, rider, vec![], Some(friendly_unit));
+            let enemy_unit = organization::Unit {
+                soldiers: victims.clone(),
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(fx(100), fx(180)),
+                formation_facing: 0,
+                ranks: 1,
+                file_spacing: fx_from_mm(800),
+                rank_spacing: fx_from_mm(800),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(fx(100), fx(180)),
+                pursuit_leash: None,
+            };
+            let enemy = w.add_command_node(Some(army), 1, 1, victims[0], vec![], Some(enemy_unit));
+
+            w.issue_order(
+                army,
+                friendly,
+                organization::Intent::Charge { target: enemy },
+                organization::Priority::Absolute,
+            );
+
+            let mut hashes = Vec::new();
+            for _ in 0..900 {
+                w.tick();
+                hashes.push(w.state_hash());
+            }
+            (hashes, w.combat.stats.damage, w.combat.stats.attacks)
+        };
+
+        let (hashes_a, damage_a, attacks_a) = run();
+        let (hashes_b, damage_b, attacks_b) = run();
+        assert_eq!(
+            hashes_a, hashes_b,
+            "同じ入力で結果が一致しない（決定論が壊れている）"
+        );
+        assert!(
+            damage_a > 0 && attacks_a > 0,
+            "騎兵突撃が誰にも損害を与えていない (damage={damage_a}, attacks={attacks_a})"
+        );
+        let _ = (damage_b, attacks_b);
     }
 }

@@ -129,6 +129,19 @@ impl World {
         )
     }
 
+    /// 騎乗した兵士を 1 体追加する（M5、デバッグ用）。
+    #[wasm_bindgen(js_name = spawnCavalryOne)]
+    pub fn spawn_cavalry_one(&mut self, x_m: i32, y_m: i32, faction: u8, unit_id: u16) -> u32 {
+        self.inner.spawn(
+            Vec2Fx::new(fx(x_m), fx(y_m)),
+            0,
+            unit_id,
+            faction,
+            Attrs::default(),
+            sim_core::soldiers::flags::MOUNTED,
+        )
+    }
+
     /// ある陣営の全兵士に移動目標を与える。
     ///
     /// M3 で指揮系統を通す命令 API（`pushOrder`）に置き換わる。
@@ -263,7 +276,8 @@ impl World {
     /// 戦闘の集計値。統計グラフ・HUD 用。
     ///
     /// `[attacks, hits, damage, kills, downed, pursuit_kills, melee_kills,
-    ///   missile_kills, crush_kills, bleed_kills, shots_fired, friendly_fire_hits]`
+    ///   missile_kills, crush_kills, bleed_kills, shots_fired, friendly_fire_hits,
+    ///   charge_kills, dismounts, horse_refusals]`（末尾 3 つは M5）。
     #[wasm_bindgen(js_name = combatStats)]
     pub fn combat_stats(&self) -> Vec<u32> {
         let s = &self.inner.combat.stats;
@@ -280,6 +294,9 @@ impl World {
             s.bleed_kills,
             s.shots_fired,
             s.friendly_fire_hits,
+            s.charge_kills,
+            s.dismounts,
+            s.horse_refusals,
         ]
     }
 
@@ -391,6 +408,7 @@ impl World {
             formation_change: None,
             path: Vec::new(),
             path_final: Vec2Fx::ZERO,
+            pursuit_leash: None,
         };
         self.inner
             .add_command_node(None, 0, faction, commander, deputies, Some(unit))
@@ -416,6 +434,39 @@ impl World {
                     facing: facing_brad,
                     speed: MoveSpeed::Walk,
                     formation,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定ノードへ、指揮系統を介さず直接（絶対優先度の）突撃命令を出す
+    /// （M5、デモ・シナリオ用の簡易 API）。
+    #[wasm_bindgen(js_name = issueCharge)]
+    pub fn issue_charge(&mut self, node: u32, target_node: u32) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Charge {
+                    target: target_node,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定ノードへ、指揮系統を介さず直接（絶対優先度の）追撃命令を出す
+    /// （M5、デモ・シナリオ用の簡易 API）。
+    #[wasm_bindgen(js_name = issuePursue)]
+    pub fn issue_pursue(&mut self, node: u32, target_node: u32, max_distance_m: u16) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::Pursue {
+                    target: target_node,
+                    max_distance_m,
                 },
                 Priority::Absolute,
             )

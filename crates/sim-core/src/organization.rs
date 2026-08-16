@@ -408,6 +408,17 @@ pub struct Unit {
     pub path: Vec<Vec2Fx>,
     /// 経路探索の最終目的地。到達判定や再計算の要否に使う。
     pub path_final: Vec2Fx,
+    /// 追撃中なら、その上限距離と起点（仕様 12 章 M5）。
+    pub pursuit_leash: Option<PursuitLeash>,
+}
+
+/// 追撃の紐（leash）。仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに
+/// 現実的な時間がかかる」を実装するための、部隊単位の上限距離。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PursuitLeash {
+    /// 追撃を開始した時点の部隊の位置。呼び戻し先にもなる。
+    pub origin: Vec2Fx,
+    pub max_distance_m: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,7 +735,7 @@ impl CommandTree {
     }
 
     /// 伝令の移動、命令の受領、指揮継承を進める。
-    pub fn tick(&mut self, soldiers: &Soldiers, terrain: &Terrain, tick: u32) {
+    pub fn tick(&mut self, soldiers: &mut Soldiers, terrain: &Terrain, tick: u32) {
         self.tick_succession(soldiers, tick);
         let mut arrivals = Vec::new();
         let mut lost = Vec::new();
@@ -771,9 +782,71 @@ impl CommandTree {
             self.deliver(index, soldiers, terrain, tick);
         }
         self.update_stats(soldiers);
+        self.tick_pursuit(soldiers, terrain);
     }
 
-    fn deliver(&mut self, messenger_id: usize, soldiers: &Soldiers, terrain: &Terrain, tick: u32) {
+    /// 追撃の紐を確認し、上限距離（規律が低いほど超過を許す）を超えた部隊を
+    /// 起点へ呼び戻す。呼び戻しは通常の移動命令と同じ経路探索・速度で進むので、
+    /// 「戻ってくるのに現実的な時間がかかる」が自然に満たされる。
+    fn tick_pursuit(&mut self, soldiers: &Soldiers, terrain: &Terrain) {
+        let node_ids: Vec<NodeId> = self.nodes.iter().map(|n| n.id).collect();
+        for node_id in node_ids {
+            let Some(node) = self.node(node_id) else {
+                continue;
+            };
+            let Some(unit) = &node.unit else {
+                continue;
+            };
+            let Some(leash) = unit.pursuit_leash else {
+                continue;
+            };
+            let centroid = if node.stats.alive > 0 {
+                node.stats.centroid
+            } else {
+                unit.formation_origin
+            };
+            let overrun_m = self.discipline_overrun_m(node_id, soldiers);
+            let effective_max = fx((leash.max_distance_m as i32 + overrun_m).max(0));
+            if dist(centroid, leash.origin) <= effective_max {
+                continue;
+            }
+            self.set_movement_target(node_id, leash.origin, soldiers, terrain);
+            if let Some(node) = self.node_mut(node_id) {
+                if let Some(unit) = node.unit.as_mut() {
+                    unit.pursuit_leash = None;
+                }
+            }
+        }
+    }
+
+    /// 規律が低い部隊ほど、追撃の紐を大きく超過して深追いする
+    /// （仕様「discipline が低い部隊は制限を超えて追う」）。最大 100 m。
+    fn discipline_overrun_m(&self, node_id: NodeId, soldiers: &Soldiers) -> i32 {
+        let Some(unit) = self.node(node_id).and_then(|n| n.unit.as_ref()) else {
+            return 0;
+        };
+        let mut sum = 0i32;
+        let mut count = 0i32;
+        for &id in &unit.soldiers {
+            if let Some(i) = soldiers.index_if_present(id) {
+                sum += soldiers.attrs[i].discipline as i32;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return 0;
+        }
+        let avg = sum / count;
+        (255 - avg) * 100 / 255
+    }
+
+    fn deliver(
+        &mut self,
+        messenger_id: usize,
+        soldiers: &mut Soldiers,
+        terrain: &Terrain,
+        tick: u32,
+    ) {
         let messenger = self.messengers[messenger_id];
         let node_id = messenger.to;
         let Some(node) = self.node(node_id) else {
@@ -829,12 +902,22 @@ impl CommandTree {
         &mut self,
         node_id: NodeId,
         intent: Intent,
-        soldiers: &Soldiers,
+        soldiers: &mut Soldiers,
         terrain: &Terrain,
         tick: u32,
     ) {
         let mut requested_formation = None;
         let mut route: Option<Vec2Fx> = None;
+        // ノードを可変借用する前に、他ノード（Charge/Pursue の対象）の重心と
+        // この部隊の現在地を読んでおく。
+        let target_centroid = match intent {
+            Intent::Charge { target } | Intent::Pursue { target, .. } => {
+                self.node(target).map(|n| n.stats.centroid)
+            }
+            _ => None,
+        };
+        let pursuit_origin =
+            matches!(intent, Intent::Pursue { .. }).then(|| self.unit_origin(node_id, soldiers));
         if let Some(node) = self.node_mut(node_id) {
             let Some(unit) = node.unit.as_mut() else {
                 return;
@@ -856,6 +939,39 @@ impl CommandTree {
                 }
                 Intent::Reserve { rally_pos } | Intent::Withdraw { to: rally_pos, .. } => {
                     route = Some(rally_pos);
+                }
+                Intent::Charge { .. } => {
+                    unit.pursuit_leash = None;
+                    if let Some(centroid) = target_centroid {
+                        route = Some(centroid);
+                    }
+                    // 騎乗している者は突撃モメンタムの積み上げへ、徒歩の者は
+                    // 通常より積極的な前進状態へ（仕様 12 章 M5、06 章 4.1 節）。
+                    for &id in &unit.soldiers {
+                        let Some(i) = soldiers.index_if_present(id) else {
+                            continue;
+                        };
+                        if !soldiers.is_active_id(id) {
+                            continue;
+                        }
+                        soldiers.hot.state[i] =
+                            if soldiers.hot.flags[i] & crate::soldiers::flags::MOUNTED != 0 {
+                                State::Charging
+                            } else {
+                                State::Advancing
+                            };
+                    }
+                }
+                Intent::Pursue { max_distance_m, .. } => {
+                    if let Some(centroid) = target_centroid {
+                        route = Some(centroid);
+                    }
+                    if let Some(origin) = pursuit_origin {
+                        unit.pursuit_leash = Some(PursuitLeash {
+                            origin,
+                            max_distance_m,
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1273,7 +1389,7 @@ mod tests {
 
     #[test]
     fn order_delay_grows_with_distance_and_reaches_leaf() {
-        let soldiers = soldiers_at(&[(10, 10), (20, 10), (200, 10)]);
+        let mut soldiers = soldiers_at(&[(10, 10), (20, 10), (200, 10)]);
         let mut tree = CommandTree::new();
         let army = tree.add_node(None, 0, 0, 0, vec![1], None);
         let unit = Unit {
@@ -1289,6 +1405,7 @@ mod tests {
             formation_change: None,
             path: Vec::new(),
             path_final: Vec2Fx::ZERO,
+            pursuit_leash: None,
         };
         let terrain = flat_terrain(400);
         let leaf = tree.add_node(Some(army), 1, 0, 2, vec![], Some(unit));
@@ -1307,7 +1424,7 @@ mod tests {
         let first = tree.messengers[0].remaining_ticks;
         assert!(first > 0);
         for tick in 0..first {
-            tree.tick(&soldiers, &terrain, tick);
+            tree.tick(&mut soldiers, &terrain, tick);
         }
         assert_eq!(tree.node(leaf).unwrap().received_order.unwrap().id, 0);
         assert!(tree
@@ -1340,6 +1457,7 @@ mod tests {
                 formation_change: None,
                 path: Vec::new(),
                 path_final: Vec2Fx::ZERO,
+                pursuit_leash: None,
             }),
         );
         let terrain = flat_terrain(400);
@@ -1354,7 +1472,7 @@ mod tests {
             &soldiers,
         );
         soldiers.hot.state[0] = State::Dead;
-        tree.tick(&soldiers, &terrain, 1);
+        tree.tick(&mut soldiers, &terrain, 1);
         assert!(tree.node(leaf).unwrap().received_order.is_none());
         assert!(tree
             .events
@@ -1369,13 +1487,13 @@ mod tests {
         let root = tree.add_node(None, 0, 0, 0, vec![1], None);
         let terrain = flat_terrain(400);
         soldiers.hot.state[0] = State::Dead;
-        tree.tick(&soldiers, &terrain, 0);
+        tree.tick(&mut soldiers, &terrain, 0);
         assert_eq!(
             tree.node(root).unwrap().command_state,
             CommandState::Succeeding
         );
         for tick in 1..=20 * sim_math::TICK_HZ {
-            tree.tick(&soldiers, &terrain, tick);
+            tree.tick(&mut soldiers, &terrain, tick);
         }
         assert_eq!(tree.node(root).unwrap().commander, 1);
         assert_eq!(
@@ -1415,6 +1533,7 @@ mod tests {
             formation_change: None,
             path: Vec::new(),
             path_final: Vec2Fx::ZERO,
+            pursuit_leash: None,
         };
         let leaf = tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
         tree.set_movement_target(leaf, Vec2Fx::new(fx(350), fx(200)), &soldiers, &terrain);
@@ -1455,6 +1574,7 @@ mod tests {
             formation_change: None,
             path: Vec::new(),
             path_final: Vec2Fx::ZERO,
+            pursuit_leash: None,
         };
         tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
         let mut goals = vec![Vec2Fx::ZERO; 4];
@@ -1463,5 +1583,140 @@ mod tests {
         soldiers.hot.state[1] = State::Dead;
         tree.formation_goals(&mut soldiers, &mut goals, 1);
         assert_ne!(before, goals[3]);
+    }
+
+    fn leaf_unit(soldiers: Vec<SoldierId>, origin: Vec2Fx) -> Unit {
+        Unit {
+            soldiers,
+            troop_type: 0,
+            formation: FORMATION_LINE,
+            formation_origin: origin,
+            formation_facing: 0,
+            ranks: 1,
+            file_spacing: fx_from_mm(800),
+            rank_spacing: fx_from_mm(800),
+            banner: None,
+            formation_change: None,
+            path: Vec::new(),
+            path_final: origin,
+            pursuit_leash: None,
+        }
+    }
+
+    /// 仕様 12 章 M5 の受け入れ条件のうち「突撃が会戦の転換点になる」動線：
+    /// Charge 命令が届くと、騎乗している者は Charging へ、徒歩の者は
+    /// Advancing へ切り替わる。
+    #[test]
+    fn charge_order_sets_mounted_soldiers_charging() {
+        let mut soldiers = soldiers_at(&[(10, 10), (11, 10), (300, 10)]);
+        soldiers.hot.flags[1] |= crate::soldiers::flags::MOUNTED;
+        let terrain = flat_terrain(400);
+        let mut tree = CommandTree::new();
+        let army = tree.add_node(None, 0, 0, 0, vec![], None);
+        let friendly = tree.add_node(
+            Some(army),
+            1,
+            0,
+            0,
+            vec![],
+            Some(leaf_unit(vec![0, 1], Vec2Fx::new(fx(10), fx(10)))),
+        );
+        let enemy = tree.add_node(
+            Some(army),
+            1,
+            1,
+            2,
+            vec![],
+            Some(leaf_unit(vec![2], Vec2Fx::new(fx(300), fx(10)))),
+        );
+        tree.issue_order(
+            army,
+            friendly,
+            Intent::Charge { target: enemy },
+            Priority::Absolute,
+            0,
+            &soldiers,
+        );
+        let total = tree.messengers[0].total_ticks;
+        for tick in 0..=total {
+            tree.tick(&mut soldiers, &terrain, tick);
+        }
+        assert_eq!(
+            soldiers.hot.state[1],
+            State::Charging,
+            "騎乗兵が Charging になっていない"
+        );
+        assert_eq!(
+            soldiers.hot.state[0],
+            State::Advancing,
+            "徒歩兵が Advancing になっていない"
+        );
+    }
+
+    /// 仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに現実的な時間がかかる」。
+    /// 紐の上限を超えると、部隊は起点へ呼び戻される（＝経路探索付きの
+    /// 通常移動で戻る＝瞬間移動ではなく実時間がかかる）。
+    #[test]
+    fn pursuit_beyond_leash_recalls_the_unit_to_its_origin() {
+        let mut soldiers = soldiers_at(&[(10, 10), (500, 500)]);
+        let terrain = flat_terrain(1200);
+        let mut tree = CommandTree::new();
+        let army = tree.add_node(None, 0, 0, 0, vec![], None);
+        let origin = Vec2Fx::new(fx(10), fx(10));
+        let chaser = tree.add_node(
+            Some(army),
+            1,
+            0,
+            0,
+            vec![],
+            Some(leaf_unit(vec![0], origin)),
+        );
+        let quarry = tree.add_node(
+            Some(army),
+            1,
+            1,
+            1,
+            vec![],
+            Some(leaf_unit(vec![1], Vec2Fx::new(fx(500), fx(500)))),
+        );
+        tree.issue_order(
+            army,
+            chaser,
+            Intent::Pursue {
+                target: quarry,
+                max_distance_m: 50,
+            },
+            Priority::Absolute,
+            0,
+            &soldiers,
+        );
+        let total = tree.messengers[0].total_ticks;
+        for tick in 0..=total {
+            tree.tick(&mut soldiers, &terrain, tick);
+        }
+        assert!(
+            tree.node(chaser)
+                .unwrap()
+                .unit
+                .as_ref()
+                .unwrap()
+                .pursuit_leash
+                .is_some(),
+            "追撃紐が設定されていない"
+        );
+
+        // 紐の上限を大きく超える位置まで追いついたことにする。
+        soldiers.hot.pos_x[0] = fx(500);
+        soldiers.hot.pos_y[0] = fx(500);
+        tree.tick(&mut soldiers, &terrain, total + 1);
+
+        let unit = tree.node(chaser).unwrap().unit.as_ref().unwrap();
+        assert!(
+            unit.pursuit_leash.is_none(),
+            "紐の上限を超えても呼び戻されていない"
+        );
+        // 瞬間移動ではなく、経路探索付きの通常移動として起点へ向かう命令が
+        // 積まれているはず（＝実時間をかけて戻ってくる）。
+        assert_eq!(unit.path_final, origin, "起点への経路が設定されていない");
     }
 }

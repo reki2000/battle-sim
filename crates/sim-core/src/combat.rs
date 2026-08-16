@@ -12,7 +12,9 @@ use sim_math::{
     per_sec_to_per_tick, within_arc, Brad, Fx, Purpose, Rng, Vec2Fx,
 };
 
-use crate::soldiers::{Attrs, SoldierId, Soldiers, State, MAX_FATIGUE, MAX_HP, MAX_MORALE, NO_ID};
+use crate::soldiers::{
+    flags, Attrs, SoldierId, Soldiers, State, MAX_FATIGUE, MAX_HP, MAX_MORALE, NO_ID,
+};
 use crate::spatial::{SpatialHash, MAX_NEIGHBORS};
 
 /// 白兵戦で参照するダメージ種別。
@@ -120,6 +122,20 @@ impl Weapon {
             power: 42,
             damage_type: DamageType::Pierce,
             requires_front_row: false,
+            ranged: false,
+        }
+    }
+
+    /// ランス。騎乗突撃用。リーチは長いが、徒歩では扱いにくいので
+    /// 落馬後は他の武器に持ち替える運用を想定する（仕様 06 章 3.1 節）。
+    pub const fn lance() -> Self {
+        Self {
+            reach: fx_from_mm(3500),
+            base_swing_ms: 2000,
+            accuracy: -2,
+            power: 30,
+            damage_type: DamageType::Pierce,
+            requires_front_row: true,
             ranged: false,
         }
     }
@@ -275,6 +291,8 @@ pub enum DeathCause {
     Crush,
     Bleed,
     Pursuit,
+    /// 騎兵の突撃（衝撃）による死。仕様 12 章 M5、06 章 4.1 節。
+    Charge,
 }
 
 /// 戦闘の集計値。
@@ -292,6 +310,12 @@ pub struct CombatStats {
     pub bleed_kills: u32,
     pub shots_fired: u32,
     pub friendly_fire_hits: u32,
+    /// 騎兵突撃の衝撃で倒れた数（仕様 12 章 M5）。
+    pub charge_kills: u32,
+    /// 馬が倒れて落馬した回数。
+    pub dismounts: u32,
+    /// 馬の忌避（refusal）で突撃が失敗した回数。
+    pub horse_refusals: u32,
 }
 
 /// UI・戦闘報告向けのイベント種別。
@@ -303,6 +327,10 @@ pub enum CombatEventKind {
     Killed,
     Broken,
     Rallied,
+    /// 馬が倒れて騎手が落馬した（仕様 12 章 M5「落馬と徒歩化」）。
+    Dismounted,
+    /// 馬が忌避して突撃が失敗した（仕様 06 章 4.2 節）。
+    HorseRefused,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,6 +381,17 @@ struct PendingShot {
 /// 標準的な矢筒・ボルトケースの初期弾薬数。
 const DEFAULT_AMMO: u16 = 24;
 
+/// 馬の最大体力（仕様 06 章 4.3 節）。騎手とは独立に減っていく。
+pub const MAX_HORSE_HP: u16 = 180;
+
+/// 騎乗している兵士が被弾したとき、その被害のうち馬に向く割合。
+/// 馬体は大きく当たりやすいので、騎手本体より高い割合を割く
+/// （仕様「対騎兵では馬を狙う」）。残りは通常どおり騎手の HP を減らす。
+const HORSE_DAMAGE_SHARE_PERMILLE: u32 = 650;
+
+/// 落馬時に騎手が受ける追加ダメージ。
+const DISMOUNT_FALL_DAMAGE: u16 = 18;
+
 /// 戦闘システム。配列の index は `SoldierId` と一致する。
 #[derive(Debug, Default)]
 pub struct CombatSystem {
@@ -367,6 +406,8 @@ pub struct CombatSystem {
     morale_pressure: Vec<u8>,
     pub ammo: Vec<u16>,
     pending_shots: Vec<PendingShot>,
+    /// 馬の体力。騎乗していない兵士では常に 0（仕様 12 章 M5）。
+    pub horse_hp: Vec<u16>,
     pub events: std::collections::VecDeque<CombatEvent>,
     pub phase: BattlePhase,
     pub stats: CombatStats,
@@ -382,12 +423,74 @@ impl CombatSystem {
         self.broken_ticks.push(0);
         self.rally_ticks.push(0);
         self.ammo.push(DEFAULT_AMMO);
+        self.horse_hp.push(0);
     }
 
     fn ensure_len(&mut self, len: usize) {
         while self.weapons.len() < len {
             self.register();
         }
+    }
+
+    /// 騎乗状態を設定する。乗せるときは馬を満タンの体力で用意し、
+    /// 下ろす（落馬させる）ときは体力を 0 にする。`Soldiers` 側の
+    /// `flags::MOUNTED` は呼び出し側が別途更新する。
+    pub fn set_mounted(&mut self, id: SoldierId, mounted: bool) {
+        let i = id as usize;
+        if i >= self.horse_hp.len() {
+            return;
+        }
+        self.horse_hp[i] = if mounted { MAX_HORSE_HP } else { 0 };
+    }
+
+    /// 馬の体力。騎乗していなければ 0。
+    #[inline]
+    pub fn horse_hp(&self, id: SoldierId) -> u16 {
+        self.horse_hp.get(id as usize).copied().unwrap_or(0)
+    }
+
+    /// 馬の忌避が発生したことをイベントログに記録する（`cavalry` モジュールから呼ぶ）。
+    pub fn record_horse_refusal(&mut self, rider: SoldierId, target: SoldierId, tick: u32) {
+        self.push_event(CombatEvent {
+            tick,
+            attacker: rider,
+            defender: target,
+            kind: CombatEventKind::HorseRefused,
+            cause: DeathCause::Melee,
+        });
+    }
+
+    /// 騎兵突撃の衝撃ダメージを外部（`cavalry` モジュール）から適用する。
+    /// 通常の白兵ダメージと同じ経路（馬への被害分割・負傷段階・士気・
+    /// 死因統計）を通す。
+    pub fn apply_impact_damage(
+        &mut self,
+        attacker: SoldierId,
+        defender: SoldierId,
+        amount: u16,
+        soldiers: &mut Soldiers,
+        tick: u32,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        self.stats.damage = self.stats.damage.saturating_add(amount as u32);
+        self.push_event(CombatEvent {
+            tick,
+            attacker,
+            defender,
+            kind: CombatEventKind::Hit,
+            cause: DeathCause::Charge,
+        });
+        self.apply_raw_damage(
+            defender,
+            amount,
+            soldiers,
+            Some(attacker),
+            false,
+            DeathCause::Charge,
+            tick,
+        );
     }
 
     fn push_event(&mut self, event: CombatEvent) {
@@ -908,6 +1011,9 @@ impl CombatSystem {
                         DeathCause::Pursuit => {
                             self.stats.pursuit_kills = self.stats.pursuit_kills.saturating_add(1)
                         }
+                        DeathCause::Charge => {
+                            self.stats.charge_kills = self.stats.charge_kills.saturating_add(1)
+                        }
                     }
                     self.push_event(CombatEvent {
                         tick,
@@ -936,6 +1042,18 @@ impl CombatSystem {
             }
             _ => {}
         }
+        // 馬への被害（仕様 12 章 M5「馬と落馬」）。騎乗中で、まだ死んでいない
+        // 場合のみ。馬体力が尽きたらその場で落馬させる。
+        if soldiers.hot.state[i] != State::Dead
+            && soldiers.hot.flags[i] & flags::MOUNTED != 0
+            && self.horse_hp.get(i).copied().unwrap_or(0) > 0
+        {
+            let horse_damage = ((amount as u32 * HORSE_DAMAGE_SHARE_PERMILLE) / 1000).max(1) as u16;
+            self.horse_hp[i] = self.horse_hp[i].saturating_sub(horse_damage);
+            if self.horse_hp[i] == 0 {
+                self.dismount(defender, soldiers, tick);
+            }
+        }
         if let Some(attacker) = attacker {
             let a = attacker as usize;
             if a < soldiers.len() {
@@ -943,6 +1061,34 @@ impl CombatSystem {
             }
             soldiers.morale[i] = soldiers.morale[i].min(MAX_MORALE);
         }
+    }
+
+    /// 馬が力尽きたときの落馬処理。`MOUNTED` フラグを外し、落下ダメージを
+    /// 騎手に与える（生き延びれば徒歩の重装兵として戦い続ける）。
+    fn dismount(&mut self, id: SoldierId, soldiers: &mut Soldiers, tick: u32) {
+        let i = id as usize;
+        if i >= soldiers.len() || soldiers.hot.flags[i] & flags::MOUNTED == 0 {
+            return;
+        }
+        soldiers.hot.flags[i] &= !flags::MOUNTED;
+        self.horse_hp[i] = 0;
+        self.stats.dismounts = self.stats.dismounts.saturating_add(1);
+        self.push_event(CombatEvent {
+            tick,
+            attacker: NO_ID,
+            defender: id,
+            kind: CombatEventKind::Dismounted,
+            cause: DeathCause::Melee,
+        });
+        self.apply_raw_damage(
+            id,
+            DISMOUNT_FALL_DAMAGE,
+            soldiers,
+            None,
+            false,
+            DeathCause::Melee,
+            tick,
+        );
     }
 
     fn update_morale(
@@ -1179,6 +1325,9 @@ impl CombatSystem {
         mix(self.stats.pursuit_kills as u64);
         mix(self.stats.shots_fired as u64);
         mix(self.stats.friendly_fire_hits as u64);
+        mix(self.stats.charge_kills as u64);
+        mix(self.stats.dismounts as u64);
+        mix(self.stats.horse_refusals as u64);
         mix(self.pending_shots.len() as u64);
         for i in 0..self.weapons.len() {
             let weapon = self.weapons[i];
@@ -1202,6 +1351,7 @@ impl CombatSystem {
             mix(self.broken_ticks[i] as u64);
             mix(self.rally_ticks[i] as u64);
             mix(self.ammo[i] as u64);
+            mix(self.horse_hp[i] as u64);
             if let Some(&target) = self.targets.get(i) {
                 mix(target as u64);
             }
@@ -1611,6 +1761,57 @@ mod tests {
             soldiers.hp[1] < start_hp || combat.stats.shots_fired > 1,
             "矢が着弾も再発射もしていない"
         );
+    }
+
+    #[test]
+    fn horse_death_dismounts_the_rider() {
+        let mut soldiers = Soldiers::default();
+        soldiers.push(
+            0,
+            0,
+            0,
+            0,
+            0,
+            attrs(120, 200),
+            crate::soldiers::flags::MOUNTED,
+        );
+        let mut combat = CombatSystem::default();
+        combat.ensure_len(1);
+        combat.set_mounted(0, true);
+        assert!(soldiers.hot.flags[0] & crate::soldiers::flags::MOUNTED != 0);
+        assert_eq!(combat.horse_hp(0), MAX_HORSE_HP);
+
+        // 馬の体力を使い切るまで打ち続ける。都度、被害の大半は馬に向く。
+        // 騎手自身が先に力尽きないよう、都度 HP を保つ（馬の減りだけを見る）。
+        for _ in 0..60 {
+            if combat.horse_hp(0) == 0 {
+                break;
+            }
+            soldiers.hp[0] = MAX_HP;
+            combat.apply_raw_damage(0, 10, &mut soldiers, None, false, DeathCause::Melee, 0);
+        }
+        assert_eq!(combat.horse_hp(0), 0, "馬の体力が尽きていない");
+        assert_eq!(
+            soldiers.hot.flags[0] & crate::soldiers::flags::MOUNTED,
+            0,
+            "落馬後も MOUNTED フラグが残っている"
+        );
+        assert_eq!(combat.stats.dismounts, 1);
+        assert!(combat
+            .events
+            .iter()
+            .any(|e| e.kind == CombatEventKind::Dismounted));
+    }
+
+    #[test]
+    fn apply_impact_damage_is_tagged_as_charge() {
+        let mut soldiers = soldiers_pair();
+        let mut combat = CombatSystem::default();
+        combat.ensure_len(soldiers.len());
+        let hp_before = soldiers.hp[1];
+        combat.apply_impact_damage(0, 1, 25, &mut soldiers, 0);
+        assert!(soldiers.hp[1] < hp_before);
+        assert!(combat.events.iter().any(|e| e.cause == DeathCause::Charge));
     }
 
     #[test]
