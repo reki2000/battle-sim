@@ -28,6 +28,7 @@ pub enum Purpose {
     WorkVariance = 13,
     Terrain = 14,
     Crush = 15,
+    EngineerDanger = 16,
 }
 
 /// SplitMix64 のミキサ。

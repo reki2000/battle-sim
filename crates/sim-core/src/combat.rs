@@ -8,14 +8,14 @@
 //! ID 順に解決しても、各判定そのものは呼び出し順に依存しない。
 
 use sim_math::{
-    angle_diff, brad_from_deg, dist, dist_sq, fx_floor_int, fx_from_mm, ms_to_ticks,
-    per_sec_to_per_tick, within_arc, Brad, Fx, Purpose, Rng, Vec2Fx,
+    angle_diff, brad_from_deg, dist, dist_sq, fx_from_mm, ms_to_ticks, per_sec_to_per_tick,
+    within_arc, Brad, Fx, Purpose, Rng, Vec2Fx,
 };
 
 use crate::soldiers::{
     flags, Attrs, SoldierId, Soldiers, State, MAX_FATIGUE, MAX_HP, MAX_MORALE, NO_ID,
 };
-use crate::spatial::{SpatialHash, MAX_NEIGHBORS};
+use crate::spatial::{CoarseIndex, SpatialHash, MAX_NEIGHBORS};
 
 /// 白兵戦で参照するダメージ種別。
 #[repr(u8)]
@@ -1366,136 +1366,6 @@ impl CombatSystem {
             }
         }
         h
-    }
-}
-
-/// 射撃の標的探索専用の粗い空間ハッシュ。`spatial::SpatialHash` と同じ
-/// カウントソート方式だが、セルサイズを弓の射程に合わせて大きく取る。
-/// 生存兵全員を毎 tick 索引し直すが、O(n) のカウントソートなので
-/// 既存の `SpatialHash::rebuild` と同じ計算量に収まる。
-struct CoarseIndex {
-    cell_m: i32,
-    origin_x: i32,
-    origin_y: i32,
-    cols: i32,
-    rows: i32,
-    cell_start: Vec<u32>,
-    entries: Vec<u32>,
-}
-
-impl CoarseIndex {
-    fn build(cell_m: i32, soldiers: &Soldiers) -> Self {
-        let n = soldiers.len();
-        let (mut min_x, mut min_y) = (Fx::MAX, Fx::MAX);
-        let (mut max_x, mut max_y) = (Fx::MIN, Fx::MIN);
-        let mut any = false;
-        for i in 0..n {
-            if !soldiers.is_alive(i) {
-                continue;
-            }
-            any = true;
-            min_x = min_x.min(soldiers.hot.pos_x[i]);
-            min_y = min_y.min(soldiers.hot.pos_y[i]);
-            max_x = max_x.max(soldiers.hot.pos_x[i]);
-            max_y = max_y.max(soldiers.hot.pos_y[i]);
-        }
-        if !any {
-            return CoarseIndex {
-                cell_m,
-                origin_x: 0,
-                origin_y: 0,
-                cols: 0,
-                rows: 0,
-                cell_start: Vec::new(),
-                entries: Vec::new(),
-            };
-        }
-        let origin_x = fx_floor_int(min_x).div_euclid(cell_m) - 1;
-        let origin_y = fx_floor_int(min_y).div_euclid(cell_m) - 1;
-        let cols = fx_floor_int(max_x).div_euclid(cell_m) + 1 - origin_x + 1;
-        let rows = fx_floor_int(max_y).div_euclid(cell_m) + 1 - origin_y + 1;
-        let cells = (cols as usize) * (rows as usize);
-
-        let mut counts = vec![0u32; cells];
-        let cell_of = |x: Fx, y: Fx| -> usize {
-            let cx = (fx_floor_int(x).div_euclid(cell_m) - origin_x).clamp(0, cols - 1);
-            let cy = (fx_floor_int(y).div_euclid(cell_m) - origin_y).clamp(0, rows - 1);
-            (cy as usize) * (cols as usize) + (cx as usize)
-        };
-        for i in 0..n {
-            if soldiers.is_alive(i) {
-                counts[cell_of(soldiers.hot.pos_x[i], soldiers.hot.pos_y[i])] += 1;
-            }
-        }
-        let mut cell_start = vec![0u32; cells + 1];
-        let mut acc = 0u32;
-        for c in 0..cells {
-            cell_start[c] = acc;
-            acc += counts[c];
-        }
-        cell_start[cells] = acc;
-        let mut entries = vec![0u32; acc as usize];
-        let mut cursor = cell_start.clone();
-        for i in 0..n {
-            if soldiers.is_alive(i) {
-                let c = cell_of(soldiers.hot.pos_x[i], soldiers.hot.pos_y[i]);
-                entries[cursor[c] as usize] = i as u32;
-                cursor[c] += 1;
-            }
-        }
-        CoarseIndex {
-            cell_m,
-            origin_x,
-            origin_y,
-            cols,
-            rows,
-            cell_start,
-            entries,
-        }
-    }
-
-    /// 周囲 3×3 セルから、`faction` とは異なる陣営の兵士だけを最大
-    /// [`MAX_NEIGHBORS`] 件集める。同陣営の候補は上限にカウントせず読み飛ばす
-    /// （`SpatialHash::query_enemies` と同じ理由。issue #5）。
-    fn query_excluding_faction(
-        &self,
-        soldiers: &Soldiers,
-        x: Fx,
-        y: Fx,
-        faction: u8,
-        out: &mut [u32; MAX_NEIGHBORS],
-    ) -> usize {
-        if self.cols == 0 {
-            return 0;
-        }
-        let cx = (fx_floor_int(x).div_euclid(self.cell_m) - self.origin_x).clamp(0, self.cols - 1);
-        let cy = (fx_floor_int(y).div_euclid(self.cell_m) - self.origin_y).clamp(0, self.rows - 1);
-        let mut count = 0;
-        for dy in -1..=1i32 {
-            let ny = cy + dy;
-            if ny < 0 || ny >= self.rows {
-                continue;
-            }
-            for dx in -1..=1i32 {
-                let nx = cx + dx;
-                if nx < 0 || nx >= self.cols {
-                    continue;
-                }
-                let c = (ny as usize) * (self.cols as usize) + (nx as usize);
-                let (start, end) = (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
-                for &id in &self.entries[start..end] {
-                    if soldiers.faction[id as usize] == faction {
-                        continue;
-                    }
-                    if count >= MAX_NEIGHBORS {
-                        return count;
-                    }
-                    out[count] = id;
-                    count += 1;
-                }
-            }
-        }
-        count
     }
 }
 

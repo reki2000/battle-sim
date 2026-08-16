@@ -129,6 +129,21 @@ pub static SURFACE_EFFECTS: [SurfaceEffect; Surface::COUNT] = [
     eff(1000, 1000, 0, 900, 1000, 1000),  // Bridge
 ];
 
+/// 地表タイプだけから通行コストの基準値を出す（傾斜のペナルティは含まない）。
+///
+/// `derive_passability` が生成時に使う式と同じ係数を使う。地形生成後に
+/// 1 セル単位で地表を書き換える工兵の地形改修（架橋・伐採、仕様 07 章 3 節）が、
+/// 全セルの再走査なしに周辺と整合した通行コストを付けられるようにするための
+/// 公開版。傾斜は工兵の改修で変わらない前提で無視する。
+#[inline]
+pub fn base_passability(surface: Surface) -> u8 {
+    let e = &SURFACE_EFFECTS[surface as usize];
+    if !surface.passable() {
+        return 0;
+    }
+    ((e.move_mult as u32 * 255 / 1150).clamp(1, 255)) as u8
+}
+
 /// 海の付け方。指定した辺に沿って標高を下げ、海岸線を作る。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SeaEdge {
@@ -302,6 +317,17 @@ impl Terrain {
     #[inline]
     pub fn size_m(&self) -> u32 {
         self.dim * self.cell_m
+    }
+
+    /// 1 セルの地表タイプを書き換え、通行コストを整合させる。
+    ///
+    /// 工兵の地形改修（架橋・渡渉点整備・伐採、仕様 07 章 3 節）が使う。
+    /// 変更前の地表タイプを返すので、破壊工作（橋を落とす等）で元に戻せる。
+    pub fn set_surface(&mut self, idx: usize, surface: Surface) -> Surface {
+        let prev = Surface::from_u8(self.surface[idx]);
+        self.surface[idx] = surface as u8;
+        self.passability[idx] = base_passability(surface);
+        prev
     }
 
     /// 生成物の同一性を検証するためのハッシュ。
