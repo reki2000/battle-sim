@@ -1,0 +1,103 @@
+# M3 中世プリセット。倍率は 1000 分率。
+
+[[formation]]
+id = "line"
+name_ja = "横隊"
+shape = "Line"
+file_spacing_mm = 800
+rank_spacing_mm = 800
+default_ranks = 4
+def_front = 1000
+def_flank = 700
+def_rear = 650
+move_mult = 1000
+turn_mult = 1000
+cohesion_req = 100
+anti_cavalry = 1000
+allow_shoot = false
+change_time_base_s = 30
+
+[[formation]]
+id = "shieldwall"
+name_ja = "盾壁"
+shape = "Line"
+file_spacing_mm = 500
+rank_spacing_mm = 700
+default_ranks = 5
+def_front = 1500
+def_flank = 750
+def_rear = 650
+move_mult = 550
+turn_mult = 500
+cohesion_req = 150
+anti_cavalry = 1300
+allow_shoot = false
+change_time_base_s = 45
+
+[[formation]]
+id = "column"
+name_ja = "縦隊"
+shape = "Rect"
+file_spacing_mm = 900
+rank_spacing_mm = 900
+default_ranks = 8
+def_front = 900
+def_flank = 900
+def_rear = 800
+move_mult = 1200
+turn_mult = 1300
+cohesion_req = 100
+anti_cavalry = 800
+allow_shoot = false
+change_time_base_s = 20
+
+[[formation]]
+id = "wedge"
+name_ja = "楔"
+shape = "Wedge"
+file_spacing_mm = 1200
+rank_spacing_mm = 1000
+default_ranks = 3
+def_front = 1300
+def_flank = 800
+def_rear = 700
+move_mult = 1000
+turn_mult = 700
+cohesion_req = 130
+anti_cavalry = 900
+allow_shoot = false
+change_time_base_s = 30
+
+[[formation]]
+id = "schiltron"
+name_ja = "シルトロン（円陣）"
+shape = "Circle"
+file_spacing_mm = 500
+rank_spacing_mm = 700
+default_ranks = 4
+def_front = 1200
+def_flank = 1200
+def_rear = 1200
+move_mult = 300
+turn_mult = 200
+cohesion_req = 150
+anti_cavalry = 1800
+allow_shoot = false
+change_time_base_s = 60
+
+[[formation]]
+id = "skirmish"
+name_ja = "散兵"
+shape = "Loose"
+file_spacing_mm = 2500
+rank_spacing_mm = 1500
+default_ranks = 2
+def_front = 600
+def_flank = 600
+def_rear = 600
+move_mult = 1150
+turn_mult = 1400
+cohesion_req = 60
+anti_cavalry = 500
+allow_shoot = true
+change_time_base_s = 15

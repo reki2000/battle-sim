@@ -41,9 +41,38 @@ export type ToWorker =
       seedSalt: number;
     }
   | { type: "setFactionGoal"; faction: number; xM: number; yM: number }
+  | {
+      type: "addLineUnit";
+      faction: number;
+      firstId: number;
+      count: number;
+      ranks: number;
+      formation: number;
+    }
+  | {
+      type: "issueMoveTo";
+      node: number;
+      xM: number;
+      yM: number;
+      facingBrad: number;
+      formation: number;
+    }
   | { type: "setRunning"; running: boolean }
   | { type: "setSpeed"; speed: number }
   | { type: "recycleBuffer"; buffer: ArrayBuffer };
+
+/**
+ * M3/M4 の集計データ。毎ティックではなく間引いて送る（仕様 01 章 4 節：
+ * 境界を跨ぐ呼び出しはフレームあたり定数回に抑える）。
+ * レイアウトは `sim-wasm` の `combatStats`/`commandNodes`/`commandEvents`/
+ * `messengers` と同じフラット配列。
+ */
+export interface StatsPayload {
+  combat: number[];
+  nodes: number[];
+  commandEvents: number[];
+  messengers: number[];
+}
 
 export type FromWorker =
   | {
@@ -53,4 +82,10 @@ export type FromWorker =
       soldierStride: number;
       terrain: TerrainPayload;
     }
-  | { type: "snapshot"; tick: number; count: number; buffer: ArrayBuffer };
+  | {
+      type: "snapshot";
+      tick: number;
+      count: number;
+      buffer: ArrayBuffer;
+      stats?: StatsPayload;
+    };

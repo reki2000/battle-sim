@@ -3,23 +3,27 @@
 //! このクレートは wasm に依存しない。ネイティブでテストとベンチができる
 //! （`sim-headless`）ことが、バランス調整と性能計測の前提になっている。
 //!
-//! **M0 の実装範囲**: SoA レイアウト、空間ハッシュ、移動積分、衝突解決、
-//! 地形の高度追従、状態ハッシュ。
-//! 指揮ツリー・AI・戦闘・士気は M3〜M4 で実装する（`docs/spec/12-roadmap.md`）。
+//! M0〜M2 の移動基盤に加え、M3 の指揮ツリー・命令・陣形を実装する。
+//! M4 の白兵戦・負傷・士気の基礎も実装する（`docs/spec/12-roadmap.md`）。
 
 #![forbid(unsafe_code)]
 
+pub mod combat;
+pub mod organization;
+pub mod pathing;
 pub mod snapshot;
 pub mod soldiers;
 pub mod spatial;
 
+use combat::CombatSystem;
+use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
 use sim_terrain::{Terrain, TerrainParams, SURFACE_EFFECTS};
 use soldiers::{flags, Attrs, SoldierId, Soldiers, State};
 use spatial::{SpatialHash, MAX_NEIGHBORS};
 
 /// シミュレーションのロジックバージョン。リプレイの互換性判定に使う。
-pub const SIM_VERSION: u32 = 1;
+pub const SIM_VERSION: u32 = 3;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -53,11 +57,17 @@ pub struct World {
     pub terrain: Terrain,
     pub soldiers: Soldiers,
     pub hash: SpatialHash,
+    /// 編成・命令・伝令・陣形を管理する M3 の指揮ツリー。
+    pub command: CommandTree,
+    /// M4 の白兵戦・負傷・士気・追撃フェーズ。
+    pub combat: CombatSystem,
     /// 各兵士の目標位置。M2 で陣形スロットに置き換わる
     goal: Vec<Vec2Fx>,
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
     push_x: Vec<Fx>,
     push_y: Vec<Fx>,
+    /// 衝突解決の全反復で蓄積した重なり量。圧迫（crush）判定に使う。
+    crush_accum: Vec<Fx>,
 }
 
 impl core::fmt::Debug for World {
@@ -80,9 +90,12 @@ impl World {
             terrain,
             soldiers: Soldiers::default(),
             hash: SpatialHash::default(),
+            command: CommandTree::new(),
+            combat: CombatSystem::default(),
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
+            crush_accum: Vec::new(),
         }
     }
 
@@ -99,9 +112,11 @@ impl World {
         let id = self
             .soldiers
             .push(pos.x, pos.y, facing, unit_id, faction, attrs, soldier_flags);
+        self.combat.register();
         self.goal.push(pos);
         self.push_x.push(0);
         self.push_y.push(0);
+        self.crush_accum.push(0);
         let i = id as usize;
         self.soldiers.z_cm[i] =
             sim_math::fx_to_mm(self.terrain.height_at(pos.x, pos.y)) as i16 / 10;
@@ -122,11 +137,71 @@ impl World {
         }
     }
 
+    /// 指揮ノードを追加する。葉ノードには `organization::Unit` を渡す。
+    pub fn add_command_node(
+        &mut self,
+        parent: Option<organization::NodeId>,
+        echelon: u8,
+        faction: u8,
+        commander: SoldierId,
+        deputies: Vec<SoldierId>,
+        unit: Option<organization::Unit>,
+    ) -> organization::NodeId {
+        self.command
+            .add_node(parent, echelon, faction, commander, deputies, unit)
+    }
+
+    /// 命令を指揮系統へ投入する。届くまでの遅延は伝令の距離から決まる。
+    pub fn issue_order(
+        &mut self,
+        issuer: organization::NodeId,
+        target: organization::NodeId,
+        intent: organization::Intent,
+        priority: organization::Priority,
+    ) -> Option<organization::OrderId> {
+        self.command
+            .issue_order(issuer, target, intent, priority, self.tick, &self.soldiers)
+    }
+
+    pub fn issue_order_via(
+        &mut self,
+        issuer: organization::NodeId,
+        target: organization::NodeId,
+        intent: organization::Intent,
+        priority: organization::Priority,
+        method: organization::DeliveryMethod,
+    ) -> Option<organization::OrderId> {
+        self.command.issue_order_via(
+            issuer,
+            target,
+            intent,
+            priority,
+            method,
+            self.tick,
+            &self.soldiers,
+        )
+    }
+
+    /// 葉部隊の陣形を変更する。完了までは `formation_change` に残る。
+    pub fn change_formation(
+        &mut self,
+        node: organization::NodeId,
+        formation: organization::FormationId,
+    ) -> bool {
+        self.command
+            .change_formation(node, formation, &self.soldiers, self.tick)
+    }
+
     /// 1 ティック進める。
     ///
     /// フェーズの順序は仕様 02 章 5 節に従う。M0 では未実装のフェーズを飛ばす。
     pub fn tick(&mut self) {
+        self.command.tick(&self.soldiers, &self.terrain, self.tick);
+        self.command
+            .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
+        self.combat
+            .tick(self.seed, self.tick, &mut self.soldiers, &self.hash);
         self.steer();
         self.integrate_motion();
         self.resolve_collisions();
@@ -149,6 +224,7 @@ impl World {
             if self.soldiers.hot.state[i] == State::Idle {
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
+                self.face_nearest_enemy_if_close(i);
                 continue;
             }
             let pos = self.soldiers.pos(i);
@@ -160,6 +236,7 @@ impl World {
                 if self.soldiers.hot.state[i] == State::Marching {
                     self.soldiers.hot.state[i] = State::Idle;
                 }
+                self.face_nearest_enemy_if_close(i);
                 continue;
             }
 
@@ -179,6 +256,39 @@ impl World {
             self.soldiers.hot.vel_x[i] = next.x.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
             self.soldiers.hot.vel_y[i] = next.y.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
             self.soldiers.hot.facing[i] = dir.angle();
+            // 進行方向を向くのが基本だが、間合いの範囲内に敵がいれば
+            // そちらを優先して向く。行軍の目標方向と実際に隣接した敵の
+            // 方向がずれる（衝突で横に押された等）と、白兵戦の弧判定を
+            // 満たせないまま双方が固まってしまうため。
+            self.face_nearest_enemy_if_close(i);
+        }
+    }
+
+    /// 間合いの範囲内にいる最も近い敵がいれば、そちらへ向き直らせる
+    /// （仕様 12 章 M4：白兵戦の弧判定が現実の隣接関係と食い違わないようにする）。
+    fn face_nearest_enemy_if_close(&mut self, i: usize) {
+        let pos = self.soldiers.pos(i);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        let count = self.hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+        // 白兵武器の間合い（最長でもパイクの 5 m）より少し広めに取る。
+        let detect_r = fx_from_mm(2_500);
+        let mut nearest: Option<(i64, Vec2Fx)> = None;
+        for &jid in &neighbors[..count] {
+            let j = jid as usize;
+            if !self.soldiers.is_alive(j) || self.soldiers.faction[j] == self.soldiers.faction[i] {
+                continue;
+            }
+            let jp = self.soldiers.pos(j);
+            let d2 = sim_math::dist_sq(pos, jp);
+            if d2 > (detect_r as i64) * (detect_r as i64) {
+                continue;
+            }
+            if nearest.map_or(true, |(best, _)| d2 < best) {
+                nearest = Some((d2, jp));
+            }
+        }
+        if let Some((_, enemy_pos)) = nearest {
+            self.soldiers.hot.facing[i] = enemy_pos.sub(pos).angle();
         }
     }
 
@@ -198,7 +308,16 @@ impl World {
         // 疲労 10000 で 40% 減
         let fatigue = self.soldiers.fatigue[i] as i32;
         let fatigue_permille = 1000 - (fatigue * 400 / soldiers::MAX_FATIGUE as i32);
-        sim_math::fx_scale_permille(after_terrain, fatigue_permille)
+        let injury_permille = match combat::InjuryStage::from_hp(self.soldiers.hp[i]) {
+            combat::InjuryStage::Light => 950,
+            combat::InjuryStage::Medium => 800,
+            combat::InjuryStage::Heavy => 500,
+            combat::InjuryStage::Downed | combat::InjuryStage::Dead => 0,
+        };
+        sim_math::fx_scale_permille(
+            sim_math::fx_scale_permille(after_terrain, fatigue_permille),
+            injury_permille,
+        )
     }
 
     /// フェーズ 9: 移動積分。
@@ -304,6 +423,67 @@ impl World {
                     (self.soldiers.hot.pos_y[i] + self.push_y[i]).clamp(0, limit);
             }
         }
+
+        self.apply_crush_pressure();
+    }
+
+    /// 圧迫（crush）の実害を戦闘システムへ渡す（仕様 12 章 M4）。
+    ///
+    /// 通常の陣形（肩が触れ合う密集隊形も含む）は `SEPARATION_ITERATIONS` の
+    /// 押し合いでほぼ解消される（`overlapping_soldiers_push_apart` テストが
+    /// 残差 10 mm 以下であることを保証している）。そのため「解決を試みた後も
+    /// なお残っている重なり」だけを圧力として扱えば、普通の行軍や密集陣形を
+    /// 圧迫死させることなく、空間ハッシュの近傍上限（12 人）を超えるような
+    /// 極端な過密（`extreme_density_disperses_but_is_not_fully_resolved`
+    /// テストが示す状況）だけを圧迫として検出できる。
+    fn apply_crush_pressure(&mut self) {
+        let n = self.soldiers.len();
+        if n == 0 {
+            return;
+        }
+        self.hash.rebuild(&self.soldiers);
+        self.crush_accum.iter_mut().for_each(|v| *v = 0);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        for i in 0..n {
+            if !self.soldiers.is_alive(i) {
+                continue;
+            }
+            let pi = self.soldiers.pos(i);
+            let ri = self.soldiers.radius(i);
+            let cnt = self.hash.query_neighbors(pi.x, pi.y, &mut neighbors);
+            let mut residual = 0 as Fx;
+            for &jid in &neighbors[..cnt] {
+                let j = jid as usize;
+                if j == i || !self.soldiers.is_alive(j) {
+                    continue;
+                }
+                let pj = self.soldiers.pos(j);
+                let rsum = ri + self.soldiers.radius(j);
+                let d2 = sim_math::dist_sq(pi, pj);
+                if d2 >= (rsum as i64) * (rsum as i64) {
+                    continue;
+                }
+                let d = sim_math::isqrt64(d2 as u64) as Fx;
+                residual += rsum - d;
+            }
+            self.crush_accum[i] = residual;
+        }
+
+        for i in 0..n {
+            if !self.soldiers.is_alive(i) || self.crush_accum[i] == 0 {
+                continue;
+            }
+            let radius = self.soldiers.radius(i).max(1);
+            let pressure_permille = ((self.crush_accum[i] as i64 * 1000) / radius as i64)
+                .clamp(0, u32::MAX as i64) as u32;
+            self.combat.apply_crush(
+                i as SoldierId,
+                &mut self.soldiers,
+                pressure_permille,
+                self.seed,
+                self.tick,
+            );
+        }
     }
 
     /// フェーズ 11: 地形の高度に追従する。
@@ -328,6 +508,8 @@ impl World {
             h = h.wrapping_mul(0x0100_0000_01b3);
         };
         mix(self.tick as u64);
+        mix(self.command.state_hash());
+        mix(self.combat.state_hash());
         for i in 0..self.soldiers.len() {
             mix(self.soldiers.hot.pos_x[i] as u32 as u64);
             mix(self.soldiers.hot.pos_y[i] as u32 as u64);

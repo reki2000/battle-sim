@@ -10,7 +10,7 @@
  */
 
 import init, { World } from "../wasm/sim.js";
-import type { ToWorker, FromWorker } from "./protocol";
+import type { ToWorker, FromWorker, StatsPayload } from "./protocol";
 import { SOLDIER_STRIDE } from "./snapshot";
 
 let world: World | null = null;
@@ -41,6 +41,10 @@ function takeBuffer(byteLen: number): ArrayBuffer {
   return new ArrayBuffer(byteLen);
 }
 
+/** 統計は毎スナップショットではなく、この tick 数おきにだけ送る。 */
+const STATS_INTERVAL_TICKS = 10;
+let lastStatsTick = -STATS_INTERVAL_TICKS;
+
 function publishSnapshot(): void {
   if (!world || !memory) return;
   world.writeSnapshot();
@@ -51,13 +55,22 @@ function publishSnapshot(): void {
   const buf = takeBuffer(len);
   new Uint8Array(buf).set(src);
 
+  const tick = world.tickCount();
+  let stats: StatsPayload | undefined;
+  if (tick - lastStatsTick >= STATS_INTERVAL_TICKS) {
+    lastStatsTick = tick;
+    stats = {
+      combat: Array.from(world.combatStats()),
+      nodes: Array.from(world.commandNodes()),
+      commandEvents: Array.from(world.commandEvents(64)),
+      messengers: Array.from(world.messengers()),
+    };
+  }
+
   post(
-    {
-      type: "snapshot",
-      tick: world.tickCount(),
-      count: (len / SOLDIER_STRIDE) | 0,
-      buffer: buf,
-    },
+    stats
+      ? { type: "snapshot", tick, count: (len / SOLDIER_STRIDE) | 0, buffer: buf, stats }
+      : { type: "snapshot", tick, count: (len / SOLDIER_STRIDE) | 0, buffer: buf },
     [buf],
   );
 }
@@ -164,6 +177,16 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
 
     case "setFactionGoal": {
       world?.setFactionGoal(msg.faction, msg.xM, msg.yM);
+      break;
+    }
+
+    case "addLineUnit": {
+      world?.addLineUnit(msg.faction, msg.firstId, msg.count, msg.ranks, msg.formation);
+      break;
+    }
+
+    case "issueMoveTo": {
+      world?.issueMoveTo(msg.node, msg.xM, msg.yM, msg.facingBrad, msg.formation);
       break;
     }
 

@@ -4,15 +4,18 @@
 //! CI はこれを使って性能とハッシュの回帰を検出する（仕様 11 章 6 節）。
 //!
 //! ```text
-//! sim-headless bench   --soldiers 20000 --ticks 2000
-//! sim-headless verify  --ticks 5000
-//! sim-headless terrain --size 2000 --relief 600
+//! sim-headless bench    --soldiers 20000 --ticks 2000
+//! sim-headless verify   --ticks 5000
+//! sim-headless terrain  --size 2000 --relief 600
+//! sim-headless battle   --soldiers 4000                 会戦を最後まで回して死因・所要時間を見る
+//! sim-headless winrate  --soldiers 2000 --runs 200       対称な兵力を繰り返し戦わせて勝率を見る
 //! ```
 
 use std::time::Instant;
 
+use sim_core::combat::BattlePhase;
 use sim_core::{deploy_block, World, WorldConfig};
-use sim_math::{fx, Vec2Fx};
+use sim_math::{fx, fx_from_mm, Vec2Fx};
 use sim_terrain::{SeaEdge, TerrainParams};
 
 fn main() {
@@ -24,13 +27,17 @@ fn main() {
         "bench" => bench(&opts),
         "verify" => verify(&opts),
         "terrain" => terrain_report(&opts),
+        "battle" => battle(&opts),
+        "winrate" => winrate(&opts),
         _ => {
             eprintln!(
                 "使い方:\n  \
                  bench   [--soldiers N] [--ticks N] [--size M] [--seed N]   性能を計測する\n  \
                  verify  [--soldiers N] [--ticks N] [--seed N]              決定論を検証する\n  \
                  terrain [--size M] [--relief 0-1000] [--seed N]            地形の統計を出す\n          \
-                 [--river-density 0-1000] [--roads N] [--sea north|east|south|west]"
+                 [--river-density 0-1000] [--roads N] [--sea north|east|south|west]\n  \
+                 battle  [--soldiers N] [--seed N] [--max-ticks N]          会戦を最後まで回し、死因内訳・所要時間を出す（M4 受け入れ条件）\n  \
+                 winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る"
             );
             std::process::exit(2);
         }
@@ -46,6 +53,8 @@ struct Opts {
     river_density: u16,
     road_count: u16,
     sea_edge: SeaEdge,
+    runs: u32,
+    max_ticks: u32,
 }
 
 impl Opts {
@@ -59,6 +68,10 @@ impl Opts {
             river_density: 500,
             road_count: 2,
             sea_edge: SeaEdge::None,
+            runs: 200,
+            // 仕様の受け入れ条件（会戦は 20 分〜3 時間）の上限に、判定の余白を
+            // 少し足した値。ここに達したら「3 時間以内に終わらなかった」とみなす。
+            max_ticks: 4 * 3600 * 20,
         };
         let mut i = 1;
         while i + 1 < args.len() {
@@ -71,6 +84,8 @@ impl Opts {
                 "--seed" => o.seed = parse_seed(v).unwrap_or(o.seed),
                 "--river-density" => o.river_density = v.parse().unwrap_or(o.river_density),
                 "--roads" => o.road_count = v.parse().unwrap_or(o.road_count),
+                "--runs" => o.runs = v.parse().unwrap_or(o.runs),
+                "--max-ticks" => o.max_ticks = v.parse().unwrap_or(o.max_ticks),
                 "--sea" => {
                     o.sea_edge = match v.as_str() {
                         "north" => SeaEdge::North,
@@ -97,12 +112,19 @@ fn parse_seed(s: &str) -> Option<u64> {
 }
 
 fn build_world(o: &Opts) -> World {
+    build_world_with_relief(o, o.relief)
+}
+
+/// `battle`/`winrate` は「両軍が実際にぶつかって決着がつく」ことが前提なので、
+/// 起伏を落として通行不能地形（崖・水域）が進路を塞がないようにする。
+/// `bench`/`verify` は決着まで回さないので `o.relief` をそのまま使う。
+fn build_world_with_relief(o: &Opts, relief: u16) -> World {
     let config = WorldConfig {
         seed: o.seed,
         terrain: TerrainParams {
             seed: o.seed,
             size_m: o.size_m,
-            relief: o.relief,
+            relief,
             ..Default::default()
         },
     };
@@ -148,6 +170,267 @@ fn build_world(o: &Opts) -> World {
         w.set_goal(i as u32, Vec2Fx::new(w.soldiers.pos(i).x, target_y));
     }
     w
+}
+
+/// `battle`/`winrate` 用に、両軍を指揮ツリーの陣形（`Unit`）として組む。
+///
+/// `deploy_block` + 個々の `set_goal` だけだと、各兵士が独立に敵陣の
+/// 座標を目指すだけなので、衝突で押し合ううちに隊列が完全に崩れて
+/// 混戦の塊になり、白兵戦の前列判定・弧判定を誰も満たせなくなって
+/// 会戦が停止してしまう。指揮ツリーの陣形スロット（`formation_goals`）を
+/// 使うと、前列が常に前列であり続け、倒れた前列は後列が詰めて補充する
+/// ——実際の中世会戦の隊列維持に近い挙動になる。
+fn build_battle_world(o: &Opts) -> World {
+    let mut w = build_world_with_relief(o, 0);
+
+    let per_side = o.soldiers / 2;
+    let files = 40u32;
+    let ranks = per_side.div_ceil(files);
+    let mid = fx((o.size_m / 2) as i32);
+    // `formation_facing` は「ランク（奥行き）方向」を回転させる角度で、
+    // 兵士個体の見た目の向き（`soldiers.hot.facing`、`Vec2Fx::angle()`）とは
+    // 90° ずれた別の規約になっている（`organization::formation_goals` の
+    // 回転式は local_y=0 のとき facing=0 で world +Y に伸びる）。
+    // ここは実測で確認済み：facing=0 → ランクは +Y（北）へ、
+    // facing=180° → ランクは -Y（南）へ伸びる。
+    let north = 0u16;
+    let south = sim_math::BRAD_HALF as u16;
+
+    // `formation_origin` はランク 0（進行方向の最後尾）の位置で、後続ランクは
+    // そこから facing 方向へ `rank_spacing` ずつ前へ出る。両陣営の最前列が
+    // ちょうど中央（mid, mid）で向き合うように、後方へ隊列の奥行き分だけ
+    // ずらしておく。ここを揃えないと両陣営の重心が完全に重なり、
+    // 12 人の近傍上限を超える過密が起きて隊列が崩壊する。
+    let rank_spacing = fx_from_mm(800);
+    let depth = rank_spacing * (ranks as i32 - 1).max(0);
+    // 前列同士の目標座標を完全に一致させると、押し合いの逃げ場がなく
+    // 兵士が密着しすぎて（前列判定の 0.8 m 圏内に自分の隣の兵士まで
+    // 入ってしまい）どちらも前列と判定されなくなる。剣の間合い（0.9 m）
+    // には収まるが密着はしない程度の隙間を残す。
+    let contact_gap = fx_from_mm(500);
+    let target0 = Vec2Fx::new(mid, mid - depth - contact_gap);
+    let target1 = Vec2Fx::new(mid, mid + depth + contact_gap);
+
+    for faction in 0u8..2 {
+        let ids: Vec<u32> = (0..w.soldiers.len())
+            .filter(|&i| w.soldiers.faction[i] == faction)
+            .map(|i| i as u32)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let commander = ids[0];
+        let deputies: Vec<u32> = ids.iter().skip(1).take(4).copied().collect();
+        let target = if faction == 0 { target0 } else { target1 };
+        let unit = sim_core::organization::Unit {
+            soldiers: ids,
+            troop_type: 0,
+            formation: sim_core::organization::FORMATION_SHIELDWALL,
+            formation_origin: target,
+            formation_facing: if faction == 0 { north } else { south },
+            ranks: ranks as u16,
+            file_spacing: fx_from_mm(800),
+            rank_spacing,
+            banner: None,
+            formation_change: None,
+            path: Vec::new(),
+            path_final: target,
+        };
+        w.add_command_node(None, 0, faction, commander, deputies, Some(unit));
+    }
+    w
+}
+
+/// 各陣営の 4 人に 1 人へ弓を持たせる。両陣営に同じ規則（index % 4）で
+/// 適用するので、装備構成は対称になる（`winrate` の前提）。
+fn equip_symmetric_army(w: &mut World) {
+    for i in 0..w.soldiers.len() {
+        if i % 4 == 0 {
+            w.combat.set_loadout(
+                i as u32,
+                sim_core::combat::Weapon::longbow(),
+                sim_core::combat::Armor::cloth(),
+            );
+            w.combat.set_ammo(i as u32, 18);
+        }
+    }
+}
+
+fn alive_by_faction(w: &World) -> (u32, u32) {
+    let mut a = 0u32;
+    let mut b = 0u32;
+    for i in 0..w.soldiers.len() {
+        if !w.soldiers.is_alive(i) {
+            continue;
+        }
+        if w.soldiers.faction[i] == 0 {
+            a += 1;
+        } else {
+            b += 1;
+        }
+    }
+    (a, b)
+}
+
+struct BattleReport {
+    /// 勝った陣営（0/1）。両陣営とも全滅、または `max_ticks` に達した場合は `None`。
+    winner: Option<u8>,
+    ticks: u32,
+    timed_out: bool,
+    stats: sim_core::combat::CombatStats,
+}
+
+fn run_battle(o: &Opts) -> BattleReport {
+    let mut w = build_battle_world(o);
+    equip_symmetric_army(&mut w);
+    let mut timed_out = true;
+    for _ in 0..o.max_ticks {
+        w.tick();
+        if w.combat.phase == BattlePhase::Complete {
+            timed_out = false;
+            break;
+        }
+    }
+    let (alive_a, alive_b) = alive_by_faction(&w);
+    let winner = match (alive_a > 0, alive_b > 0) {
+        (true, false) => Some(0),
+        (false, true) => Some(1),
+        _ => None,
+    };
+    BattleReport {
+        winner,
+        ticks: w.tick,
+        timed_out,
+        stats: w.combat.stats,
+    }
+}
+
+fn battle(o: &Opts) {
+    let t0 = Instant::now();
+    let report = run_battle(o);
+    let elapsed_s = t0.elapsed().as_secs_f64();
+    let game_minutes = report.ticks as f64 / sim_math::TICK_HZ as f64 / 60.0;
+    let s = &report.stats;
+    let total_deaths =
+        s.melee_kills + s.missile_kills + s.crush_kills + s.bleed_kills + s.pursuit_kills;
+    let pct = |v: u32| {
+        if total_deaths == 0 {
+            0.0
+        } else {
+            v as f64 * 100.0 / total_deaths as f64
+        }
+    };
+    let largest = [
+        ("追撃", s.pursuit_kills),
+        ("白兵", s.melee_kills),
+        ("射撃", s.missile_kills),
+        ("圧迫", s.crush_kills),
+        ("出血", s.bleed_kills),
+    ]
+    .into_iter()
+    .max_by_key(|&(_, v)| v);
+
+    println!("{{");
+    println!(
+        "  \"winner_faction\": {},",
+        report.winner.map_or("null".to_string(), |w| w.to_string())
+    );
+    println!("  \"timed_out\": {},", report.timed_out);
+    println!("  \"ticks\": {},", report.ticks);
+    println!("  \"game_minutes\": {game_minutes:.1},");
+    println!("  \"wall_clock_s\": {elapsed_s:.1},");
+    println!("  \"total_deaths\": {total_deaths},");
+    println!(
+        "  \"pursuit_kills\": {} ({:.1}%),",
+        s.pursuit_kills,
+        pct(s.pursuit_kills)
+    );
+    println!(
+        "  \"melee_kills\": {} ({:.1}%),",
+        s.melee_kills,
+        pct(s.melee_kills)
+    );
+    println!(
+        "  \"missile_kills\": {} ({:.1}%),",
+        s.missile_kills,
+        pct(s.missile_kills)
+    );
+    println!(
+        "  \"crush_kills\": {} ({:.1}%),",
+        s.crush_kills,
+        pct(s.crush_kills)
+    );
+    println!(
+        "  \"bleed_kills\": {} ({:.1}%),",
+        s.bleed_kills,
+        pct(s.bleed_kills)
+    );
+    println!("  \"friendly_fire_hits\": {},", s.friendly_fire_hits);
+    println!("  \"shots_fired\": {}", s.shots_fired);
+    println!("}}");
+
+    eprintln!(
+        "\n所要 {game_minutes:.1} 分（20〜180 分の範囲内: {}）",
+        (20.0..=180.0).contains(&game_minutes)
+    );
+    if let Some((name, _)) = largest {
+        eprintln!(
+            "最大の死因: {name}（追撃が最大: {}）",
+            largest.map(|(n, _)| n) == Some("追撃")
+        );
+    }
+}
+
+fn winrate(o: &Opts) {
+    let t0 = Instant::now();
+    let mut wins_a = 0u32;
+    let mut wins_b = 0u32;
+    let mut draws_or_timeouts = 0u32;
+    for run in 0..o.runs {
+        let mut run_opts = Opts {
+            seed: o.seed.wrapping_add(run as u64 * 0x9E37_79B9),
+            ..clone_opts(o)
+        };
+        run_opts.seed |= 1;
+        let report = run_battle(&run_opts);
+        match report.winner {
+            Some(0) => wins_a += 1,
+            Some(1) => wins_b += 1,
+            _ => draws_or_timeouts += 1,
+        }
+    }
+    let decisive = wins_a + wins_b;
+    let win_rate_a = if decisive == 0 {
+        0.0
+    } else {
+        wins_a as f64 * 100.0 / decisive as f64
+    };
+    let within_band = (42.0..=58.0).contains(&win_rate_a);
+
+    println!("{{");
+    println!("  \"runs\": {},", o.runs);
+    println!("  \"wins_faction_0\": {wins_a},");
+    println!("  \"wins_faction_1\": {wins_b},");
+    println!("  \"draws_or_timeouts\": {draws_or_timeouts},");
+    println!("  \"win_rate_faction_0_pct\": {win_rate_a:.1},");
+    println!("  \"within_50pm8pct\": {within_band},");
+    println!("  \"wall_clock_s\": {:.1}", t0.elapsed().as_secs_f64());
+    println!("}}");
+}
+
+fn clone_opts(o: &Opts) -> Opts {
+    Opts {
+        soldiers: o.soldiers,
+        ticks: o.ticks,
+        size_m: o.size_m,
+        relief: o.relief,
+        seed: o.seed,
+        river_density: o.river_density,
+        road_count: o.road_count,
+        sea_edge: o.sea_edge,
+        runs: o.runs,
+        max_ticks: o.max_ticks,
+    }
 }
 
 fn bench(o: &Opts) {

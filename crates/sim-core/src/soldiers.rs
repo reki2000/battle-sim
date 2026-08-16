@@ -166,6 +166,23 @@ impl Soldiers {
         self.len() == 0
     }
 
+    #[inline]
+    pub fn index_if_present(&self, id: SoldierId) -> Option<usize> {
+        let i = id as usize;
+        (i < self.len()).then_some(i)
+    }
+
+    #[inline]
+    pub fn is_active_id(&self, id: SoldierId) -> bool {
+        self.index_if_present(id)
+            .is_some_and(|i| self.hot.state[i].is_active())
+    }
+
+    #[inline]
+    pub fn pos_checked(&self, id: SoldierId) -> Option<sim_math::Vec2Fx> {
+        self.index_if_present(id).map(|i| self.pos(i))
+    }
+
     /// 兵士を 1 体追加し、その ID を返す。
     #[allow(clippy::too_many_arguments)]
     pub fn push(

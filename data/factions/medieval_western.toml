@@ -1,0 +1,61 @@
+# 14 世紀西欧封建軍の汎用編成プリセット（M3）。
+
+id = "medieval_western"
+name_ja = "西欧封建軍"
+
+[[echelon]]
+name = "Army"
+commander_title = "総大将"
+child_min = 3
+child_max = 5
+
+[[echelon]]
+name = "Battle"
+commander_title = "元帥"
+child_min = 3
+child_max = 8
+roles = ["Vanguard", "Main", "Rearguard"]
+
+[[echelon]]
+name = "Banner"
+commander_title = "旗騎士"
+child_min = 2
+child_max = 4
+has_banner = true
+
+[[echelon]]
+name = "Company"
+commander_title = "百人隊長"
+child_min = 2
+child_max = 8
+
+[[echelon]]
+name = "Vintaine"
+commander_title = "二十人長"
+leaf = true
+size_min = 18
+size_max = 24
+
+[[troop_type]]
+id = "men_at_arms"
+name_ja = "重装兵"
+default_formation = "line"
+alt_formations = ["shieldwall"]
+
+[[troop_type]]
+id = "spearmen"
+name_ja = "槍兵"
+default_formation = "shieldwall"
+alt_formations = ["schiltron", "line"]
+
+[[troop_type]]
+id = "longbowmen"
+name_ja = "長弓兵"
+default_formation = "skirmish"
+alt_formations = ["line"]
+
+[[troop_type]]
+id = "heavy_cavalry"
+name_ja = "重騎兵"
+default_formation = "wedge"
+alt_formations = ["line", "column"]

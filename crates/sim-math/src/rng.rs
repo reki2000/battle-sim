@@ -27,6 +27,7 @@ pub enum Purpose {
     MessengerRisk = 12,
     WorkVariance = 13,
     Terrain = 14,
+    Crush = 15,
 }
 
 /// SplitMix64 のミキサ。

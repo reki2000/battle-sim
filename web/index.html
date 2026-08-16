@@ -19,6 +19,7 @@
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
       }
       #terrain-view,
+      #soldier-view,
       #overlay-view {
         display: block;
         position: absolute;
@@ -60,14 +61,31 @@
         white-space: pre;
         pointer-events: none;
       }
+      #command-panel {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        max-width: 320px;
+        padding: 10px 14px;
+        background: rgba(10, 14, 20, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        color: #d8dee6;
+        font-size: 11px;
+        line-height: 1.6;
+        white-space: pre;
+        pointer-events: none;
+      }
     </style>
   </head>
   <body>
     <div id="view-stack">
       <canvas id="terrain-view"></canvas>
+      <canvas id="soldier-view"></canvas>
       <canvas id="overlay-view"></canvas>
     </div>
     <div id="hud">起動中…</div>
+    <div id="command-panel"></div>
     <div id="help">
 ドラッグ  パン
 ホイール  ズーム（対数）
