@@ -361,6 +361,9 @@ pub enum CommandEventKind {
     SuccessionCompleted,
     FormationChangeStarted,
     FormationChanged,
+    /// M7: 命令に反して指揮官が独断で行動した（仕様 05 章「ambition の高い
+    /// 騎士が命令を無視して突撃する」）。
+    Insubordination,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -386,9 +389,144 @@ pub struct NodeStats {
     pub engaged_ratio: u16,
 }
 
+// M7 の指揮官 AI（`docs/spec/05-ai.md` 5〜7 節）。データ型はここに置き、
+// 判断ロジック（視認・評価・目的選択・独断専行）は `crate::commander_ai` に
+// 分離する（`cavalry`/`engineering` が `soldiers`/`combat`/`structures` の
+// データを外から動かすのと同じ構成）。
+
+/// 指揮官の性格パラメータ。兵士共通の `Attrs` とは別軸で、戦略層の判断だけに効く。
+/// 仕様 05 章 5.4 節。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommanderAttrs {
+    pub boldness: u8,
+    pub caution: u8,
+    pub initiative: u8,
+    pub obedience: u8,
+    pub tactical_skill: u8,
+    pub ambition: u8,
+    pub charisma: u8,
+    pub flexibility: u8,
+    pub patience: u8,
+    pub ruthlessness: u8,
+}
+
+/// 敵（または味方）部隊についての推定情報。仕様 05 章 5.1 節。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownForce {
+    pub node: NodeId,
+    pub est_pos: Vec2Fx,
+    pub est_strength: u32,
+    pub est_troop_type: u16,
+    pub est_morale: u16,
+    /// 0..1000。古い情報ほど低い。
+    pub confidence: u16,
+    pub observed_tick: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerrainNoteKind {
+    HighGround,
+    Ford,
+    Forest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerrainNote {
+    pub pos: Vec2Fx,
+    pub kind: TerrainNoteKind,
+}
+
+/// 指揮官が「自分が知っていることだけ」で判断するための情報源。仕様 05 章 5.1 節。
+///
+/// `own_forces` と `terrain_notes` はこの PR では埋めない（本文冒頭のスコープ
+/// 注記を参照）。自軍の戦力は `NodeStats` から直接読める前提で扱う。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Blackboard {
-    pub confusion: u16,
+    pub own_forces: Vec<KnownForce>,
+    pub enemy_forces: Vec<KnownForce>,
+    pub terrain_notes: Vec<TerrainNote>,
+    pub last_updated: u32,
+}
+
+/// 戦況評価。仕様 05 章 5.2 節。`critical_points` は本 PR のスコープ外（本文参照）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SituationAssessment {
+    /// 自軍 ÷ 敵軍を 1000 分率で表す（1000 = 互角）。
+    pub force_ratio_permille: i32,
+    /// 押しているか押されているか（自軍と敵軍の士気差から近似する。本文参照）。
+    pub momentum: i32,
+    pub flank_threats: [u16; 2],
+    pub rear_threat: u16,
+    pub reserve_available: u32,
+    pub terrain_advantage: i32,
+    pub time_pressure: i32,
+}
+
+/// 戦略層が選ぶ目的。仕様 05 章 5.3 節（3 種を実装。表の残りは将来の拡張）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Objective {
+    Envelop { target: NodeId },
+    HoldHighGround,
+    CommitReserve,
+}
+
+/// `Objective` を決定論検証用ハッシュに混ぜるための下請け。
+fn objective_hash(o: Objective) -> u64 {
+    match o {
+        Objective::Envelop { target } => 0x1_0000_0000 | target as u64,
+        Objective::HoldHighGround => 1,
+        Objective::CommitReserve => 2,
+    }
+}
+
+/// 軍全体の会戦プラン。仕様 05 章 6 節。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BattlePlan {
+    CenterPush,
+    DoubleEnvelopment,
+    RefusedFlank,
+    DefendHighGround,
+    FeignedRetreat,
+    EchelonAttack,
+    CavalryReserve,
+    Delay,
+}
+
+/// 「なぜそう判断したか」の記録 1 件。仕様 05 章 7 節。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionRecord {
+    pub tick: u32,
+    pub chosen: &'static str,
+    pub chosen_score: i32,
+    /// 上位候補（選ばれたものを含む）とスコア。
+    pub candidates: Vec<(&'static str, i32)>,
+    /// 選ばれた候補のスコア内訳。
+    pub breakdown: Vec<(&'static str, i32)>,
+}
+
+const DECISION_LOG_CAPACITY: usize = 8;
+
+/// 直近 N 件の判断を保持するリングバッファ。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecisionLog {
+    records: std::collections::VecDeque<DecisionRecord>,
+}
+
+impl DecisionLog {
+    pub fn push(&mut self, record: DecisionRecord) {
+        self.records.push_back(record);
+        if self.records.len() > DECISION_LOG_CAPACITY {
+            self.records.pop_front();
+        }
+    }
+
+    pub fn latest(&self) -> Option<&DecisionRecord> {
+        self.records.back()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DecisionRecord> {
+        self.records.iter()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,6 +584,16 @@ pub struct CommandNode {
     pub stats: NodeStats,
     pub unit: Option<Unit>,
     succession_end_tick: Option<u32>,
+    /// M7: この指揮官の性格（`objective`/`Order` とは別軸、戦略層の判断だけに効く）。
+    pub commander_attrs: CommanderAttrs,
+    /// M7: この指揮官が選んだ戦略目的（非葉ノード）。子への `Order` の元になる。
+    pub strategic_objective: Option<Objective>,
+    /// M7: 軍全体の会戦プラン。ルートノード（`parent.is_none()`）だけが持つ。
+    pub battle_plan: Option<BattlePlan>,
+    /// M7: 直近の判断（上位候補・スコア内訳）。仕様 05 章 7 節「なぜそうしたか」。
+    pub decision_log: DecisionLog,
+    /// M7: 次に戦略層の思考をする tick（位相分散、`crate::commander_ai` が使う）。
+    pub(crate) next_assess_tick: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -495,6 +643,13 @@ impl CommandTree {
             stats: NodeStats::default(),
             unit,
             succession_end_tick: None,
+            commander_attrs: CommanderAttrs::default(),
+            strategic_objective: None,
+            battle_plan: None,
+            decision_log: DecisionLog::default(),
+            // 位相を NodeId でずらし、全ノードが同じ tick に集中して思考しないようにする
+            // （仕様 05 章 2 節の think_at と同じ考え方）。
+            next_assess_tick: id % crate::commander_ai::ASSESS_INTERVAL_TICKS,
         });
         if let Some(parent_id) = parent {
             if let Some(parent_node) = self.nodes.get_mut(parent_id as usize) {
@@ -692,7 +847,7 @@ impl CommandTree {
             .find(|&id| soldiers.is_active_id(id))
     }
 
-    fn subtree_soldiers(&self, id: NodeId) -> Vec<SoldierId> {
+    pub fn subtree_soldiers(&self, id: NodeId) -> Vec<SoldierId> {
         let Some(node) = self.node(id) else {
             return Vec::new();
         };
@@ -898,6 +1053,39 @@ impl CommandTree {
         }
     }
 
+    /// 指揮官の性格を設定する。生成後に呼ぶ想定（`add_node` の引数を増やさない
+    /// ためのセッター）。
+    pub fn set_commander_attrs(&mut self, node_id: NodeId, attrs: CommanderAttrs) {
+        if let Some(node) = self.node_mut(node_id) {
+            node.commander_attrs = attrs;
+        }
+    }
+
+    /// 上位からの命令を経由せず、この指揮官自身の判断で `intent` を即座に
+    /// 適用する（M7 の独断専行、仕様 05 章「ambition の高い騎士が命令を
+    /// 無視して突撃する」）。通常の `issue_order` と違い、伝令の遅延も
+    /// `interpret` による服従判定も経ない——これは他者からの命令ではなく、
+    /// 指揮官自身がその場で下した決断だから。
+    pub fn override_intent(
+        &mut self,
+        node_id: NodeId,
+        intent: Intent,
+        soldiers: &mut Soldiers,
+        terrain: &Terrain,
+        tick: u32,
+    ) {
+        if let Some(node) = self.node_mut(node_id) {
+            node.objective = Some(intent);
+        }
+        self.apply_intent(node_id, intent, soldiers, terrain, tick);
+        self.events.push(CommandEvent {
+            tick,
+            node: node_id,
+            order: None,
+            kind: CommandEventKind::Insubordination,
+        });
+    }
+
     fn apply_intent(
         &mut self,
         node_id: NodeId,
@@ -1057,12 +1245,17 @@ impl CommandTree {
             return Compliance::Ignored;
         };
         let attrs = soldiers.attrs[i];
-        let obedience = attrs.discipline as u16 + attrs.loyalty as u16;
+        // M7: 指揮官の性格（`CommanderAttrs::obedience`/`initiative`）も服従判定に効く
+        // （仕様「obedience: 命令遵守。initiative の反対に効く」）。将官には
+        // 通常の兵士より重く効かせる（`obedience`/`initiative` の値域は
+        // 兵士の `discipline`/`loyalty` と同じ 0..255 なので単純加算できる）。
+        let obedience =
+            attrs.discipline as u16 + attrs.loyalty as u16 + node.commander_attrs.obedience as u16;
         let conflict = match (node.objective, order.intent) {
             (Some(Intent::Charge { .. }), Intent::Withdraw { .. }) => attrs.aggression as u16,
             (Some(Intent::Hold { .. }), Intent::Charge { .. }) => attrs.self_preservation as u16,
             _ => 0,
-        };
+        } + node.commander_attrs.initiative as u16 / 2;
         let score = obedience.saturating_sub(conflict / 2);
         let noise = sim_math::Rng::stream(
             0x4D33,
@@ -1345,6 +1538,15 @@ impl CommandTree {
                 mix(unit.formation_origin.y as u32 as u64);
                 mix(unit.path.len() as u64);
             }
+            // M7: 指揮官 AI の状態も決定論検証の対象にする。
+            mix(node.blackboard.enemy_forces.len() as u64);
+            for f in &node.blackboard.enemy_forces {
+                mix(f.node as u64);
+                mix(f.confidence as u64);
+                mix(f.est_strength as u64);
+            }
+            mix(node.strategic_objective.map_or(u64::MAX, objective_hash));
+            mix(node.battle_plan.map_or(u64::MAX, |p| p as u64));
         }
         for messenger in &self.messengers {
             mix(messenger.order.id as u64);
