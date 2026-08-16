@@ -12,6 +12,14 @@ import { MinimapRenderer } from "./render/minimap";
 import { InterpolatedPositions, SnapshotView } from "./sim/snapshot";
 import type { TerrainData } from "./sim/terrain-data";
 import type { FromWorker, ToWorker } from "./sim/protocol";
+import {
+  parseStats,
+  drawOrderVisualization,
+  drawDeathCauseGraph,
+  deathCauseLegend,
+  commandTreeSummary,
+  type ParsedStats,
+} from "./render/command-overlay";
 
 const TICK_MS = 50;
 
@@ -20,6 +28,7 @@ const soldierCanvas = document.getElementById("soldier-view") as HTMLCanvasEleme
 const overlayCanvas = document.getElementById("overlay-view") as HTMLCanvasElement;
 const overlayCtx = overlayCanvas.getContext("2d", { alpha: true })!;
 const hud = document.getElementById("hud") as HTMLDivElement;
+const commandPanel = document.getElementById("command-panel") as HTMLDivElement;
 
 const cam = new Camera();
 const terrainGl = new TerrainGlRenderer(terrainCanvas);
@@ -41,6 +50,8 @@ let fpsFrames = 0;
 let fpsLast = performance.now();
 /** 描画中に読み続けているスナップショットバッファ。次が来たら返す。 */
 let heldBuffer: ArrayBuffer | null = null;
+/** 指揮ツリー・戦闘統計。間引いて届くので、届いた最新のものを保持する。 */
+let lastStats: ParsedStats | null = null;
 
 const worker = new Worker(new URL("./sim/worker.ts", import.meta.url), {
   type: "module",
@@ -90,14 +101,24 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     cam.centerY = t.sizeM / 2;
     cam.setViewWidthM(600);
 
-    // 両軍を向かい合わせに配置し、互いに向かって進ませる
+    // 両軍を向かい合わせに配置し、指揮ツリーの陣形として互いに向かって進ませる。
+    // 前列同士の目標座標を完全に一致させると、押し合いの逃げ場がなく密着しすぎて
+    // 前列判定が誰も成立しなくなるため、隊列の奥行き＋わずかな隙間ぶんだけ
+    // 後方へずらす（sim-headless の battle サブコマンドと同じ考え方）。
     const mid = Math.floor(t.sizeM / 2);
+    const FILES = 40;
+    const RANKS = 25;
+    const RANK_SPACING_M = 0.8;
+    const CONTACT_GAP_M = 0.5;
+    const depth = RANK_SPACING_M * (RANKS - 1);
+    const SHIELDWALL = 1; // organization::FORMATION_SHIELDWALL
+
     send({
       type: "deploy",
       xM: mid - 16,
-      yM: mid - 60,
-      files: 40,
-      ranks: 25,
+      yM: mid - depth - CONTACT_GAP_M,
+      files: FILES,
+      ranks: RANKS,
       spacingMm: 800,
       faction: 0,
       unitId: 0,
@@ -106,16 +127,36 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     send({
       type: "deploy",
       xM: mid - 16,
-      yM: mid + 60,
-      files: 40,
-      ranks: 25,
+      yM: mid + depth + CONTACT_GAP_M,
+      files: FILES,
+      ranks: RANKS,
       spacingMm: 800,
       faction: 1,
       unitId: 1,
       seedSalt: 2,
     });
-    send({ type: "setFactionGoal", faction: 0, xM: mid, yM: mid + 40 });
-    send({ type: "setFactionGoal", faction: 1, xM: mid, yM: mid - 40 });
+
+    const perSide = FILES * RANKS;
+    // organization::formation_goals の回転規約では facing=0 でランクが +Y
+    // （北）へ、facing=180°（32768 brad）で -Y（南）へ伸びる。
+    send({ type: "addLineUnit", faction: 0, firstId: 0, count: perSide, ranks: RANKS, formation: SHIELDWALL });
+    send({ type: "addLineUnit", faction: 1, firstId: perSide, count: perSide, ranks: RANKS, formation: SHIELDWALL });
+    send({
+      type: "issueMoveTo",
+      node: 0,
+      xM: mid,
+      yM: mid - depth - CONTACT_GAP_M,
+      facingBrad: 0,
+      formation: SHIELDWALL,
+    });
+    send({
+      type: "issueMoveTo",
+      node: 1,
+      xM: mid,
+      yM: mid + depth + CONTACT_GAP_M,
+      facingBrad: 32768,
+      formation: SHIELDWALL,
+    });
 
     setRunning(true);
     return;
@@ -135,6 +176,9 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     simTick = msg.tick;
     soldierCount = msg.count;
     lastSnapshotAt = performance.now();
+    if (msg.stats) {
+      lastStats = parseStats(msg.stats);
+    }
   }
 };
 
@@ -281,12 +325,30 @@ function frame(now: number): void {
     );
   }
 
+  // 命令の可視化（矢印・伝令の移動、仕様 12 章 M3）と死因内訳のグラフ（M4）。
+  if (lastStats) {
+    drawOrderVisualization(overlayCtx, cam, lastStats.nodes, lastStats.messengers);
+    const graphW = 260 * dpr;
+    const graphH = 14 * dpr;
+    const graphX = overlayCanvas.width - graphW - 12 * dpr;
+    const graphY = 12 * dpr;
+    drawDeathCauseGraph(overlayCtx, graphX, graphY, graphW, graphH, lastStats.combat);
+  }
+
   const lodNames = ["至近", "戦術", "部隊", "会戦", "戦域"];
   hud.textContent =
     `tick ${simTick}  ${running ? `▶ ${speed}x` : "⏸"}\n` +
     `兵士 ${soldierCount}（描画 ${soldierRenderer.drawn}）\n` +
     `視野 ${cam.viewWidthM.toFixed(0)} m  ${cam.pxPerM.toFixed(2)} px/m  LOD ${lodNames[cam.lod]}\n` +
     `${fps.toFixed(0)} fps`;
+
+  if (lastStats) {
+    commandPanel.textContent =
+      `── 指揮系統 ──\n${commandTreeSummary(lastStats.nodes) || "(部隊なし)"}\n\n` +
+      `── 死因内訳 ──\n${deathCauseLegend(lastStats.combat)}\n` +
+      `撃破 ${lastStats.combat.kills}  戦闘不能 ${lastStats.combat.downed}  ` +
+      `誤射 ${lastStats.combat.friendlyFireHits}`;
+  }
 
   requestAnimationFrame(frame);
 }

@@ -1,7 +1,12 @@
 /**
- * ImageGen で事前生成したビジュアルアセットの読み込み。
+ * 事前生成したビジュアルアセットの読み込み。
  *
- * 画像は `web/public/assets` に置かれており、ビルド時には生成しない。
+ * 画像は `web/public/assets` に置かれており、ビルド時には生成しない
+ * （仕様 08 章 4.2 節）。素材が見つからない場合（404 や manifest 未掲載）は
+ * 読み込みを失敗させず、その場で手続き生成した簡易プレースホルダに
+ * フォールバックする。シミュレーションと描画自体は常に成立させるための
+ * 保険であり、本番品質の見た目を代替するものではない。
+ *
  * 人物画像だけは ImageGen の出力に残ったチェッカーボード風の背景を、
  * 起動時に外周からの連結領域としてアルファ化する。これは生成処理ではなく、
  * 既存 PNG を Canvas へ読み込む際のマスク処理である。
@@ -25,8 +30,53 @@ function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
+/**
+ * 地形タイルアトラスが見つからないときの手続き生成フォールバック。
+ * 4x4 のタイルそれぞれを、地表らしき単色で塗り分けるだけの最小限のもの。
+ */
+function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
+  const cols = 4;
+  const rows = 4;
+  const width = tileSize * cols;
+  const height = tileSize * rows;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) throw new Error("地形アトラス用 Canvas を作成できません");
+  const colors = [
+    "#5b7a4a",
+    "#7fa15c",
+    "#8f9a5a",
+    "#6b6247",
+    "#9c8b6a",
+    "#8a8a8a",
+    "#3d5a80",
+    "#c9b896",
+  ];
+  for (let ty = 0; ty < rows; ty++) {
+    for (let tx = 0; tx < cols; tx++) {
+      ctx.fillStyle = colors[(ty * cols + tx) % colors.length]!;
+      ctx.fillRect(tx * tileSize, ty * tileSize, tileSize, tileSize);
+    }
+  }
+  return {
+    width,
+    height,
+    tileWidth: tileSize,
+    tileHeight: tileSize,
+    pixels: ctx.getImageData(0, 0, width, height).data,
+  };
+}
+
 export async function loadTerrainAtlas(): Promise<TerrainAtlas> {
-  const image = await loadImage("/assets/terrain-atlas.png");
+  let image: HTMLImageElement;
+  try {
+    image = await loadImage("/assets/terrain-atlas.png");
+  } catch (err) {
+    console.warn("地形タイルアトラスが見つからないため、手続き生成のプレースホルダを使う", err);
+    return proceduralTerrainAtlas();
+  }
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth;
   canvas.height = image.naturalHeight;

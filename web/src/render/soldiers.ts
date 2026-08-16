@@ -72,7 +72,7 @@ precision mediump float;
 precision highp int;
 
 uniform sampler2D u_spriteTex;
-uniform int u_renderMode;
+uniform float u_dotBlend;
 uniform vec4 u_faction0;
 uniform vec4 u_faction1;
 
@@ -93,22 +93,31 @@ void main() {
     return;
   }
 
-  if (u_renderMode == 0) {
-    vec4 sprite = texture(u_spriteTex, v_uv);
-    if (sprite.a <= 0.01) discard;
-    // 2陣営目だけをシェーダ内でパレット寄せする。将来の本格的な
-    // パレット置換でも、このインスタンス属性と描画経路はそのまま使える。
-    if (faction == 1u) sprite.rgb = mix(sprite.rgb, factionColor.rgb, 0.28);
-    outColor = sprite;
+  // L2/L3/L4 は小さなクアッド／点に落とす。状態は色の明度に反映し、
+  // 画面を遠ざけても状態と陣営の違いを失わないようにする。
+  vec3 dotColor = factionColor.rgb;
+  if (state == 8u || state == 9u) dotColor = mix(dotColor, vec3(0.92, 0.48, 0.20), 0.35);
+  if (state == 10u) dotColor = mix(dotColor, vec3(0.35, 0.86, 0.52), 0.28);
+  vec4 dot = vec4(dotColor, 0.96);
+
+  if (u_dotBlend >= 0.999) {
+    outColor = dot;
     return;
   }
 
-  // L2/L3/L4 は小さなクアッド／点に落とす。状態は色の明度に反映し、
-  // 画面を遠ざけても状態と陣営の違いを失わないようにする。
-  vec3 color = factionColor.rgb;
-  if (state == 8u || state == 9u) color = mix(color, vec3(0.92, 0.48, 0.20), 0.35);
-  if (state == 10u) color = mix(color, vec3(0.35, 0.86, 0.52), 0.28);
-  outColor = vec4(color, 0.96);
+  vec4 sprite = texture(u_spriteTex, v_uv);
+  if (sprite.a <= 0.01) {
+    if (u_dotBlend <= 0.001) discard;
+    outColor = vec4(dot.rgb, dot.a * u_dotBlend);
+    return;
+  }
+  // 2陣営目だけをシェーダ内でパレット寄せする。将来の本格的な
+  // パレット置換でも、このインスタンス属性と描画経路はそのまま使える。
+  if (faction == 1u) sprite.rgb = mix(sprite.rgb, factionColor.rgb, 0.28);
+
+  // 隣接 LOD 間はクロスフェード帯（px/m で ±15%）を設け、両方を描いて
+  // アルファでブレンドする（仕様 08 章 2.3 節）。
+  outColor = mix(sprite, dot, u_dotBlend);
 }
 `;
 
@@ -132,7 +141,7 @@ export class SoldierRenderer {
     worldSize: WebGLUniformLocation;
     spriteWidth: WebGLUniformLocation;
     spriteHeight: WebGLUniformLocation;
-    renderMode: WebGLUniformLocation;
+    dotBlend: WebGLUniformLocation;
     spriteTex: WebGLUniformLocation;
     faction0: WebGLUniformLocation;
     faction1: WebGLUniformLocation;
@@ -182,7 +191,7 @@ export class SoldierRenderer {
       worldSize: location("u_worldSize"),
       spriteWidth: location("u_spriteWidth"),
       spriteHeight: location("u_spriteHeight"),
-      renderMode: location("u_renderMode"),
+      dotBlend: location("u_dotBlend"),
       spriteTex: location("u_spriteTex"),
       faction0: location("u_faction0"),
       faction1: location("u_faction1"),
@@ -278,9 +287,30 @@ export class SoldierRenderer {
     const camOffsetX = (cam.centerX - cam.centerY) * PX_PER_M * zoom;
     const camOffsetY = (cam.centerX + cam.centerY) * (TILE_H / TILE_M / 2) * zoom;
     const pxPerM = cam.pxPerM;
-    const close = cam.lod === Lod.Close || cam.lod === Lod.Tactical;
-    const spriteHeight = close ? 1.7 * pxPerM : cam.lod === Lod.Unit ? 0.7 * pxPerM : 1;
-    const spriteWidth = close ? spriteHeight * (200 / 300) : spriteHeight;
+    // 隣接 LOD 間はクロスフェード帯（px/m で ±15%）を設け、両方を描いて
+    // アルファでブレンドする（仕様 08 章 2.3 節）。スプライト（等身大の絵）と
+    // 点描画の切り替わりは Tactical/Unit 境界（12 px/m）、点のサイズが
+    // 固定になる切り替わりは Unit/Battle 境界（3 px/m）で起きる。
+    const crossfadeT = (scale: number, threshold: number): number => {
+      const band = threshold * 0.15;
+      return Math.min(1, Math.max(0, (scale - (threshold - band)) / (2 * band)));
+    };
+    const tSpriteVsDot = crossfadeT(pxPerM, 12);
+    let spriteHeight: number;
+    let dotBlend: number;
+    if (tSpriteVsDot > 0) {
+      const spriteSideHeight = 1.7 * pxPerM;
+      const dotSideHeight = 0.7 * pxPerM;
+      spriteHeight = dotSideHeight + (spriteSideHeight - dotSideHeight) * tSpriteVsDot;
+      dotBlend = 1 - tSpriteVsDot;
+    } else {
+      const tUnitVsBattle = crossfadeT(pxPerM, 3);
+      const unitSideHeight = 0.7 * pxPerM;
+      const battleSideHeight = 1;
+      spriteHeight = battleSideHeight + (unitSideHeight - battleSideHeight) * tUnitVsBattle;
+      dotBlend = 1;
+    }
+    const spriteWidth = dotBlend < 1 ? spriteHeight * (200 / 300) : spriteHeight;
 
     if (n === 0) {
       this.drawn = 0;
@@ -353,7 +383,7 @@ export class SoldierRenderer {
     gl.uniform1f(u.worldSize, cam.worldSizeM);
     gl.uniform1f(u.spriteWidth, Math.max(1, spriteWidth));
     gl.uniform1f(u.spriteHeight, Math.max(1, spriteHeight));
-    gl.uniform1i(u.renderMode, close && this.assetsReady ? 0 : 1);
+    gl.uniform1f(u.dotBlend, this.assetsReady ? dotBlend : 1);
     gl.uniform1i(u.spriteTex, 0);
     gl.uniform4f(u.faction0, 0.239, 0.478, 0.722, 1);
     gl.uniform4f(u.faction1, 0.851, 0.502, 0.196, 1);

@@ -10,6 +10,7 @@
 
 pub mod combat;
 pub mod organization;
+pub mod pathing;
 pub mod snapshot;
 pub mod soldiers;
 pub mod spatial;
@@ -65,6 +66,8 @@ pub struct World {
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
     push_x: Vec<Fx>,
     push_y: Vec<Fx>,
+    /// 衝突解決の全反復で蓄積した重なり量。圧迫（crush）判定に使う。
+    crush_accum: Vec<Fx>,
 }
 
 impl core::fmt::Debug for World {
@@ -92,6 +95,7 @@ impl World {
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
+            crush_accum: Vec::new(),
         }
     }
 
@@ -112,6 +116,7 @@ impl World {
         self.goal.push(pos);
         self.push_x.push(0);
         self.push_y.push(0);
+        self.crush_accum.push(0);
         let i = id as usize;
         self.soldiers.z_cm[i] =
             sim_math::fx_to_mm(self.terrain.height_at(pos.x, pos.y)) as i16 / 10;
@@ -191,7 +196,7 @@ impl World {
     ///
     /// フェーズの順序は仕様 02 章 5 節に従う。M0 では未実装のフェーズを飛ばす。
     pub fn tick(&mut self) {
-        self.command.tick(&self.soldiers, self.tick);
+        self.command.tick(&self.soldiers, &self.terrain, self.tick);
         self.command
             .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
@@ -219,6 +224,7 @@ impl World {
             if self.soldiers.hot.state[i] == State::Idle {
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
+                self.face_nearest_enemy_if_close(i);
                 continue;
             }
             let pos = self.soldiers.pos(i);
@@ -230,6 +236,7 @@ impl World {
                 if self.soldiers.hot.state[i] == State::Marching {
                     self.soldiers.hot.state[i] = State::Idle;
                 }
+                self.face_nearest_enemy_if_close(i);
                 continue;
             }
 
@@ -249,6 +256,39 @@ impl World {
             self.soldiers.hot.vel_x[i] = next.x.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
             self.soldiers.hot.vel_y[i] = next.y.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
             self.soldiers.hot.facing[i] = dir.angle();
+            // 進行方向を向くのが基本だが、間合いの範囲内に敵がいれば
+            // そちらを優先して向く。行軍の目標方向と実際に隣接した敵の
+            // 方向がずれる（衝突で横に押された等）と、白兵戦の弧判定を
+            // 満たせないまま双方が固まってしまうため。
+            self.face_nearest_enemy_if_close(i);
+        }
+    }
+
+    /// 間合いの範囲内にいる最も近い敵がいれば、そちらへ向き直らせる
+    /// （仕様 12 章 M4：白兵戦の弧判定が現実の隣接関係と食い違わないようにする）。
+    fn face_nearest_enemy_if_close(&mut self, i: usize) {
+        let pos = self.soldiers.pos(i);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        let count = self.hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+        // 白兵武器の間合い（最長でもパイクの 5 m）より少し広めに取る。
+        let detect_r = fx_from_mm(2_500);
+        let mut nearest: Option<(i64, Vec2Fx)> = None;
+        for &jid in &neighbors[..count] {
+            let j = jid as usize;
+            if !self.soldiers.is_alive(j) || self.soldiers.faction[j] == self.soldiers.faction[i] {
+                continue;
+            }
+            let jp = self.soldiers.pos(j);
+            let d2 = sim_math::dist_sq(pos, jp);
+            if d2 > (detect_r as i64) * (detect_r as i64) {
+                continue;
+            }
+            if nearest.map_or(true, |(best, _)| d2 < best) {
+                nearest = Some((d2, jp));
+            }
+        }
+        if let Some((_, enemy_pos)) = nearest {
+            self.soldiers.hot.facing[i] = enemy_pos.sub(pos).angle();
         }
     }
 
@@ -382,6 +422,67 @@ impl World {
                 self.soldiers.hot.pos_y[i] =
                     (self.soldiers.hot.pos_y[i] + self.push_y[i]).clamp(0, limit);
             }
+        }
+
+        self.apply_crush_pressure();
+    }
+
+    /// 圧迫（crush）の実害を戦闘システムへ渡す（仕様 12 章 M4）。
+    ///
+    /// 通常の陣形（肩が触れ合う密集隊形も含む）は `SEPARATION_ITERATIONS` の
+    /// 押し合いでほぼ解消される（`overlapping_soldiers_push_apart` テストが
+    /// 残差 10 mm 以下であることを保証している）。そのため「解決を試みた後も
+    /// なお残っている重なり」だけを圧力として扱えば、普通の行軍や密集陣形を
+    /// 圧迫死させることなく、空間ハッシュの近傍上限（12 人）を超えるような
+    /// 極端な過密（`extreme_density_disperses_but_is_not_fully_resolved`
+    /// テストが示す状況）だけを圧迫として検出できる。
+    fn apply_crush_pressure(&mut self) {
+        let n = self.soldiers.len();
+        if n == 0 {
+            return;
+        }
+        self.hash.rebuild(&self.soldiers);
+        self.crush_accum.iter_mut().for_each(|v| *v = 0);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        for i in 0..n {
+            if !self.soldiers.is_alive(i) {
+                continue;
+            }
+            let pi = self.soldiers.pos(i);
+            let ri = self.soldiers.radius(i);
+            let cnt = self.hash.query_neighbors(pi.x, pi.y, &mut neighbors);
+            let mut residual = 0 as Fx;
+            for &jid in &neighbors[..cnt] {
+                let j = jid as usize;
+                if j == i || !self.soldiers.is_alive(j) {
+                    continue;
+                }
+                let pj = self.soldiers.pos(j);
+                let rsum = ri + self.soldiers.radius(j);
+                let d2 = sim_math::dist_sq(pi, pj);
+                if d2 >= (rsum as i64) * (rsum as i64) {
+                    continue;
+                }
+                let d = sim_math::isqrt64(d2 as u64) as Fx;
+                residual += rsum - d;
+            }
+            self.crush_accum[i] = residual;
+        }
+
+        for i in 0..n {
+            if !self.soldiers.is_alive(i) || self.crush_accum[i] == 0 {
+                continue;
+            }
+            let radius = self.soldiers.radius(i).max(1);
+            let pressure_permille = ((self.crush_accum[i] as i64 * 1000) / radius as i64)
+                .clamp(0, u32::MAX as i64) as u32;
+            self.combat.apply_crush(
+                i as SoldierId,
+                &mut self.soldiers,
+                pressure_permille,
+                self.seed,
+                self.tick,
+            );
         }
     }
 

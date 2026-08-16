@@ -7,7 +7,9 @@
 use sim_math::{
     dist, fx, fx_from_mm, fx_mul, ms_to_ticks, per_sec_to_per_tick, Brad, Fx, Vec2Fx, FX_ONE,
 };
+use sim_terrain::Terrain;
 
+use crate::pathing;
 use crate::soldiers::{SoldierId, Soldiers, State};
 
 pub type NodeId = u32;
@@ -401,6 +403,11 @@ pub struct Unit {
     pub rank_spacing: Fx,
     pub banner: Option<u16>,
     pub formation_change: Option<FormationChange>,
+    /// 残りの経路ウェイポイント（次に目指す点が先頭）。`formation_origin` が
+    /// 現在の目標であり、ここには「その先」の点だけが入る（仕様 12 章 M2）。
+    pub path: Vec<Vec2Fx>,
+    /// 経路探索の最終目的地。到達判定や再計算の要否に使う。
+    pub path_final: Vec2Fx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -717,7 +724,7 @@ impl CommandTree {
     }
 
     /// 伝令の移動、命令の受領、指揮継承を進める。
-    pub fn tick(&mut self, soldiers: &Soldiers, tick: u32) {
+    pub fn tick(&mut self, soldiers: &Soldiers, terrain: &Terrain, tick: u32) {
         self.tick_succession(soldiers, tick);
         let mut arrivals = Vec::new();
         let mut lost = Vec::new();
@@ -761,12 +768,12 @@ impl CommandTree {
             });
         }
         for index in arrivals {
-            self.deliver(index, soldiers, tick);
+            self.deliver(index, soldiers, terrain, tick);
         }
         self.update_stats(soldiers);
     }
 
-    fn deliver(&mut self, messenger_id: usize, soldiers: &Soldiers, tick: u32) {
+    fn deliver(&mut self, messenger_id: usize, soldiers: &Soldiers, terrain: &Terrain, tick: u32) {
         let messenger = self.messengers[messenger_id];
         let node_id = messenger.to;
         let Some(node) = self.node(node_id) else {
@@ -800,7 +807,7 @@ impl CommandTree {
             }
         }
         if compliance != Compliance::Ignored {
-            self.apply_intent(node_id, messenger.order.intent, soldiers, tick);
+            self.apply_intent(node_id, messenger.order.intent, soldiers, terrain, tick);
         }
         let kind = match compliance {
             Compliance::Obeyed => CommandEventKind::Obeyed,
@@ -818,8 +825,16 @@ impl CommandTree {
         }
     }
 
-    fn apply_intent(&mut self, node_id: NodeId, intent: Intent, soldiers: &Soldiers, tick: u32) {
+    fn apply_intent(
+        &mut self,
+        node_id: NodeId,
+        intent: Intent,
+        soldiers: &Soldiers,
+        terrain: &Terrain,
+        tick: u32,
+    ) {
         let mut requested_formation = None;
+        let mut route: Option<Vec2Fx> = None;
         if let Some(node) = self.node_mut(node_id) {
             let Some(unit) = node.unit.as_mut() else {
                 return;
@@ -831,19 +846,22 @@ impl CommandTree {
                     formation,
                     ..
                 } => {
-                    unit.formation_origin = pos;
                     unit.formation_facing = facing;
                     requested_formation = Some(formation);
+                    route = Some(pos);
                 }
                 Intent::Hold { pos, facing, .. } => {
-                    unit.formation_origin = pos;
                     unit.formation_facing = facing;
+                    route = Some(pos);
                 }
                 Intent::Reserve { rally_pos } | Intent::Withdraw { to: rally_pos, .. } => {
-                    unit.formation_origin = rally_pos;
+                    route = Some(rally_pos);
                 }
                 _ => {}
             }
+        }
+        if let Some(destination) = route {
+            self.set_movement_target(node_id, destination, soldiers, terrain);
         }
         if let Some(formation) = requested_formation {
             if self
@@ -854,6 +872,53 @@ impl CommandTree {
                 let _ = self.change_formation(node_id, formation, soldiers, tick);
             }
         }
+    }
+
+    /// 部隊の移動目標を設定する。粗い A* で経路を求め、経路の最初のウェイポイントを
+    /// `formation_origin`（陣形が追従する即時目標）に、残りを `unit.path` に積む。
+    /// 経路が見つからない場合は直線移動にフォールバックする。
+    fn set_movement_target(
+        &mut self,
+        node_id: NodeId,
+        destination: Vec2Fx,
+        soldiers: &Soldiers,
+        terrain: &Terrain,
+    ) {
+        let start = self.unit_origin(node_id, soldiers);
+        let mut waypoints =
+            pathing::find_path(terrain, start, destination).unwrap_or_else(|| vec![destination]);
+        let Some(node) = self.node_mut(node_id) else {
+            return;
+        };
+        let Some(unit) = node.unit.as_mut() else {
+            return;
+        };
+        let first = if waypoints.is_empty() {
+            destination
+        } else {
+            waypoints.remove(0)
+        };
+        unit.formation_origin = first;
+        unit.path = waypoints;
+        unit.path_final = destination;
+    }
+
+    /// 部隊の現在位置の代表点。生存者の重心があればそれを、なければ部隊の
+    /// 現在の陣形起点を使う（配置直後などまだ統計が計算されていない場合）。
+    fn unit_origin(&self, node_id: NodeId, soldiers: &Soldiers) -> Vec2Fx {
+        let Some(node) = self.node(node_id) else {
+            return Vec2Fx::ZERO;
+        };
+        if node.stats.alive > 0 {
+            return node.stats.centroid;
+        }
+        let Some(unit) = &node.unit else {
+            return Vec2Fx::ZERO;
+        };
+        unit.soldiers
+            .iter()
+            .find_map(|&id| soldiers.pos_checked(id))
+            .unwrap_or(unit.formation_origin)
     }
 
     fn interpret(
@@ -975,6 +1040,21 @@ impl CommandTree {
                         formation_changed = true;
                     }
                 }
+                // 経路上の現在のウェイポイントに近づいたら、次のウェイポイントへ進む。
+                // 重心は前ティックの `update_stats` の結果なので 1 tick 遅れるが、
+                // 隊列が長いユニットでは十分な精度。
+                if !unit.path.is_empty() {
+                    let centroid = self
+                        .nodes
+                        .get(index)
+                        .map(|n| n.stats.centroid)
+                        .unwrap_or(Vec2Fx::ZERO);
+                    let unit = self.nodes[index].unit.as_mut().unwrap();
+                    if dist(centroid, unit.formation_origin) <= pathing::arrival_radius() {
+                        unit.formation_origin = unit.path.remove(0);
+                    }
+                }
+                let unit = self.nodes[index].unit.as_mut().unwrap();
                 let transitioning = unit.formation_change.is_some();
                 let alive = unit
                     .soldiers
@@ -1147,6 +1227,7 @@ impl CommandTree {
                 mix(unit.formation as u64);
                 mix(unit.formation_origin.x as u32 as u64);
                 mix(unit.formation_origin.y as u32 as u64);
+                mix(unit.path.len() as u64);
             }
         }
         for messenger in &self.messengers {
@@ -1162,6 +1243,17 @@ impl CommandTree {
 mod tests {
     use super::*;
     use crate::soldiers::Attrs;
+
+    fn flat_terrain(size_m: u32) -> Terrain {
+        sim_terrain::generate(&sim_terrain::TerrainParams {
+            seed: 1,
+            size_m,
+            cell_m: 4,
+            relief: 0,
+            thermal_iterations: 0,
+            ..Default::default()
+        })
+    }
 
     fn soldiers_at(positions: &[(i32, i32)]) -> Soldiers {
         let mut soldiers = Soldiers::default();
@@ -1195,7 +1287,10 @@ mod tests {
             rank_spacing: fx_from_mm(800),
             banner: None,
             formation_change: None,
+            path: Vec::new(),
+            path_final: Vec2Fx::ZERO,
         };
+        let terrain = flat_terrain(400);
         let leaf = tree.add_node(Some(army), 1, 0, 2, vec![], Some(unit));
         tree.issue_order(
             army,
@@ -1212,7 +1307,7 @@ mod tests {
         let first = tree.messengers[0].remaining_ticks;
         assert!(first > 0);
         for tick in 0..first {
-            tree.tick(&soldiers, tick);
+            tree.tick(&soldiers, &terrain, tick);
         }
         assert_eq!(tree.node(leaf).unwrap().received_order.unwrap().id, 0);
         assert!(tree
@@ -1243,8 +1338,11 @@ mod tests {
                 rank_spacing: fx_from_mm(800),
                 banner: None,
                 formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::ZERO,
             }),
         );
+        let terrain = flat_terrain(400);
         tree.issue_order(
             root,
             leaf,
@@ -1256,7 +1354,7 @@ mod tests {
             &soldiers,
         );
         soldiers.hot.state[0] = State::Dead;
-        tree.tick(&soldiers, 1);
+        tree.tick(&soldiers, &terrain, 1);
         assert!(tree.node(leaf).unwrap().received_order.is_none());
         assert!(tree
             .events
@@ -1269,20 +1367,74 @@ mod tests {
         let mut soldiers = soldiers_at(&[(10, 10), (11, 10)]);
         let mut tree = CommandTree::new();
         let root = tree.add_node(None, 0, 0, 0, vec![1], None);
+        let terrain = flat_terrain(400);
         soldiers.hot.state[0] = State::Dead;
-        tree.tick(&soldiers, 0);
+        tree.tick(&soldiers, &terrain, 0);
         assert_eq!(
             tree.node(root).unwrap().command_state,
             CommandState::Succeeding
         );
         for tick in 1..=20 * sim_math::TICK_HZ {
-            tree.tick(&soldiers, tick);
+            tree.tick(&soldiers, &terrain, tick);
         }
         assert_eq!(tree.node(root).unwrap().commander, 1);
         assert_eq!(
             tree.node(root).unwrap().command_state,
             CommandState::Commanded
         );
+    }
+
+    #[test]
+    fn move_to_routes_around_an_impassable_wall() {
+        // 目的地までの直線上に通行不能な壁を置き、経路探索がそれを迂回することを確認する。
+        let mut terrain = flat_terrain(400);
+        // 粗いセル（16 m）を丸ごと塞ぐ厚みの壁を、隙間を 1 か所だけ残して置く
+        let gap_start = terrain.dim.saturating_sub(12);
+        for cy in 0..terrain.dim {
+            if cy >= gap_start {
+                continue;
+            }
+            for wx in (terrain.dim / 2)..(terrain.dim / 2 + 8) {
+                let idx = terrain.idx(wx, cy);
+                terrain.passability[idx] = 0;
+            }
+        }
+        let soldiers = soldiers_at(&[(50, 200)]);
+        let mut tree = CommandTree::new();
+        let root = tree.add_node(None, 0, 0, 0, vec![], None);
+        let unit = Unit {
+            soldiers: vec![0],
+            troop_type: 0,
+            formation: FORMATION_LINE,
+            formation_origin: Vec2Fx::new(fx(50), fx(200)),
+            formation_facing: 0,
+            ranks: 1,
+            file_spacing: fx_from_mm(800),
+            rank_spacing: fx_from_mm(800),
+            banner: None,
+            formation_change: None,
+            path: Vec::new(),
+            path_final: Vec2Fx::ZERO,
+        };
+        let leaf = tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
+        tree.set_movement_target(leaf, Vec2Fx::new(fx(350), fx(200)), &soldiers, &terrain);
+        let unit = tree.node(leaf).unwrap().unit.as_ref().unwrap();
+        // 直進なら壁の範囲を通るはずだが、経路上のどのウェイポイントも
+        // 壁のセルには入らない
+        let wall_range = (terrain.dim / 2)..(terrain.dim / 2 + 8);
+        let mut all_points = vec![unit.formation_origin];
+        all_points.extend(unit.path.iter().copied());
+        assert!(
+            all_points.len() > 1,
+            "壁があるのに経路が直線 1 本になっている"
+        );
+        for p in &all_points[..all_points.len() - 1] {
+            let (cx, _) = terrain.world_to_cell(p.x, p.y);
+            assert!(
+                !wall_range.contains(&cx),
+                "ウェイポイントが壁の上に乗っている"
+            );
+        }
     }
 
     #[test]
@@ -1301,6 +1453,8 @@ mod tests {
             rank_spacing: fx_from_mm(800),
             banner: None,
             formation_change: None,
+            path: Vec::new(),
+            path_final: Vec2Fx::ZERO,
         };
         tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
         let mut goals = vec![Vec2Fx::ZERO; 4];

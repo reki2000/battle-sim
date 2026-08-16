@@ -8,8 +8,8 @@
 //! ID 順に解決しても、各判定そのものは呼び出し順に依存しない。
 
 use sim_math::{
-    angle_diff, brad_from_deg, dist_sq, fx_from_mm, ms_to_ticks, within_arc, Brad, Fx, Purpose,
-    Rng, Vec2Fx,
+    angle_diff, brad_from_deg, dist, dist_sq, fx_floor_int, fx_from_mm, ms_to_ticks,
+    per_sec_to_per_tick, within_arc, Brad, Fx, Purpose, Rng, Vec2Fx,
 };
 
 use crate::soldiers::{Attrs, SoldierId, Soldiers, State, MAX_FATIGUE, MAX_HP, MAX_MORALE, NO_ID};
@@ -47,17 +47,20 @@ pub enum HitLocation {
 /// 白兵武器の最小データ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Weapon {
-    /// リーチ（固定小数点の m）。
+    /// リーチ（固定小数点の m）。射撃武器では最大射程として使う。
     pub reach: Fx,
-    /// 基本の振り時間。
+    /// 基本の振り時間。射撃武器では装填・照準を含む発射間隔。
     pub base_swing_ms: u16,
     /// 命中値への加算。
     pub accuracy: i16,
     /// 筋力補正前の威力。
     pub power: u16,
     pub damage_type: DamageType,
-    /// 後列から攻撃できる武器（基礎スコープではパイクだけ）。
+    /// 後列から攻撃できる武器（基礎スコープではパイクと弓兵科）。
     pub requires_front_row: bool,
+    /// 射撃武器か（true なら白兵の間合いではなく `CombatSystem` の
+    /// 射撃パスで解決し、着弾に遅延を持たせる）。
+    pub ranged: bool,
 }
 
 impl Weapon {
@@ -69,6 +72,7 @@ impl Weapon {
             power: 24,
             damage_type: DamageType::Pierce,
             requires_front_row: true,
+            ranged: false,
         }
     }
 
@@ -80,6 +84,7 @@ impl Weapon {
             power: 32,
             damage_type: DamageType::Cut,
             requires_front_row: true,
+            ranged: false,
         }
     }
 
@@ -91,6 +96,7 @@ impl Weapon {
             power: 38,
             damage_type: DamageType::Blunt,
             requires_front_row: true,
+            ranged: false,
         }
     }
 
@@ -102,6 +108,7 @@ impl Weapon {
             power: 34,
             damage_type: DamageType::Pierce,
             requires_front_row: true,
+            ranged: false,
         }
     }
 
@@ -113,6 +120,33 @@ impl Weapon {
             power: 42,
             damage_type: DamageType::Pierce,
             requires_front_row: false,
+            ranged: false,
+        }
+    }
+
+    /// 長弓。射程が長く威力も高いが、発射間隔も長い。
+    pub const fn longbow() -> Self {
+        Self {
+            reach: fx_from_mm(120_000),
+            base_swing_ms: 3500,
+            accuracy: -2,
+            power: 22,
+            damage_type: DamageType::Missile,
+            requires_front_row: false,
+            ranged: true,
+        }
+    }
+
+    /// 弩。命中は安定するが発射間隔が長く連射が利かない。
+    pub const fn crossbow() -> Self {
+        Self {
+            reach: fx_from_mm(80_000),
+            base_swing_ms: 6000,
+            accuracy: 8,
+            power: 30,
+            damage_type: DamageType::Missile,
+            requires_front_row: false,
+            ranged: true,
         }
     }
 }
@@ -229,7 +263,21 @@ pub enum BattlePhase {
     Complete,
 }
 
-/// 戦闘の集計値。UI 用イベントログは M4 後半でこの値をイベント列へ拡張する。
+/// 死因の内訳。M4 の受け入れ条件「損害の内訳で追撃が最大の死因になる」を
+/// 検証できるよう、キルはどれか 1 つの原因に分類する。追撃は他の原因より
+/// 優先して判定する（追撃中・敗走中に受けた最後の一撃は武器種によらず
+/// 「追撃」を死因とする）。
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeathCause {
+    Melee,
+    Missile,
+    Crush,
+    Bleed,
+    Pursuit,
+}
+
+/// 戦闘の集計値。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CombatStats {
     pub attacks: u32,
@@ -238,7 +286,46 @@ pub struct CombatStats {
     pub kills: u32,
     pub downed: u32,
     pub pursuit_kills: u32,
+    pub melee_kills: u32,
+    pub missile_kills: u32,
+    pub crush_kills: u32,
+    pub bleed_kills: u32,
+    pub shots_fired: u32,
+    pub friendly_fire_hits: u32,
 }
+
+/// UI・戦闘報告向けのイベント種別。
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombatEventKind {
+    Hit,
+    Downed,
+    Killed,
+    Broken,
+    Rallied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CombatEvent {
+    pub tick: u32,
+    pub attacker: SoldierId,
+    pub defender: SoldierId,
+    pub kind: CombatEventKind,
+    pub cause: DeathCause,
+}
+
+/// イベントログの保持上限。UI は直近のイベントだけを見るので、長時間戦でも
+/// メモリが際限なく増えないように打ち切る（`organization::CommandEvent` は
+/// 発生数が少ないため無制限だが、こちらは 1 tick に数千件出うる）。
+const MAX_EVENTS: usize = 4096;
+
+/// この圧力（‰、push 量を半径に対する割合で表す）を超えた分だけ圧迫の実害になる。
+/// 通常の押し合いや行進中のジョストルはこれを超えない。
+const CRUSH_THRESHOLD_PERMILLE: u32 = 600;
+
+/// 射撃の標的探索に使う粗いセルの一辺（m）。近接戦用の `SpatialHash`
+/// （2 m セル）では弓の射程まで届かないための専用インデックス。
+const RANGED_CELL_M: i32 = 48;
 
 #[derive(Clone, Copy, Debug)]
 struct DamageIntent {
@@ -247,7 +334,24 @@ struct DamageIntent {
     amount: u16,
     location: HitLocation,
     instant_death: bool,
+    cause: DeathCause,
 }
+
+/// 飛んでいる最中の矢・ボルト。着弾まで `remaining_ticks` を数える。
+#[derive(Clone, Copy, Debug)]
+struct PendingShot {
+    attacker: SoldierId,
+    target: SoldierId,
+    aim_point: Vec2Fx,
+    remaining_ticks: u16,
+    weapon: Weapon,
+    attacker_skill: u8,
+    attacker_strength: u8,
+    range_permille: u32,
+}
+
+/// 標準的な矢筒・ボルトケースの初期弾薬数。
+const DEFAULT_AMMO: u16 = 24;
 
 /// 戦闘システム。配列の index は `SoldierId` と一致する。
 #[derive(Debug, Default)]
@@ -261,6 +365,9 @@ pub struct CombatSystem {
     engaged_count: Vec<u16>,
     intents: Vec<DamageIntent>,
     morale_pressure: Vec<u8>,
+    pub ammo: Vec<u16>,
+    pending_shots: Vec<PendingShot>,
+    pub events: std::collections::VecDeque<CombatEvent>,
     pub phase: BattlePhase,
     pub stats: CombatStats,
 }
@@ -274,11 +381,19 @@ impl CombatSystem {
         self.attack_timer.push(0);
         self.broken_ticks.push(0);
         self.rally_ticks.push(0);
+        self.ammo.push(DEFAULT_AMMO);
     }
 
     fn ensure_len(&mut self, len: usize) {
         while self.weapons.len() < len {
             self.register();
+        }
+    }
+
+    fn push_event(&mut self, event: CombatEvent) {
+        self.events.push_back(event);
+        if self.events.len() > MAX_EVENTS {
+            self.events.pop_front();
         }
     }
 
@@ -290,6 +405,16 @@ impl CombatSystem {
         }
         self.weapons[i] = weapon;
         self.armors[i] = armor;
+        true
+    }
+
+    /// 弾薬数を設定する（射撃兵科の初期配備に使う）。
+    pub fn set_ammo(&mut self, id: SoldierId, ammo: u16) -> bool {
+        let i = id as usize;
+        if i >= self.ammo.len() {
+            return false;
+        }
+        self.ammo[i] = ammo;
         true
     }
 
@@ -368,13 +493,67 @@ impl CombatSystem {
             }
         }
 
+        // 射程の長い兵科（弓・弩）は、近接用の細かい空間ハッシュでは届かない
+        // 距離の敵を探す必要がある。まだ標的のいない射撃兵だけが対象なので、
+        // 該当者がいなければ粗い索引の構築自体を省く（仕様 12 章 M2/M4）。
+        let ranged_seekers: Vec<u32> = (0..n as u32)
+            .filter(|&idx| {
+                let i = idx as usize;
+                soldiers.is_alive(i)
+                    && self.weapons[i].ranged
+                    && self.targets[i] == NO_ID
+                    && self.ammo[i] > 0
+                    && !matches!(soldiers.hot.state[i], State::Broken | State::Rallying)
+            })
+            .collect();
+        if !ranged_seekers.is_empty() {
+            let ranged_index = CoarseIndex::build(RANGED_CELL_M, soldiers);
+            let mut buf = [0u32; MAX_NEIGHBORS];
+            for &idx in &ranged_seekers {
+                let i = idx as usize;
+                let pos = soldiers.pos(i);
+                let count = ranged_index.query(pos.x, pos.y, &mut buf);
+                let mut best: Option<(i64, SoldierId)> = None;
+                for &candidate_id in &buf[..count] {
+                    let j = candidate_id as usize;
+                    if j == i || !is_targetable(soldiers.hot.state[j]) {
+                        continue;
+                    }
+                    if soldiers.faction[i] == soldiers.faction[j]
+                        || (self.phase == BattlePhase::Pursuit
+                            && soldiers.hot.state[j] != State::Broken)
+                    {
+                        continue;
+                    }
+                    let candidate = soldiers.pos(j);
+                    let reach = self.weapons[i].reach;
+                    let distance_sq = dist_sq(pos, candidate);
+                    if distance_sq > (reach as i64) * (reach as i64)
+                        || !within_arc(soldiers.hot.facing[i], pos, candidate, 16_384)
+                    {
+                        continue;
+                    }
+                    if best.map_or(true, |current| (distance_sq, candidate_id) < current) {
+                        best = Some((distance_sq, candidate_id));
+                    }
+                }
+                if let Some((_, target)) = best {
+                    self.targets[i] = target;
+                }
+            }
+        }
+
         for i in 0..n {
             soldiers.target[i] = self.targets[i];
             if self.targets[i] != NO_ID {
                 if !matches!(soldiers.hot.state[i], State::Wavering | State::Broken) {
-                    soldiers.hot.state[i] = State::Engaged;
+                    soldiers.hot.state[i] = if self.weapons[i].ranged {
+                        State::Shooting
+                    } else {
+                        State::Engaged
+                    };
                 }
-            } else if soldiers.hot.state[i] == State::Engaged {
+            } else if matches!(soldiers.hot.state[i], State::Engaged | State::Shooting) {
                 soldiers.hot.state[i] = State::Idle;
             }
         }
@@ -390,10 +569,48 @@ impl CombatSystem {
                 self.attack_timer[i] -= 1;
                 continue;
             }
+            let weapon = self.weapons[i];
+            let attacker_attrs = soldiers.attrs[i];
+            self.attack_timer[i] = swing_ticks(
+                weapon,
+                attacker_attrs,
+                soldiers.fatigue[i],
+                soldiers.hot.state[i],
+            );
+
+            if weapon.ranged {
+                if self.ammo[i] == 0 {
+                    continue;
+                }
+                self.ammo[i] -= 1;
+                self.stats.shots_fired = self.stats.shots_fired.saturating_add(1);
+                let defender = self.targets[i] as usize;
+                let origin = soldiers.pos(i);
+                let aim_point = soldiers.pos(defender);
+                // 矢速はおよそ 45 m/s。飛翔中に着弾点は動かず、狙われた瞬間の
+                // 位置へ飛ぶ（=標的がその間に動けば外れうる）。
+                let speed_per_tick = per_sec_to_per_tick(fx_from_mm(45_000)).max(1);
+                let distance = dist(origin, aim_point);
+                let travel_ticks = ((distance as i64 + speed_per_tick as i64 - 1)
+                    / speed_per_tick as i64)
+                    .clamp(1, u16::MAX as i64) as u16;
+                let range_permille =
+                    ((distance as i64 * 1000) / (weapon.reach.max(1) as i64)).clamp(0, 1000) as u32;
+                self.pending_shots.push(PendingShot {
+                    attacker: i as SoldierId,
+                    target: self.targets[i],
+                    aim_point,
+                    remaining_ticks: travel_ticks,
+                    weapon,
+                    attacker_skill: attacker_attrs.skill,
+                    attacker_strength: attacker_attrs.strength,
+                    range_permille,
+                });
+                continue;
+            }
 
             let defender = self.targets[i] as usize;
             self.stats.attacks = self.stats.attacks.saturating_add(1);
-            let attacker_attrs = soldiers.attrs[i];
             let defender_attrs = soldiers.attrs[defender];
             let flank_bonus = flank_bonus(
                 soldiers.hot.facing[defender],
@@ -401,7 +618,7 @@ impl CombatSystem {
                 soldiers.pos(i),
             );
             let attack_roll = injury_skill(attacker_attrs.skill, soldiers.hp[i])
-                + self.weapons[i].accuracy as i32
+                + weapon.accuracy as i32
                 - (soldiers.fatigue[i] as i32 * 40 / 100)
                 + flank_bonus
                 + Rng::stream(world_seed, i as u32, Purpose::HitRoll, tick).range(-30, 31);
@@ -417,12 +634,6 @@ impl CombatSystem {
                 }
                 + Rng::stream(world_seed, defender as u32, Purpose::HitRoll, tick).range(-30, 31);
 
-            self.attack_timer[i] = swing_ticks(
-                self.weapons[i],
-                attacker_attrs,
-                soldiers.fatigue[i],
-                soldiers.hot.state[i],
-            );
             if attack_roll <= defense_roll {
                 continue;
             }
@@ -431,7 +642,7 @@ impl CombatSystem {
             let mut location_rng = Rng::stream(world_seed, i as u32, Purpose::HitLocation, tick);
             let location = hit_location(&mut location_rng);
             let amount = damage_amount(
-                self.weapons[i],
+                weapon,
                 attacker_attrs,
                 self.armors[defender],
                 location,
@@ -440,27 +651,129 @@ impl CombatSystem {
             );
             let mut damage_rng = Rng::stream(world_seed, i as u32, Purpose::DamageRoll, tick);
             let instant_death = location == HitLocation::Head
-                && matches!(
-                    self.weapons[i].damage_type,
-                    DamageType::Pierce | DamageType::Blunt
-                )
+                && matches!(weapon.damage_type, DamageType::Pierce | DamageType::Blunt)
                 && amount >= 20
                 && damage_rng.chance_permille(80 + (amount as u32).min(120));
+            let cause = if self.phase == BattlePhase::Pursuit {
+                DeathCause::Pursuit
+            } else {
+                DeathCause::Melee
+            };
+            self.push_event(CombatEvent {
+                tick,
+                attacker: i as SoldierId,
+                defender: self.targets[i],
+                kind: CombatEventKind::Hit,
+                cause,
+            });
             self.intents.push(DamageIntent {
                 attacker: i as SoldierId,
                 defender: self.targets[i],
                 amount,
                 location,
                 instant_death,
+                cause,
             });
         }
 
+        self.resolve_pending_shots(world_seed, tick, soldiers, hash);
+
         for index in 0..self.intents.len() {
             let intent = self.intents[index];
-            self.apply_damage(intent, soldiers);
+            self.apply_damage(intent, soldiers, tick);
         }
         self.intents.clear();
         self.update_morale(world_seed, tick, soldiers, hash);
+    }
+
+    /// 飛翔中の矢・ボルトを進め、着弾したものを解決する。着弾点付近に実際に
+    /// 立っている兵士（味方も含む）から命中相手を選ぶことで、面積命中と
+    /// 味方誤射を同じ仕組みで表現する（仕様 12 章 M4「射撃」）。
+    fn resolve_pending_shots(
+        &mut self,
+        world_seed: u64,
+        tick: u32,
+        soldiers: &mut Soldiers,
+        hash: &SpatialHash,
+    ) {
+        let mut index = 0;
+        while index < self.pending_shots.len() {
+            if self.pending_shots[index].remaining_ticks > 0 {
+                self.pending_shots[index].remaining_ticks -= 1;
+                index += 1;
+                continue;
+            }
+            let shot = self.pending_shots.swap_remove(index);
+
+            let mut buf = [0u32; MAX_NEIGHBORS];
+            let count = hash.query_neighbors(shot.aim_point.x, shot.aim_point.y, &mut buf);
+            let mut candidates: Vec<(i64, u32)> = buf[..count]
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    id != shot.attacker
+                        && soldiers
+                            .index_if_present(id)
+                            .is_some_and(|j| is_targetable(soldiers.hot.state[j]))
+                })
+                .map(|id| (dist_sq(shot.aim_point, soldiers.pos(id as usize)), id))
+                .collect();
+            candidates.sort_unstable_by_key(|&(d, id)| (d, id));
+
+            let base_accuracy =
+                injury_skill(shot.attacker_skill, MAX_HP) + shot.weapon.accuracy as i32;
+            let range_penalty = shot.range_permille as i32 / 4;
+            let hit_chance = (500 + base_accuracy * 4 - range_penalty).clamp(50, 950) as u32;
+            let mut rng = Rng::stream(world_seed, shot.attacker, Purpose::ArrowSpread, tick);
+            if candidates.is_empty() || !rng.chance_permille(hit_chance) {
+                continue;
+            }
+            let hit_id = candidates
+                .iter()
+                .find(|&&(_, id)| id == shot.target)
+                .map(|&(_, id)| id)
+                .unwrap_or(candidates[0].1);
+            let hit_idx = hit_id as usize;
+
+            let location = hit_location(&mut rng);
+            let synth_attrs = Attrs::new(0, 0, 0, shot.attacker_strength, 0, 0, 0, 0, 0, 0, 0, 0);
+            let mut amount = damage_amount(
+                shot.weapon,
+                synth_attrs,
+                self.armors[hit_idx],
+                location,
+                0,
+                false,
+            ) as i32;
+            // 装甲貫通の距離減衰: 最大射程付近では威力が 6 割まで落ちる。
+            let falloff = (1000 - shot.range_permille as i32 * 400 / 1000).max(400);
+            amount = (amount * falloff / 1000).max(1);
+            let amount = amount as u16;
+
+            let attacker_faction = soldiers.faction.get(shot.attacker as usize).copied();
+            let is_friendly = attacker_faction.is_some_and(|f| f == soldiers.faction[hit_idx]);
+            if is_friendly {
+                self.stats.friendly_fire_hits = self.stats.friendly_fire_hits.saturating_add(1);
+            }
+            self.stats.hits = self.stats.hits.saturating_add(1);
+            self.push_event(CombatEvent {
+                tick,
+                attacker: shot.attacker,
+                defender: hit_id,
+                kind: CombatEventKind::Hit,
+                cause: DeathCause::Missile,
+            });
+            self.stats.damage = self.stats.damage.saturating_add(amount as u32);
+            self.apply_raw_damage(
+                hit_id,
+                amount,
+                soldiers,
+                Some(shot.attacker),
+                false,
+                DeathCause::Missile,
+                tick,
+            );
+        }
     }
 
     fn apply_bleeding(&mut self, tick: u32, soldiers: &mut Soldiers) {
@@ -478,12 +791,20 @@ impl CombatSystem {
                 _ => 0,
             };
             if amount != 0 {
-                self.apply_raw_damage(i as SoldierId, amount, soldiers, None, false);
+                self.apply_raw_damage(
+                    i as SoldierId,
+                    amount,
+                    soldiers,
+                    None,
+                    false,
+                    DeathCause::Bleed,
+                    tick,
+                );
             }
         }
     }
 
-    fn apply_damage(&mut self, intent: DamageIntent, soldiers: &mut Soldiers) {
+    fn apply_damage(&mut self, intent: DamageIntent, soldiers: &mut Soldiers, tick: u32) {
         self.stats.damage = self.stats.damage.saturating_add(intent.amount as u32);
         self.apply_raw_damage(
             intent.defender,
@@ -491,10 +812,45 @@ impl CombatSystem {
             soldiers,
             Some(intent.attacker),
             intent.instant_death,
+            intent.cause,
+            tick,
         );
         let _ = intent.location;
     }
 
+    /// 圧迫（crush）による負傷を適用する。密集しすぎた集団の中で押し潰される
+    /// 兵士を表す。`pressure_permille` は押し戻し量から呼び出し側が計算する
+    /// 圧力の目安で、閾値（[`CRUSH_THRESHOLD_PERMILLE`]）を超えた分だけが実害になる
+    /// （仕様 12 章 M4「圧迫」、`lib.rs::resolve_collisions` から呼ばれる）。
+    pub fn apply_crush(
+        &mut self,
+        id: SoldierId,
+        soldiers: &mut Soldiers,
+        pressure_permille: u32,
+        world_seed: u64,
+        tick: u32,
+    ) {
+        let i = id as usize;
+        if i >= soldiers.len()
+            || !soldiers.is_alive(i)
+            || pressure_permille <= CRUSH_THRESHOLD_PERMILLE
+        {
+            return;
+        }
+        let excess = pressure_permille - CRUSH_THRESHOLD_PERMILLE;
+        let mut rng = Rng::stream(world_seed, id, Purpose::Crush, tick);
+        if !rng.chance_permille((excess / 3).min(1000)) {
+            return;
+        }
+        let amount = (excess / 60).clamp(1, 15) as u16;
+        self.stats.damage = self.stats.damage.saturating_add(amount as u32);
+        self.apply_raw_damage(id, amount, soldiers, None, false, DeathCause::Crush, tick);
+        soldiers.fatigue[i] = soldiers.fatigue[i]
+            .saturating_add((excess / 2) as u16)
+            .min(MAX_FATIGUE);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn apply_raw_damage(
         &mut self,
         defender: SoldierId,
@@ -502,6 +858,8 @@ impl CombatSystem {
         soldiers: &mut Soldiers,
         attacker: Option<SoldierId>,
         instant_death: bool,
+        cause: DeathCause,
+        tick: u32,
     ) {
         let i = defender as usize;
         if i >= soldiers.len() || soldiers.hot.state[i] == State::Dead {
@@ -529,9 +887,35 @@ impl CombatSystem {
             InjuryStage::Dead => {
                 if before != InjuryStage::Dead {
                     self.stats.kills = self.stats.kills.saturating_add(1);
-                    if self.phase == BattlePhase::Pursuit || was_broken {
-                        self.stats.pursuit_kills = self.stats.pursuit_kills.saturating_add(1);
+                    let effective_cause = if self.phase == BattlePhase::Pursuit || was_broken {
+                        DeathCause::Pursuit
+                    } else {
+                        cause
+                    };
+                    match effective_cause {
+                        DeathCause::Melee => {
+                            self.stats.melee_kills = self.stats.melee_kills.saturating_add(1)
+                        }
+                        DeathCause::Missile => {
+                            self.stats.missile_kills = self.stats.missile_kills.saturating_add(1)
+                        }
+                        DeathCause::Crush => {
+                            self.stats.crush_kills = self.stats.crush_kills.saturating_add(1)
+                        }
+                        DeathCause::Bleed => {
+                            self.stats.bleed_kills = self.stats.bleed_kills.saturating_add(1)
+                        }
+                        DeathCause::Pursuit => {
+                            self.stats.pursuit_kills = self.stats.pursuit_kills.saturating_add(1)
+                        }
                     }
+                    self.push_event(CombatEvent {
+                        tick,
+                        attacker: attacker.unwrap_or(NO_ID),
+                        defender,
+                        kind: CombatEventKind::Killed,
+                        cause: effective_cause,
+                    });
                 }
                 soldiers.hot.state[i] = State::Dead;
                 soldiers.target[i] = NO_ID;
@@ -539,6 +923,13 @@ impl CombatSystem {
             InjuryStage::Downed => {
                 if soldiers.hot.state[i] != State::Downed {
                     self.stats.downed = self.stats.downed.saturating_add(1);
+                    self.push_event(CombatEvent {
+                        tick,
+                        attacker: attacker.unwrap_or(NO_ID),
+                        defender,
+                        kind: CombatEventKind::Downed,
+                        cause,
+                    });
                 }
                 soldiers.hot.state[i] = State::Downed;
                 soldiers.target[i] = NO_ID;
@@ -650,6 +1041,13 @@ impl CombatSystem {
                     if self.rally_ticks[i] == 0 {
                         soldiers.hot.state[i] = State::Wavering;
                         soldiers.morale[i] = soldiers.morale[i].max(300);
+                        self.push_event(CombatEvent {
+                            tick,
+                            attacker: NO_ID,
+                            defender: i as SoldierId,
+                            kind: CombatEventKind::Rallied,
+                            cause: DeathCause::Melee,
+                        });
                     }
                 }
                 _ if self.morale_pressure[i] != 0 && soldiers.morale[i] <= 250 => {
@@ -661,6 +1059,13 @@ impl CombatSystem {
                         soldiers.hot.state[i] = State::Broken;
                         self.broken_ticks[i] = 0;
                         soldiers.target[i] = NO_ID;
+                        self.push_event(CombatEvent {
+                            tick,
+                            attacker: NO_ID,
+                            defender: i as SoldierId,
+                            kind: CombatEventKind::Broken,
+                            cause: DeathCause::Melee,
+                        });
                     }
                 }
                 _ if self.morale_pressure[i] != 0 && soldiers.morale[i] <= 400 => {
@@ -767,6 +1172,14 @@ impl CombatSystem {
         mix(self.stats.damage as u64);
         mix(self.stats.kills as u64);
         mix(self.stats.downed as u64);
+        mix(self.stats.melee_kills as u64);
+        mix(self.stats.missile_kills as u64);
+        mix(self.stats.crush_kills as u64);
+        mix(self.stats.bleed_kills as u64);
+        mix(self.stats.pursuit_kills as u64);
+        mix(self.stats.shots_fired as u64);
+        mix(self.stats.friendly_fire_hits as u64);
+        mix(self.pending_shots.len() as u64);
         for i in 0..self.weapons.len() {
             let weapon = self.weapons[i];
             let armor = self.armors[i];
@@ -776,6 +1189,7 @@ impl CombatSystem {
             mix(weapon.power as u64);
             mix(weapon.damage_type as u64);
             mix(u64::from(weapon.requires_front_row));
+            mix(u64::from(weapon.ranged));
             mix(armor.class as u64);
             mix(armor.head as u64);
             mix(armor.torso as u64);
@@ -787,11 +1201,129 @@ impl CombatSystem {
             mix(self.attack_timer[i] as u64);
             mix(self.broken_ticks[i] as u64);
             mix(self.rally_ticks[i] as u64);
+            mix(self.ammo[i] as u64);
             if let Some(&target) = self.targets.get(i) {
                 mix(target as u64);
             }
         }
         h
+    }
+}
+
+/// 射撃の標的探索専用の粗い空間ハッシュ。`spatial::SpatialHash` と同じ
+/// カウントソート方式だが、セルサイズを弓の射程に合わせて大きく取る。
+/// 生存兵全員を毎 tick 索引し直すが、O(n) のカウントソートなので
+/// 既存の `SpatialHash::rebuild` と同じ計算量に収まる。
+struct CoarseIndex {
+    cell_m: i32,
+    origin_x: i32,
+    origin_y: i32,
+    cols: i32,
+    rows: i32,
+    cell_start: Vec<u32>,
+    entries: Vec<u32>,
+}
+
+impl CoarseIndex {
+    fn build(cell_m: i32, soldiers: &Soldiers) -> Self {
+        let n = soldiers.len();
+        let (mut min_x, mut min_y) = (Fx::MAX, Fx::MAX);
+        let (mut max_x, mut max_y) = (Fx::MIN, Fx::MIN);
+        let mut any = false;
+        for i in 0..n {
+            if !soldiers.is_alive(i) {
+                continue;
+            }
+            any = true;
+            min_x = min_x.min(soldiers.hot.pos_x[i]);
+            min_y = min_y.min(soldiers.hot.pos_y[i]);
+            max_x = max_x.max(soldiers.hot.pos_x[i]);
+            max_y = max_y.max(soldiers.hot.pos_y[i]);
+        }
+        if !any {
+            return CoarseIndex {
+                cell_m,
+                origin_x: 0,
+                origin_y: 0,
+                cols: 0,
+                rows: 0,
+                cell_start: Vec::new(),
+                entries: Vec::new(),
+            };
+        }
+        let origin_x = fx_floor_int(min_x).div_euclid(cell_m) - 1;
+        let origin_y = fx_floor_int(min_y).div_euclid(cell_m) - 1;
+        let cols = fx_floor_int(max_x).div_euclid(cell_m) + 1 - origin_x + 1;
+        let rows = fx_floor_int(max_y).div_euclid(cell_m) + 1 - origin_y + 1;
+        let cells = (cols as usize) * (rows as usize);
+
+        let mut counts = vec![0u32; cells];
+        let cell_of = |x: Fx, y: Fx| -> usize {
+            let cx = (fx_floor_int(x).div_euclid(cell_m) - origin_x).clamp(0, cols - 1);
+            let cy = (fx_floor_int(y).div_euclid(cell_m) - origin_y).clamp(0, rows - 1);
+            (cy as usize) * (cols as usize) + (cx as usize)
+        };
+        for i in 0..n {
+            if soldiers.is_alive(i) {
+                counts[cell_of(soldiers.hot.pos_x[i], soldiers.hot.pos_y[i])] += 1;
+            }
+        }
+        let mut cell_start = vec![0u32; cells + 1];
+        let mut acc = 0u32;
+        for c in 0..cells {
+            cell_start[c] = acc;
+            acc += counts[c];
+        }
+        cell_start[cells] = acc;
+        let mut entries = vec![0u32; acc as usize];
+        let mut cursor = cell_start.clone();
+        for i in 0..n {
+            if soldiers.is_alive(i) {
+                let c = cell_of(soldiers.hot.pos_x[i], soldiers.hot.pos_y[i]);
+                entries[cursor[c] as usize] = i as u32;
+                cursor[c] += 1;
+            }
+        }
+        CoarseIndex {
+            cell_m,
+            origin_x,
+            origin_y,
+            cols,
+            rows,
+            cell_start,
+            entries,
+        }
+    }
+
+    fn query(&self, x: Fx, y: Fx, out: &mut [u32; MAX_NEIGHBORS]) -> usize {
+        if self.cols == 0 {
+            return 0;
+        }
+        let cx = (fx_floor_int(x).div_euclid(self.cell_m) - self.origin_x).clamp(0, self.cols - 1);
+        let cy = (fx_floor_int(y).div_euclid(self.cell_m) - self.origin_y).clamp(0, self.rows - 1);
+        let mut count = 0;
+        for dy in -1..=1i32 {
+            let ny = cy + dy;
+            if ny < 0 || ny >= self.rows {
+                continue;
+            }
+            for dx in -1..=1i32 {
+                let nx = cx + dx;
+                if nx < 0 || nx >= self.cols {
+                    continue;
+                }
+                let c = (ny as usize) * (self.cols as usize) + (nx as usize);
+                let (start, end) = (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
+                for &id in &self.entries[start..end] {
+                    if count >= MAX_NEIGHBORS {
+                        return count;
+                    }
+                    out[count] = id;
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 }
 
@@ -993,12 +1525,12 @@ mod tests {
         soldiers.push(0, 0, 0, 0, 0, attrs(200, 200), 0);
         let mut combat = CombatSystem::default();
         combat.ensure_len(1);
-        combat.apply_raw_damage(0, 59, &mut soldiers, None, false);
+        combat.apply_raw_damage(0, 59, &mut soldiers, None, false, DeathCause::Melee, 0);
         assert_eq!(InjuryStage::from_hp(soldiers.hp[0]), InjuryStage::Medium);
         assert_eq!(InjuryStage::from_hp(30), InjuryStage::Heavy);
-        combat.apply_raw_damage(0, 30, &mut soldiers, None, false);
+        combat.apply_raw_damage(0, 30, &mut soldiers, None, false, DeathCause::Melee, 0);
         assert_eq!(soldiers.hot.state[0], State::Downed);
-        combat.apply_raw_damage(0, 20, &mut soldiers, None, false);
+        combat.apply_raw_damage(0, 20, &mut soldiers, None, false, DeathCause::Melee, 0);
         assert_eq!(soldiers.hot.state[0], State::Dead);
     }
 
@@ -1043,5 +1575,64 @@ mod tests {
             values
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn ranged_weapon_hits_a_distant_target_and_consumes_ammo() {
+        let mut soldiers = Soldiers::default();
+        // 近接用の空間ハッシュ（3x3 セル = 6 m）では届かない距離に離す。
+        soldiers.push(fx(10), fx(10), brad_from_deg(90), 0, 0, attrs(200, 200), 0);
+        soldiers.push(fx(10), fx(70), brad_from_deg(270), 0, 1, attrs(20, 20), 0);
+        let mut hash = SpatialHash::default();
+        let mut combat = CombatSystem::default();
+        combat.ensure_len(soldiers.len());
+        combat.set_loadout(0, Weapon::longbow(), Armor::cloth());
+        let start_ammo = combat.ammo[0];
+        let start_hp = soldiers.hp[1];
+
+        for tick in 0..400 {
+            hash.rebuild(&soldiers);
+            combat.tick(123, tick, &mut soldiers, &hash);
+            if combat.ammo[0] < start_ammo {
+                break;
+            }
+        }
+        assert!(combat.ammo[0] < start_ammo, "矢が発射されていない");
+        assert!(combat.stats.shots_fired >= 1);
+
+        for tick in 400..2000 {
+            hash.rebuild(&soldiers);
+            combat.tick(123, tick, &mut soldiers, &hash);
+            if soldiers.hp[1] < start_hp {
+                break;
+            }
+        }
+        assert!(
+            soldiers.hp[1] < start_hp || combat.stats.shots_fired > 1,
+            "矢が着弾も再発射もしていない"
+        );
+    }
+
+    #[test]
+    fn crush_only_hurts_above_the_pressure_threshold() {
+        let mut soldiers = Soldiers::default();
+        soldiers.push(0, 0, 0, 0, 0, attrs(120, 120), 0);
+        let mut combat = CombatSystem::default();
+        combat.ensure_len(1);
+
+        let hp_before = soldiers.hp[0];
+        combat.apply_crush(0, &mut soldiers, CRUSH_THRESHOLD_PERMILLE, 1, 0);
+        assert_eq!(
+            soldiers.hp[0], hp_before,
+            "閾値以下では被害が出てはいけない"
+        );
+
+        let fatigue_before = soldiers.fatigue[0];
+        // 閾値超過分が大きいほど確実に被害が出るよう、十分大きい圧力で試す。
+        combat.apply_crush(0, &mut soldiers, 5000, 1, 0);
+        assert!(
+            soldiers.hp[0] < hp_before || soldiers.fatigue[0] > fatigue_before,
+            "強い圧迫なのに被害も疲労増加もない"
+        );
     }
 }
