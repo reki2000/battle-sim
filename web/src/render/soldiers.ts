@@ -35,6 +35,17 @@ const INSTANCE_STRIDE = 16;
  * 「描画の最適化（視錐台カリング、L3/L4 の間引き）」）。目標値は品質
  * プリセット（`quality.ts`）で変わる。
  */
+/**
+ * スプライトを選ぶときの「姿勢」。
+ *
+ * 転倒中の兵士は倒れているので、`Downed` の寝姿を借りる。状態そのものは
+ * `Engaged` などのまま（シミュレーションでは生きて戦っている）なので、
+ * 絵の選択だけを差し替える。
+ */
+function poseState(snap: SnapshotView, i: number): SoldierState {
+  return snap.isStumbling(i) ? SoldierState.Downed : snap.state(i);
+}
+
 function thinningStride(n: number, lod: Lod): number {
   if (lod < Lod.Battle) return 1;
   return Math.max(1, Math.floor(n / getQuality().thinTargetInstances));
@@ -102,6 +113,8 @@ out vec4 outColor;
 void main() {
   uint faction = (v_packed >> 20u) & 15u;
   uint state = (v_packed >> 24u) & 255u;
+  bool fallen = ((v_packed >> 16u) & 1u) == 1u;
+  bool braced = ((v_packed >> 17u) & 1u) == 1u;
   vec4 factionColor = faction == 1u ? u_faction1 : u_faction0;
 
   // L2/L3/L4 は小さなクアッド／点に落とす。状態は色の明度に反映し、
@@ -110,6 +123,13 @@ void main() {
   if (state == 8u || state == 9u) dotColor = mix(dotColor, vec3(0.92, 0.48, 0.20), 0.35);
   if (state == 10u) dotColor = mix(dotColor, vec3(0.35, 0.86, 0.52), 0.28);
   float dotAlpha = 0.96;
+  if (fallen) {
+    // 転倒中は横倒しだが生きている。死体（下）より明るく残す
+    float edge = smoothstep(0.0, 0.18, v_uv.y) * smoothstep(1.0, 0.82, v_uv.y);
+    dotColor = mix(factionColor.rgb, vec3(0.95, 0.75, 0.35), 0.30);
+    dotAlpha = 0.90 * edge;
+  }
+  if (braced) dotColor = mix(dotColor, vec3(0.72, 0.84, 1.00), 0.30);
   if (state >= 12u) {
     // 遠距離では Downed / Dead を横倒しの暗い個体として残す。近距離では
     // manifest の dead 静止バリエーションへ滑らかにクロスフェードする。
@@ -134,6 +154,10 @@ void main() {
   // パレット置換でも、このインスタンス属性と描画経路はそのまま使える。
   if (faction == 1u) sprite.rgb = mix(sprite.rgb, factionColor.rgb, 0.28);
   if (state >= 12u) sprite.rgb *= 0.62;
+  // 転倒中は倒れた絵のまま、死体より明るく（まだ生きている）
+  if (fallen) sprite.rgb = mix(sprite.rgb * 0.88, vec3(0.95, 0.75, 0.35), 0.12);
+  // 受け止める姿勢は盾のきらめきとして薄く乗せる
+  if (braced) sprite.rgb = mix(sprite.rgb, vec3(0.80, 0.88, 1.00), 0.14);
 
   // 隣接 LOD 間はクロスフェード帯（px/m で ±15%）を設け、両方を描いて
   // アルファでブレンドする（仕様 08 章 2.3 節）。
@@ -412,7 +436,9 @@ export class SoldierRenderer {
       if (!useSprites) {
         fallbackGroup().indices.push(i);
       } else {
-        const resolved = this.spriteRuntime?.resolve(snap.troopType(i), snap.state(i));
+        // 転倒中は「倒れている」姿勢のスプライトを使う。死体と同じ絵だが、
+        // シェーダ側で明度を分けて区別する（死体より明るい）。
+        const resolved = this.spriteRuntime?.resolve(snap.troopType(i), poseState(snap, i));
         const texture = resolved ? this.v2Textures.get(resolved.sheet.url) : undefined;
         if (!resolved || !texture) {
           fallbackGroup().indices.push(i);
@@ -475,7 +501,7 @@ export class SoldierRenderer {
         let direction = 0;
         let frame = 0;
         const resolved = group.columns === 8
-          ? this.spriteRuntime?.resolve(snap.troopType(i), snap.state(i))
+          ? this.spriteRuntime?.resolve(snap.troopType(i), poseState(snap, i))
           : null;
         if (resolved) {
           direction = Math.round((snap.facing(i) / 65536) * 8) & 7;
@@ -493,7 +519,10 @@ export class SoldierRenderer {
         }
         const faction = snap.faction(i) & 0x0f;
         const state = snap.state(i) & 0xff;
-        const packed = direction | (frame << 8) | (faction << 20) | (state << 24);
+        const fallen = snap.isStumbling(i) ? 1 : 0;
+        const braced = snap.isBraced(i) ? 1 : 0;
+        const packed = direction | (frame << 8) | (fallen << 16) | (braced << 17) |
+          (faction << 20) | (state << 24);
         data.setUint32(offset + 12, packed >>> 0, true);
       }
       gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -536,6 +565,14 @@ export class SoldierRenderer {
       ctx.fillStyle = state === SoldierState.Dead || state === SoldierState.Downed
         ? "rgba(60,40,40,0.65)"
         : FACTION_COLORS[faction]!;
+      if (snap.isStumbling(i)) {
+        // 転倒中は横倒しの平たい矩形にする（倒れているのが一目で分かる）
+        const w = Math.max(2, 1.4 * pxPerM);
+        const h = Math.max(1, 0.4 * pxPerM);
+        ctx.fillRect(p.sx - w / 2, p.sy - h, w, h);
+        drawn++;
+        continue;
+      }
       const h = cam.lod <= Lod.Tactical ? Math.max(2, 1.7 * pxPerM) : size;
       ctx.fillRect(p.sx - size / 2, p.sy - h, size, h);
       drawn++;

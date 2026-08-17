@@ -88,6 +88,24 @@ const BACKOFF_REAR_CLEARANCE_MM: i32 = 1_400;
 /// 助走を打ち切るまでの時間（tick）。
 const RUNUP_TICKS: u32 = 60;
 
+/// 助走を止めるかどうかを判定し始める距離（mm）。接触の一歩手前。
+const FALTER_DISTANCE_MM: i32 = 4_000;
+/// 失速判定の基準値（‰）。
+const FALTER_BASE_PERMILLE: i32 = 140;
+/// 正面で踏ん張っている敵 1 人あたりの失速の増分（‰）。
+const FALTER_PER_BRACED_ENEMY: i32 = 90;
+/// 一緒に走っている味方 1 人あたりの失速の減分（‰）。一人で突っ込むのは怖い。
+const FALTER_PER_RUNNING_FRIEND: i32 = 60;
+/// 失速したあと足が止まっている時間（tick）。
+const FALTER_HOLD_TICKS: u32 = 40;
+/// 失速したときの士気ダメージ。
+const FALTER_MORALE_LOSS: u16 = 20;
+
+/// 突撃してくる敵を「受け止める姿勢」に入る距離（mm）。
+const BRACE_DISTANCE_MM: i32 = 4_000;
+/// 受け止める姿勢で受けたときに残る衝撃（‰）。盾で受け流す分だけ減る。
+const BRACED_IMPACT_PERMILLE: i32 = 550;
+
 /// 下がる判断に必要な最低士気と、それを許す疲労の上限。
 const BACKOFF_MIN_MORALE: u16 = 400;
 const BACKOFF_MAX_FATIGUE: u16 = 5_000;
@@ -119,6 +137,10 @@ pub struct ChargeStats {
     pub backoffs: u32,
     /// 走り込みを始めた回数
     pub runups: u32,
+    /// 接触の手前で足が止まった（失速した）回数
+    pub falters: u32,
+    /// 突撃を受け止める姿勢に入った回数
+    pub braces: u32,
 }
 
 /// 徒歩兵の助走・転倒に関する per-soldier 状態。index は `SoldierId`。
@@ -140,6 +162,10 @@ pub struct ChargeSystem {
     next_decision: Vec<u32>,
     /// 前 tick に味方と深く接触していたか（ぶつかった瞬間だけ転倒判定するため）
     in_contact: Vec<bool>,
+    /// 失速して足が止まっているあいだの、再開できるティック
+    hesitate_until: Vec<u32>,
+    /// この助走で失速判定を済ませたか（1 回の突撃につき 1 回だけ引く）
+    falter_checked: Vec<bool>,
     pub stats: ChargeStats,
 }
 
@@ -154,6 +180,8 @@ impl ChargeSystem {
         self.focus_y.push(0);
         self.next_decision.push(0);
         self.in_contact.push(false);
+        self.hesitate_until.push(0);
+        self.falter_checked.push(false);
     }
 
     fn ensure_len(&mut self, len: usize) {
@@ -175,6 +203,24 @@ impl ChargeSystem {
     #[inline]
     pub fn is_stumbling(&self, id: SoldierId) -> bool {
         self.stumble_ticks.get(id as usize).copied().unwrap_or(0) > 0
+    }
+
+    /// 助走で敵へ詰めている最中か。
+    ///
+    /// この間は白兵戦の間合い（[`crate::World::apply_melee_standoff`]）を
+    /// 無視して体ごとぶつかりに行く。助走の途中で「間合いを保つ」に切り替わって
+    /// しまうと、勢いのある兵士が接触の手前で止まり、衝撃が永遠に入らない。
+    #[inline]
+    pub fn is_closing(&self, id: SoldierId) -> bool {
+        self.micro(id) == Micro::RunUp || self.momentum_permille(id) >= IMPACT_MIN_PERMILLE
+    }
+
+    /// 接触の手前で足が止まっているか（突撃が寸前で失速した状態）。
+    #[inline]
+    pub fn is_hesitating(&self, id: SoldierId, tick: u32) -> bool {
+        self.hesitate_until
+            .get(id as usize)
+            .is_some_and(|&until| tick < until)
     }
 
     /// 選んでいる微視的行動。
@@ -242,6 +288,10 @@ impl ChargeSystem {
                 }
             }
 
+            // 受け止める姿勢は「突撃が来ているあいだだけ」。毎 tick 落とし、
+            // 突撃してくる兵士の前方走査（下）が張り直す。
+            soldiers.hot.flags[i] &= !flags::BRACED;
+
             let mounted = soldiers.hot.flags[i] & flags::MOUNTED != 0;
             if !soldiers.is_alive(i) || mounted {
                 // 騎乗兵のモメンタムは `cavalry` が持つ
@@ -252,6 +302,7 @@ impl ChargeSystem {
             if soldiers.hot.state[i] != State::Charging {
                 self.momentum_permille[i] = 0;
                 self.run_mm[i] = 0;
+                self.falter_checked[i] = false;
                 continue;
             }
 
@@ -271,17 +322,26 @@ impl ChargeSystem {
                 .max(300);
             self.momentum_permille[i] = ((raw_permille * fatigue_cap) / 1000).min(1000) as u16;
 
-            if self.momentum_permille[i] < IMPACT_MIN_PERMILLE {
+            // 前方を見る必要があるのは「勢いが乗って衝撃を起こしうる」か
+            // 「まだ失速判定を引いていない」ときだけ。勢いのないまま走り続けて
+            // いる兵士のために毎 tick 近傍を引くと、白兵戦の相手探しをもう一度
+            // やるのと同じ重さになる。
+            if self.momentum_permille[i] < IMPACT_MIN_PERMILLE && self.falter_checked[i] {
                 continue;
             }
 
-            // 前方の敵に接触したか
+            // 前方の敵を見る。接触したか、その手前で足が止まるか、そして
+            // 突っ込まれる側が身構えるかをここで決める。
             let pos = soldiers.pos(i);
             let count =
                 hash.query_enemies(soldiers, pos.x, pos.y, soldiers.faction[i], &mut neighbors);
             let contact_r = soldiers.radius(i) + fx_from_mm(CONTACT_RANGE_MM);
             let half_arc = sim_math::brad_from_deg(50) as u32;
-            let mut nearest: Option<(i64, usize)> = None;
+            let falter_r = fx_from_mm(FALTER_DISTANCE_MM) as i64;
+            let brace_r = fx_from_mm(BRACE_DISTANCE_MM) as i64;
+            let mut nearest_contact: Option<(i64, usize)> = None;
+            let mut nearest_ahead: Option<i64> = None;
+            let mut braced_ahead = 0i32;
             for &jid in &neighbors[..count] {
                 let j = jid as usize;
                 if !soldiers.is_alive(j) {
@@ -292,18 +352,121 @@ impl ChargeSystem {
                     continue;
                 }
                 let d2 = dist_sq(pos, jp);
-                if d2 <= ((contact_r + soldiers.radius(j)) as i64).pow(2)
-                    && nearest.map_or(true, |(best, _)| d2 < best)
+                if d2 <= brace_r * brace_r {
+                    // 突撃が来ていると気づいた敵は、受け止める姿勢に入る
+                    if self.decide_brace(world_seed, tick, j, i, soldiers) {
+                        braced_ahead += 1;
+                    }
+                }
+                if d2 <= falter_r * falter_r
+                    && nearest_ahead.map_or(true, |best| d2 < best)
+                    && !matches!(soldiers.hot.state[j], State::Broken | State::Downed)
                 {
-                    nearest = Some((d2, j));
+                    nearest_ahead = Some(d2);
+                }
+                if d2 <= ((contact_r + soldiers.radius(j)) as i64).pow(2)
+                    && nearest_contact.map_or(true, |(best, _)| d2 < best)
+                {
+                    nearest_contact = Some((d2, j));
                 }
             }
-            let Some((_, target)) = nearest else {
+
+            // 突撃が寸前で失速する。中世会戦では、接触まで走りきる突撃より
+            // 手前で足が止まる突撃の方が多かった（仕様 06 章 3.7 節）。
+            if nearest_ahead.is_some() && !self.falter_checked[i] {
+                self.falter_checked[i] = true;
+                let running_friends = count_running_friends(i, pos, soldiers, hash);
+                let mut falter = FALTER_BASE_PERMILLE;
+                falter += braced_ahead.min(4) * FALTER_PER_BRACED_ENEMY;
+                falter -= running_friends.min(6) * FALTER_PER_RUNNING_FRIEND;
+                falter -= soldiers.attrs[i].bravery as i32 / 3;
+                falter -= (soldiers.morale[i] as i32 - 500) / 8;
+                let mut rng = Rng::stream(world_seed, i as u32, Purpose::ChargeDecision, tick);
+                if rng.chance_permille(falter.clamp(0, 900) as u32) {
+                    self.falter(i, tick, soldiers);
+                    continue;
+                }
+            }
+
+            if self.momentum_permille[i] < IMPACT_MIN_PERMILLE {
+                continue;
+            }
+            let Some((_, target)) = nearest_contact else {
                 continue;
             };
 
             self.resolve_impact(world_seed, tick, i, target, soldiers, combat, map_limit);
         }
+    }
+
+    /// 突撃を受ける側が、盾を構えて足を止めるかどうかを決める。
+    ///
+    /// 判定は 1 秒ごとに引き直す（毎 tick 引くと構えたり解いたりを繰り返す）。
+    /// 規律の高い兵士は踏みとどまり、そうでない兵士は身をかわそうとする。
+    fn decide_brace(
+        &mut self,
+        world_seed: u64,
+        tick: u32,
+        defender: usize,
+        charger: usize,
+        soldiers: &mut Soldiers,
+    ) -> bool {
+        if !soldiers.is_alive(defender)
+            || soldiers.is_stumbling(defender)
+            || soldiers.hot.flags[defender] & flags::MOUNTED != 0
+            || matches!(
+                soldiers.hot.state[defender],
+                State::Broken | State::Rallying | State::Charging
+            )
+        {
+            return false;
+        }
+        // 突撃してくる相手を見ていなければ身構えられない
+        if !within_arc(
+            soldiers.hot.facing[defender],
+            soldiers.pos(defender),
+            soldiers.pos(charger),
+            sim_math::brad_from_deg(60) as u32,
+        ) {
+            return false;
+        }
+        if soldiers.is_braced(defender) {
+            return true;
+        }
+        let attrs = soldiers.attrs[defender];
+        let chance =
+            (400 + attrs.discipline as i32 * 2 + attrs.bravery as i32 - 200).clamp(50, 950);
+        let mut rng = Rng::stream(
+            world_seed,
+            defender as u32,
+            Purpose::ChargeDecision,
+            tick / sim_math::TICK_HZ,
+        );
+        if rng.chance_permille(chance as u32) {
+            soldiers.hot.flags[defender] |= flags::BRACED;
+            soldiers.hot.vel_x[defender] = 0;
+            soldiers.hot.vel_y[defender] = 0;
+            self.stats.braces = self.stats.braces.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 接触の手前で足が止まる。助走は失われ、しばらく踏み出せない。
+    fn falter(&mut self, i: usize, tick: u32, soldiers: &mut Soldiers) {
+        self.momentum_permille[i] = 0;
+        self.run_mm[i] = 0;
+        self.micro[i] = Micro::None;
+        self.hesitate_until[i] = tick + FALTER_HOLD_TICKS;
+        self.next_decision[i] = tick + FALTER_HOLD_TICKS;
+        soldiers.hot.vel_x[i] = 0;
+        soldiers.hot.vel_y[i] = 0;
+        soldiers.morale[i] = soldiers.morale[i].saturating_sub(FALTER_MORALE_LOSS);
+        if soldiers.hot.state[i] == State::Charging {
+            soldiers.hot.state[i] = State::Advancing;
+        }
+        self.stats.falters = self.stats.falters.saturating_add(1);
     }
 
     /// 助走をつけた徒歩兵が敵に届いた瞬間の解決。
@@ -321,9 +484,10 @@ impl ChargeSystem {
         let m = self.momentum_permille[i] as i32;
         let pos = soldiers.pos(i);
 
-        // 相手が正面からこちらを見ていれば「踏ん張っている」。突っ込んだ側が
-        // 弾き返されるのはこの場合。
-        let braced = within_arc(
+        // 相手が盾を構えて足を止めていれば「踏ん張っている」。突っ込んだ側が
+        // 弾き返されるのはこの場合（[`Self::decide_brace`]）。姿勢に入って
+        // いなくても、正面からこちらを見ていれば多少は耐える。
+        let facing_me = within_arc(
             soldiers.hot.facing[target],
             soldiers.pos(target),
             pos,
@@ -332,7 +496,15 @@ impl ChargeSystem {
             soldiers.hot.state[target],
             State::Broken | State::Wavering | State::Downed
         );
+        let set_shield = soldiers.is_braced(target);
+        let braced = facing_me || set_shield;
 
+        // 受け止める姿勢は衝撃そのものを弱める（盾で受け流す）
+        let m = if set_shield {
+            m * BRACED_IMPACT_PERMILLE / 1000
+        } else {
+            m
+        };
         let damage = ((BASE_IMPACT_DAMAGE * m) / 1000).max(2) as u16;
         combat.apply_impact_damage(i as SoldierId, target as SoldierId, damage, soldiers, tick);
         self.stats.impacts = self.stats.impacts.saturating_add(1);
@@ -423,6 +595,12 @@ impl ChargeSystem {
         // 引くため、イテレータ化しても読みやすくならない）
         #[allow(clippy::needless_range_loop)]
         for i in 0..n {
+            // 突撃が寸前で失速した兵士は、しばらく足が止まる（実際に止めるのは
+            // `World::steer`。ここで `goal` を書き換えてしまうと、部隊に属さない
+            // 兵士の目標を壊す）
+            if self.is_hesitating(i as SoldierId, tick) {
+                continue;
+            }
             // 何も進行中でなく、見直しの番でもない兵士は近傍を見るまでもない。
             // 近傍クエリは 1 体あたりでは安いが、毎 tick 全員ぶん回すと
             // 白兵戦の相手探しをもう一度やるのと同じ重さになる。
@@ -545,6 +723,8 @@ impl ChargeSystem {
         self.focus_x[i] = target_pos.x;
         self.focus_y[i] = target_pos.y;
         self.run_mm[i] = 0;
+        // 新しい助走なので、失速判定も引き直す
+        self.falter_checked[i] = false;
         soldiers.hot.state[i] = State::Charging;
         self.stats.runups = self.stats.runups.saturating_add(1);
     }
@@ -678,6 +858,8 @@ impl ChargeSystem {
             mix(self.micro_until[i] as u64);
             mix(self.next_decision[i] as u64);
             mix(self.in_contact[i] as u64);
+            mix(self.hesitate_until[i] as u64);
+            mix(self.falter_checked[i] as u64);
         }
         h
     }
@@ -688,6 +870,23 @@ fn recovery_ticks(rng: &mut Rng, accel: u8) -> u8 {
     let span = (STUMBLE_TICKS_MAX - STUMBLE_TICKS_MIN) as i32;
     let base = STUMBLE_TICKS_MIN as i32 + rng.range(0, span + 1);
     (base - accel as i32 / 48).clamp(STUMBLE_TICKS_MIN as i32, STUMBLE_TICKS_MAX as i32) as u8
+}
+
+/// 近くで一緒に走っている味方の数。集団で突っ込むほど足は止まりにくい。
+fn count_running_friends(i: usize, pos: Vec2Fx, soldiers: &Soldiers, hash: &SpatialHash) -> i32 {
+    let mut buf = [0u32; MAX_NEIGHBORS];
+    let count = hash.query_neighbors(pos.x, pos.y, &mut buf);
+    let mut friends = 0;
+    for &jid in &buf[..count] {
+        let j = jid as usize;
+        if j == i || !soldiers.is_alive(j) || soldiers.faction[j] != soldiers.faction[i] {
+            continue;
+        }
+        if soldiers.hot.state[j] == State::Charging && soldiers.gait(j) == Gait::Running {
+            friends += 1;
+        }
+    }
+    friends
 }
 
 /// 近傍から最も近い敵を探す。返すのは（距離の二乗, index）。

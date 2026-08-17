@@ -325,6 +325,8 @@ struct BattleReport {
     stats: sim_core::combat::CombatStats,
     /// 徒歩の助走突撃・転倒の統計。
     charge: sim_core::charge::ChargeStats,
+    /// 疲れた前列と後列の交代が起きた回数。
+    rotations: u32,
 }
 
 fn run_battle(o: &Opts) -> BattleReport {
@@ -356,6 +358,7 @@ fn finish_battle(mut w: World, o: &Opts) -> BattleReport {
         alive: (alive_a, alive_b),
         stats: w.combat.stats,
         charge: w.charge.stats,
+        rotations: w.command.rotations,
     }
 }
 
@@ -525,7 +528,10 @@ fn battle(o: &Opts) {
     println!("  \"friendly_fire_hits\": {},", s.friendly_fire_hits);
     println!("  \"shots_fired\": {},", s.shots_fired);
     println!("  \"foot_charge_impacts\": {},", report.charge.impacts);
-    println!("  \"stumbles\": {}", report.charge.stumbles);
+    println!("  \"stumbles\": {},", report.charge.stumbles);
+    println!("  \"charge_falters\": {},", report.charge.falters);
+    println!("  \"braces\": {},", report.charge.braces);
+    println!("  \"rank_rotations\": {}", report.rotations);
     println!("}}");
 
     eprintln!(
@@ -616,7 +622,10 @@ fn scenario_run(o: &Opts) {
     println!("  \"foot_charge_impacts\": {},", report.charge.impacts);
     println!("  \"foot_charge_runups\": {},", report.charge.runups);
     println!("  \"foot_charge_backoffs\": {},", report.charge.backoffs);
-    println!("  \"stumbles\": {}", report.charge.stumbles);
+    println!("  \"stumbles\": {},", report.charge.stumbles);
+    println!("  \"charge_falters\": {},", report.charge.falters);
+    println!("  \"braces\": {},", report.charge.braces);
+    println!("  \"rank_rotations\": {}", report.rotations);
     println!("}}");
 }
 

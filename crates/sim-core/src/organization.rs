@@ -5,7 +5,7 @@
 //! 伝令ごとに距離から遅延を計算するため、発令順や走査順に結果が依存しない。
 
 use sim_math::{
-    dist, fx, fx_from_mm, fx_mul, ms_to_ticks, per_sec_to_per_tick, Brad, Fx, Vec2Fx, FX_ONE,
+    dist, fx, fx_from_mm, fx_mul, ms_to_ticks, per_sec_to_per_tick, Brad, Fx, Rng, Vec2Fx, FX_ONE,
 };
 use sim_terrain::Terrain;
 
@@ -364,6 +364,8 @@ pub enum CommandEventKind {
     /// M7: 命令に反して指揮官が独断で行動した（仕様 05 章「ambition の高い
     /// 騎士が命令を無視して突撃する」）。
     Insubordination,
+    /// 疲れた前列を後列と入れ替えた（仕様 06 章 6 節）。
+    RanksRotated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +556,13 @@ pub struct Unit {
 /// 側面へ回り込まずに正面衝突するので、いったん敵の横を目指させる。
 const FLANK_OFFSET_M: i32 = 60;
 
+/// 前後列の交代を検討する間隔（tick）。20 Hz なので 40 tick = 2 秒。
+const ROTATION_INTERVAL_TICKS: u32 = 40;
+/// 前列の兵士がこの疲労を超えたら、交代の対象になる。
+const ROTATION_FATIGUE_THRESHOLD: u16 = 5_500;
+/// 後列と入れ替える意味があるとみなす疲労差。
+const ROTATION_FATIGUE_MARGIN: u16 = 1_500;
+
 /// 追撃の紐（leash）。仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに
 /// 現実的な時間がかかる」を実装するための、部隊単位の上限距離。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +614,8 @@ pub struct CommandTree {
     pub nodes: Vec<CommandNode>,
     pub messengers: Vec<Messenger>,
     pub events: Vec<CommandEvent>,
+    /// 前後列の交代が起きた回数（UI とテスト用）。
+    pub rotations: u32,
     next_order_id: OrderId,
 }
 
@@ -1361,6 +1372,88 @@ impl CommandTree {
         }
     }
 
+    /// 疲れた前列を後列と入れ替える（仕様 06 章 6 節「指揮官は交代を命じる」）。
+    ///
+    /// 陣形スロットは `unit.soldiers` の並び順から決まるので、**配列の要素を
+    /// 入れ替えるだけで前列と後列が入れ替わる**。中世会戦は疲労で決まるので、
+    /// これができる部隊は持久戦に強い——そして誰でもできる芸当ではないので、
+    /// 入れ替わる 2 人の `discipline` が確率を決める。規律の低い部隊では
+    /// 疲れた兵士が前列に残り続ける。
+    ///
+    /// `world_seed` と `tick` から判定を導くので、実行順序に依存しない。
+    pub fn rotate_tired_ranks(&mut self, soldiers: &Soldiers, world_seed: u64, tick: u32) {
+        if tick % ROTATION_INTERVAL_TICKS != 0 {
+            return;
+        }
+        for index in 0..self.nodes.len() {
+            let Some(unit) = self.nodes[index].unit.as_mut() else {
+                continue;
+            };
+            if unit.ranks < 2 || unit.formation_change.is_some() {
+                continue;
+            }
+            // 生きている者だけがスロットを占める（`formation_goals` と同じ規則）
+            let alive: Vec<usize> = (0..unit.soldiers.len())
+                .filter(|&k| soldiers.is_active_id(unit.soldiers[k]))
+                .collect();
+            let ranks = unit.ranks as usize;
+            let files = alive.len().div_ceil(ranks).max(1);
+            if alive.len() <= files {
+                continue;
+            }
+
+            let mut rotated = 0usize;
+            let limit = (files / 2).max(1);
+            for slot in 0..files.min(alive.len()) {
+                if rotated >= limit {
+                    break;
+                }
+                let front = alive[slot];
+                let front_id = unit.soldiers[front];
+                if soldiers.fatigue[front_id as usize] < ROTATION_FATIGUE_THRESHOLD {
+                    continue;
+                }
+                // 後列のいちばん元気な者を選ぶ（同値なら後ろの列を優先）
+                let mut best: Option<(u16, usize)> = None;
+                for &candidate in alive.iter().skip(files) {
+                    let id = unit.soldiers[candidate];
+                    let fatigue = soldiers.fatigue[id as usize];
+                    if fatigue + ROTATION_FATIGUE_MARGIN > soldiers.fatigue[front_id as usize] {
+                        continue;
+                    }
+                    if best.map_or(true, |(best_fatigue, _)| fatigue <= best_fatigue) {
+                        best = Some((fatigue, candidate));
+                    }
+                }
+                let Some((_, rear)) = best else {
+                    continue;
+                };
+                let rear_id = unit.soldiers[rear];
+                // 交代は訓練の産物。規律の低い 2 人では入れ替わらない
+                let discipline = (soldiers.attrs[front_id as usize].discipline as i32
+                    + soldiers.attrs[rear_id as usize].discipline as i32)
+                    / 2;
+                let chance = (discipline * 3).clamp(0, 900) as u32;
+                let mut rng =
+                    Rng::stream(world_seed, front_id, sim_math::Purpose::DecisionNoise, tick);
+                if !rng.chance_permille(chance) {
+                    continue;
+                }
+                unit.soldiers.swap(front, rear);
+                rotated += 1;
+                self.rotations = self.rotations.saturating_add(1);
+            }
+            if rotated > 0 {
+                self.events.push(CommandEvent {
+                    tick,
+                    node: index as NodeId,
+                    order: None,
+                    kind: CommandEventKind::RanksRotated,
+                });
+            }
+        }
+    }
+
     /// 葉ノードの兵士に、現在の陣形スロットを目標として設定する。
     pub fn formation_goals(&mut self, soldiers: &mut Soldiers, goals: &mut [Vec2Fx], tick: u32) {
         for index in 0..self.nodes.len() {
@@ -1564,6 +1657,10 @@ impl CommandTree {
                 mix(unit.formation_origin.x as u32 as u64);
                 mix(unit.formation_origin.y as u32 as u64);
                 mix(unit.path.len() as u64);
+                // スロットの並び（前後列の交代で変わる）も決定論の検証対象
+                for &id in &unit.soldiers {
+                    mix(id as u64);
+                }
             }
             // M7: 指揮官 AI の状態も決定論検証の対象にする。
             mix(node.blackboard.enemy_forces.len() as u64);

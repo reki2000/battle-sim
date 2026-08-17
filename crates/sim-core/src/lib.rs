@@ -52,6 +52,16 @@ const SEPARATION_ITERATIONS: usize = 2;
 /// 押し戻しの緩和係数。完全に解消しないことで密集の圧力が残る。
 const SEPARATION_RELAX_PERMILLE: i32 = 500;
 
+/// 白兵戦で保とうとする距離を、武器の間合いより少し内側に取る分（mm）。
+/// ぎりぎりを狙うと押し合いで届かなくなるため。
+const STANDOFF_MARGIN_MM: i32 = 200;
+/// 長物の兵士が「踏み込まれた」と感じて下がり始める、体の間の距離（mm）。
+const STANDOFF_RETREAT_MM: i32 = 600;
+/// 間合いの許容幅（mm）。この幅の中では足を止めて戦う。
+const STANDOFF_TOLERANCE_MM: i32 = 150;
+/// 間合いを詰める・取り直すときの足の速さ（mm/s）。摺り足で、走りはしない。
+const STANDOFF_STEP_MM_PER_S: i32 = 700;
+
 /// ワールドの生成設定。
 #[derive(Clone, Debug)]
 pub struct WorldConfig {
@@ -420,6 +430,10 @@ impl World {
             self.seed,
             self.tick,
         );
+        // 疲れた前列を後列と入れ替える。陣形スロットの並びを変えるので、
+        // スロットから目標を配る `formation_goals` の直前に置く。
+        self.command
+            .rotate_tired_ranks(&self.soldiers, self.seed, self.tick);
         self.command
             .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
@@ -535,6 +549,14 @@ impl World {
                 self.soldiers.hot.vel_y[i] = 0;
                 continue;
             }
+            // 突撃が寸前で失速した兵士は、しばらくその場で足が止まる
+            // （仕様 06 章 3.7 節）。向きは敵から離さない。
+            if self.charge.is_hesitating(i as SoldierId, self.tick) {
+                self.soldiers.hot.vel_x[i] = 0;
+                self.soldiers.hot.vel_y[i] = 0;
+                self.face_nearest_enemy_if_close(i);
+                continue;
+            }
             // 命令を受けていない兵士はその場を保つ。押し合いで動かされても
             // 元の位置に戻ろうとはしない（さもないと 1 点に集まれという命令が
             // 分離と綱引きし、密集が解けなくなる）。
@@ -542,6 +564,12 @@ impl World {
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
                 self.face_nearest_enemy_if_close(i);
+                continue;
+            }
+            // 白兵戦中は「武器の間合い」を保つのが最優先で、陣形スロットへの
+            // 移動より前に来る。剣は踏み込み、槍は突ける距離で止まり、
+            // 近づかれたら下がって突き直す（仕様 06 章 3.1 節の reach）。
+            if self.apply_melee_standoff(i) {
                 continue;
             }
             let pos = self.soldiers.pos(i);
@@ -578,7 +606,7 @@ impl World {
             if self.charge.is_backing_off(i as SoldierId) {
                 continue;
             }
-            self.soldiers.hot.facing[i] = dir.angle();
+            self.soldiers.turn_facing_toward(i, dir.angle());
             // 進行方向を向くのが基本だが、間合いの範囲内に敵がいれば
             // そちらを優先して向く。行軍の目標方向と実際に隣接した敵の
             // 方向がずれる（衝突で横に押された等）と、白兵戦の弧判定を
@@ -617,8 +645,79 @@ impl World {
             }
         }
         if let Some((_, enemy_pos)) = nearest {
-            self.soldiers.hot.facing[i] = enemy_pos.sub(pos).angle();
+            // 瞬時には振り向けない。旋回速度の上限を守って向き直る
+            // （仕様 06 章 2.5 節）。側面・背面を取られた兵士が向き直る前に
+            // 討たれるのはこの上限のため。
+            self.soldiers
+                .turn_facing_toward(i, enemy_pos.sub(pos).angle());
         }
+    }
+
+    /// 白兵戦の間合い（standoff）を保つ操舵。この tick の操舵をここで
+    /// 決めきったら `true` を返す。
+    ///
+    /// 交戦相手のいる兵士は、陣形スロットへ歩くより「自分の武器が届いて、
+    /// かつ相手の武器が届きにくい距離」を保とうとする。
+    ///
+    /// - **短い武器（剣・斧）は踏み込む**。届く距離まで詰めたらそこで止まる
+    /// - **長い武器（槍・パイク）は距離で止まる**。踏み込まれたら下がって
+    ///   突き直す。パイク方陣が敵を寄せつけないのはこの結果
+    /// - 騎乗兵は突撃が仕事なので対象にしない
+    fn apply_melee_standoff(&mut self, i: usize) -> bool {
+        if self.soldiers.hot.state[i] != State::Engaged
+            || self.soldiers.hot.flags[i] & flags::MOUNTED != 0
+            // 助走で詰めている最中は間合いを取らず、体ごとぶつかりに行く
+            || self.charge.is_closing(i as SoldierId)
+        {
+            return false;
+        }
+        let weapon = self.combat.weapons[i];
+        if weapon.ranged {
+            return false;
+        }
+        let Some(j) = self
+            .soldiers
+            .index_if_present(self.soldiers.target[i])
+            .filter(|&j| self.soldiers.is_alive(j))
+        else {
+            return false;
+        };
+
+        let pos = self.soldiers.pos(i);
+        let target_pos = self.soldiers.pos(j);
+        let bodies = self.soldiers.radius(i) + self.soldiers.radius(j);
+        let preferred = weapon.reach + bodies - fx_from_mm(STANDOFF_MARGIN_MM);
+        // 長物だけが「近すぎる」を嫌って下がる。短い武器は組み合ってよい
+        let too_close = bodies
+            + if weapon.reach >= fx_from_mm(2_000) {
+                fx_from_mm(STANDOFF_RETREAT_MM)
+            } else {
+                0
+            };
+        let tolerance = fx_from_mm(STANDOFF_TOLERANCE_MM);
+        // 距離と向きを 1 回の平方根で出す
+        let delta = target_pos.sub(pos);
+        let distance = delta.len();
+        let dir = if distance == 0 {
+            Vec2Fx::new(FX_ONE, 0)
+        } else {
+            delta.scale(fx_div(FX_ONE, distance))
+        };
+
+        // 足を止めて戦っている（もっとも多い）場合は速度を計算しない。
+        // `desired_speed` は地形と構造物を引くので、全交戦兵ぶん毎 tick
+        // 呼ぶと無駄が大きい。
+        let velocity = if distance > preferred + tolerance {
+            dir.scale(self.standoff_step(i))
+        } else if distance < too_close {
+            dir.scale(-self.standoff_step(i))
+        } else {
+            Vec2Fx::ZERO
+        };
+        self.soldiers.hot.vel_x[i] = velocity.x.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
+        self.soldiers.hot.vel_y[i] = velocity.y.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
+        self.soldiers.turn_facing_toward(i, dir.angle());
+        true
     }
 
     /// 1 ティックあたりの希望移動量（Fx, m）。
@@ -770,6 +869,13 @@ impl World {
         for i in 0..n {
             self.pass_radius[i] = self.soldiers.pass_radius(i);
         }
+    }
+
+    /// 間合いを調整する摺り足の速さ。地形や疲労で遅くなっているときは
+    /// それ以上は出ない。
+    #[inline]
+    fn standoff_step(&self, i: usize) -> Fx {
+        per_sec_to_per_tick(fx_from_mm(STANDOFF_STEP_MM_PER_S)).min(self.desired_speed(i))
     }
 
     /// フェーズ 10: 衝突解決（押し合い）。
@@ -1369,6 +1475,187 @@ mod tests {
         assert!(
             w.charge.stats.runups > 0,
             "誰も走り込まない（助走の判断が働いていない）"
+        );
+    }
+
+    /// 人は瞬時に振り向けない。旋回速度の上限が守られている
+    /// （仕様 06 章 2.5 節）。
+    #[test]
+    fn soldiers_cannot_turn_instantly() {
+        let mut w = small_world();
+        let id = w.spawn(Vec2Fx::new(fx(150), fx(150)), 0, 0, 0, Attrs::default(), 0);
+        let i = id as usize;
+        // 真後ろへ歩かせる。向きは 1 tick では反転しない
+        w.set_goal(id, Vec2Fx::new(fx(120), fx(150)));
+        let step = w.soldiers.turn_step(i);
+        w.tick();
+        let after_one = sim_math::angle_diff(w.soldiers.hot.facing[i], 0).unsigned_abs();
+        assert!(
+            after_one <= step + 1,
+            "1 tick で {after_one} brad 回った（上限 {step}）"
+        );
+        assert!(after_one > 0, "まったく向きを変えていない");
+
+        // 走っている兵士は立ち止まっている兵士より旋回が鈍い
+        for _ in 0..40 {
+            w.tick();
+        }
+        let standing = w.spawn(Vec2Fx::new(fx(160), fx(160)), 0, 0, 0, Attrs::default(), 0);
+        assert!(
+            w.soldiers.turn_step(standing as usize) > w.soldiers.turn_step(i)
+                || w.soldiers.gait(i) == soldiers::Gait::Standing,
+            "走っていても旋回速度が落ちていない"
+        );
+    }
+
+    /// 長物は間合いを取り、短い武器は組み合う（仕様 06 章 3.1 節の reach）。
+    ///
+    /// 踏み込まれた状態から始め、それぞれが落ち着く距離を見る。
+    #[test]
+    fn long_weapons_back_off_while_short_ones_stay_close() {
+        fn settle_distance(weapon: combat::Weapon) -> Fx {
+            let mut w = small_world();
+            // 攻めっ気がなく規律の高い兵士にして、助走の判断が混ざらないようにする
+            let steady = Attrs::new(140, 140, 140, 140, 140, 140, 140, 250, 0, 140, 140, 140);
+            let a = w.spawn(Vec2Fx::new(fx(150), fx(150)), 0, 0, 0, steady, 0);
+            let target_pos = Vec2Fx::new(fx(150) + fx_from_mm(1_000), fx(150));
+            let b = w.spawn(target_pos, sim_math::brad_from_deg(180), 0, 1, steady, 0);
+            w.combat.set_loadout(a, weapon, combat::Armor::cloth());
+            for _ in 0..200 {
+                // 相手は棒立ちで、間合いを詰めても離れもしない
+                w.soldiers.set_pos(b as usize, target_pos);
+                w.soldiers.hot.state[b as usize] = State::Idle;
+                w.tick();
+            }
+            sim_math::dist(w.soldiers.pos(a as usize), target_pos)
+        }
+
+        let with_sword = settle_distance(combat::Weapon::sword());
+        let with_pike = settle_distance(combat::Weapon::pike());
+        assert!(
+            with_pike > with_sword + fx_from_mm(200),
+            "パイクが剣と同じ距離で組み合っている: pike={} mm sword={} mm",
+            sim_math::fx_to_mm(with_pike),
+            sim_math::fx_to_mm(with_sword)
+        );
+        assert!(
+            with_sword < fx_from_mm(1_500),
+            "剣が間合いを空けすぎている: {} mm",
+            sim_math::fx_to_mm(with_sword)
+        );
+    }
+
+    /// 突撃は接触の手前で失速することがあり、受ける側は身構える
+    /// （仕様 06 章 3.7 / 3.8 節）。
+    ///
+    /// 少人数で、規律の高い戦列へ突っ込ませる。一緒に走る味方が少ないほど
+    /// 足は止まりやすい——一人で突っ込むのは怖い。
+    #[test]
+    fn charges_falter_against_a_braced_line() {
+        let mut w = small_world();
+        let timid = Attrs::new(150, 150, 150, 150, 150, 120, 10, 200, 250, 200, 140, 140);
+        let steady = Attrs::new(150, 150, 150, 150, 150, 140, 220, 250, 60, 120, 140, 140);
+        let north = sim_math::brad_from_deg(90);
+        let chargers: Vec<SoldierId> = (0..3)
+            .map(|k| {
+                w.spawn(
+                    Vec2Fx::new(fx(150) + fx(k * 3), fx(150)),
+                    north,
+                    0,
+                    0,
+                    timid,
+                    0,
+                )
+            })
+            .collect();
+        let line: Vec<SoldierId> = (0..8)
+            .map(|k| {
+                w.spawn(
+                    Vec2Fx::new(fx(149) + fx(k), fx(153)),
+                    sim_math::brad_from_deg(270),
+                    0,
+                    1,
+                    steady,
+                    0,
+                )
+            })
+            .collect();
+        for (n, &id) in chargers.iter().enumerate() {
+            w.set_goal(id, Vec2Fx::new(fx(150) + fx(n as i32 * 3), fx(153)));
+        }
+        for _ in 0..600 {
+            for &id in &chargers {
+                if !w.charge.is_hesitating(id, w.tick) {
+                    w.soldiers.hot.state[id as usize] = State::Charging;
+                }
+            }
+            w.tick();
+        }
+        assert!(
+            w.charge.stats.braces > 0,
+            "突撃を受ける側が誰も身構えていない"
+        );
+        assert!(
+            w.charge.stats.falters > 0,
+            "臆病な突撃が一度も失速していない"
+        );
+        let _ = line;
+    }
+
+    /// 疲れた前列は後列と入れ替わる。規律が低い部隊では起きない
+    /// （仕様 06 章 6 節）。
+    #[test]
+    fn tired_front_ranks_rotate_with_the_rear() {
+        fn rotations(discipline: u8) -> u32 {
+            let mut w = small_world();
+            let attrs = Attrs::new(
+                140, 140, 140, 140, 140, 140, 140, discipline, 120, 120, 140, 140,
+            );
+            let mut ids = Vec::new();
+            for rank in 0..3 {
+                for file in 0..4 {
+                    ids.push(w.spawn(
+                        Vec2Fx::new(fx(150) + fx(file), fx(150) + fx(rank)),
+                        0,
+                        0,
+                        0,
+                        attrs,
+                        0,
+                    ));
+                }
+            }
+            // 前列（先頭 4 人）だけ疲れきっている
+            for &id in ids.iter().take(4) {
+                w.soldiers.fatigue[id as usize] = 9_000;
+            }
+            let unit = organization::Unit {
+                soldiers: ids.clone(),
+                troop_type: 0,
+                formation: organization::FORMATION_LINE,
+                formation_origin: Vec2Fx::new(fx(150), fx(150)),
+                formation_facing: 0,
+                ranks: 3,
+                file_spacing: fx_from_mm(900),
+                rank_spacing: fx_from_mm(900),
+                banner: None,
+                formation_change: None,
+                path: Vec::new(),
+                path_final: Vec2Fx::new(fx(150), fx(150)),
+                pursuit_leash: None,
+            };
+            w.add_command_node(None, 0, 0, ids[0], vec![], Some(unit));
+            for _ in 0..200 {
+                w.tick();
+            }
+            w.command.rotations
+        }
+
+        let disciplined = rotations(240);
+        let rabble = rotations(10);
+        assert!(disciplined > 0, "規律の高い部隊でも交代が起きない");
+        assert!(
+            rabble < disciplined,
+            "規律に関係なく交代している: rabble={rabble} disciplined={disciplined}"
         );
     }
 

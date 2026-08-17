@@ -351,6 +351,9 @@ const MAX_EVENTS: usize = 4096;
 /// 通常の押し合いや行進中のジョストルはこれを超えない。
 const CRUSH_THRESHOLD_PERMILLE: u32 = 600;
 
+/// 盾を構えて受け止める姿勢の防御ボーナス（仕様 06 章 3.8 節）。
+const BRACED_DEFENSE_BONUS: i32 = 35;
+
 /// 射撃の標的探索に使う粗いセルの一辺（m）。近接戦用の `SpatialHash`
 /// （2 m セル）では弓の射程まで届かないための専用インデックス。
 const RANGED_CELL_M: i32 = 48;
@@ -683,6 +686,7 @@ impl CombatSystem {
                 attacker_attrs,
                 soldiers.fatigue[i],
                 soldiers.hot.state[i],
+                soldiers.is_braced(i),
             );
 
             if weapon.ranged {
@@ -742,6 +746,12 @@ impl CombatSystem {
                 // 倒れた相手はほとんど受けられない。密集した戦列で転ぶことが
                 // 致命的なのは中世会戦の現実そのもの
                 - if soldiers.is_stumbling(defender) { 90 } else { 0 }
+                // 盾を構えて足を止めている相手は崩しにくい
+                + if soldiers.is_braced(defender) {
+                    BRACED_DEFENSE_BONUS
+                } else {
+                    0
+                }
                 + Rng::stream(world_seed, defender as u32, Purpose::HitRoll, tick).range(-30, 31);
 
             if attack_roll <= defense_roll {
@@ -1459,7 +1469,7 @@ fn injury_skill(skill: u8, hp: u16) -> i32 {
     skill as i32 * multiplier / 1000
 }
 
-fn swing_ticks(weapon: Weapon, attrs: Attrs, fatigue: u16, state: State) -> u16 {
+fn swing_ticks(weapon: Weapon, attrs: Attrs, fatigue: u16, state: State, braced: bool) -> u16 {
     // skill_factor・fatigue_factor・crowding_factor はいずれもパーミル
     // （1000 = ×1.0）で、3 つ掛け合わせると 1000^3 = 1e9 倍になる。
     // 1e6 で割ると 1000 倍大きい ms が残り、剣の 1 振り約 2 秒のはずが
@@ -1467,9 +1477,15 @@ fn swing_ticks(weapon: Weapon, attrs: Attrs, fatigue: u16, state: State) -> u16 
     let skill_factor = (2000 - attrs.skill as i32 * 4).max(980) as i64;
     let fatigue_factor = if fatigue > 6000 { 1400 } else { 1000 };
     let crowding_factor = if state == State::Wavering { 1200 } else { 1000 };
-    let ms =
-        weapon.base_swing_ms as i64 * skill_factor * fatigue_factor as i64 * crowding_factor as i64
-            / 1_000_000_000;
+    // 盾を構えて受け止める姿勢は守りに寄っている。攻撃の手数は落ちる
+    // （仕様 06 章 3.8 節）
+    let stance_factor: i64 = if braced { 1300 } else { 1000 };
+    let ms = weapon.base_swing_ms as i64
+        * skill_factor
+        * fatigue_factor as i64
+        * crowding_factor as i64
+        * stance_factor
+        / 1_000_000_000_000;
     ms_to_ticks(ms.max(50).min(u32::MAX as i64) as u32).max(1) as u16
 }
 

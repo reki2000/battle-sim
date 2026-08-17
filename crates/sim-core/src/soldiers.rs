@@ -57,6 +57,9 @@ pub mod flags {
     pub const SLEEPING: u8 = 1 << 5;
     /// 転倒中。立ち上がるまで動けず、攻撃もできない（`charge::ChargeSystem` が管理）
     pub const STUMBLING: u8 = 1 << 6;
+    /// 盾を構えて突撃を受け止める姿勢。衝撃に強いが自分の攻撃は遅くなる
+    /// （`charge::ChargeSystem` が管理）
+    pub const BRACED: u8 = 1 << 7;
 }
 
 /// 徒歩兵の体の半径（mm）。肩幅ベース（仕様 06 章 2.2 節）。
@@ -76,6 +79,17 @@ pub const WALK_MIN_SPEED_MM_PER_TICK: i32 = 20;
 /// 「走っている」とみなす最低速度（1 tick あたりの移動量 mm）。
 /// 100 mm/tick = 2.0 m/s。
 pub const RUN_MIN_SPEED_MM_PER_TICK: i32 = 100;
+
+/// 向きを変える速さ（度／秒）。人は瞬時に振り向けない。
+///
+/// 立ち止まっていれば体ごと素早く向き直れるが、走っている最中に向きを変える
+/// には足を踏み替える必要があり、馬はさらに大回りになる。この上限があること
+/// で、側面や背面を取られた兵士が「向き直れないまま討たれる」——白兵戦の弧
+/// 判定（仕様 06 章 3.1 節）が実際の意味を持つ。
+pub const TURN_DEG_PER_SEC_STANDING: i32 = 270;
+pub const TURN_DEG_PER_SEC_WALKING: i32 = 200;
+pub const TURN_DEG_PER_SEC_RUNNING: i32 = 120;
+pub const TURN_DEG_PER_SEC_MOUNTED: i32 = 90;
 
 /// 歩容。すり抜けに必要な隙間・疲労の消費・つまずきやすさを決める。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -308,15 +322,26 @@ impl Soldiers {
     }
 
     /// 現在の歩容。
+    ///
+    /// 判定は**速度の二乗**で行い、平方根を避ける。歩容は毎 tick 全員ぶん
+    /// 引かれる（すり抜け半径・旋回速度・つまずき判定）ので、ここに
+    /// `isqrt` が入ると 50,000 体では効いてくる。
     #[inline]
     pub fn gait(&self, i: usize) -> Gait {
         if self.hot.flags[i] & flags::STUMBLING != 0 || !self.is_alive(i) {
             return Gait::Standing;
         }
-        match self.speed_mm_per_tick(i) {
-            s if s >= RUN_MIN_SPEED_MM_PER_TICK => Gait::Running,
-            s if s >= WALK_MIN_SPEED_MM_PER_TICK => Gait::Walking,
-            _ => Gait::Standing,
+        let vx = self.hot.vel_x[i] as i64;
+        let vy = self.hot.vel_y[i] as i64;
+        let speed_sq = vx * vx + vy * vy;
+        let run = sim_math::fx_from_mm(RUN_MIN_SPEED_MM_PER_TICK) as i64;
+        let walk = sim_math::fx_from_mm(WALK_MIN_SPEED_MM_PER_TICK) as i64;
+        if speed_sq >= run * run {
+            Gait::Running
+        } else if speed_sq >= walk * walk {
+            Gait::Walking
+        } else {
+            Gait::Standing
         }
     }
 
@@ -346,6 +371,37 @@ impl Soldiers {
     #[inline]
     pub fn is_stumbling(&self, i: usize) -> bool {
         self.hot.flags[i] & flags::STUMBLING != 0
+    }
+
+    /// 盾を構えて踏ん張っているか。
+    #[inline]
+    pub fn is_braced(&self, i: usize) -> bool {
+        self.hot.flags[i] & flags::BRACED != 0
+    }
+
+    /// この tick に変えられる向きの上限（brad）。
+    #[inline]
+    pub fn turn_step(&self, i: usize) -> u32 {
+        let deg_per_sec = if self.hot.flags[i] & flags::MOUNTED != 0 {
+            TURN_DEG_PER_SEC_MOUNTED
+        } else {
+            match self.gait(i) {
+                Gait::Running => TURN_DEG_PER_SEC_RUNNING,
+                Gait::Walking => TURN_DEG_PER_SEC_WALKING,
+                Gait::Standing => TURN_DEG_PER_SEC_STANDING,
+            }
+        };
+        // 身のこなし（accel）が良い兵士は素早く向き直る（±25%）
+        let agility_permille = 750 + (self.attrs[i].accel as i32) * 2;
+        let per_sec = deg_per_sec * agility_permille / 1000;
+        (sim_math::brad_from_deg(per_sec) as u32 / sim_math::TICK_HZ).max(1)
+    }
+
+    /// 向きを目標へ、旋回速度の上限を守って近づける。
+    #[inline]
+    pub fn turn_facing_toward(&mut self, i: usize, target: Brad) {
+        let step = self.turn_step(i);
+        self.hot.facing[i] = sim_math::turn_toward(self.hot.facing[i], target, step);
     }
 
     /// 押し合いでの質量寄与（kg 相当）。
