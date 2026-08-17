@@ -42,6 +42,23 @@ pub enum Stamp {
         by_m: i32,
         half_width_m: i32,
     },
+    /// 矩形から水を抜く（水深 0・種別なし・地表を `surface` に）。
+    ///
+    /// 手続き生成は窪地を湖として埋めるので、シナリオが「ここは乾いた
+    /// 会戦場だ」と決めた区画にも水が残ることがある。水域のセルは
+    /// [`Stamp::SurfaceRect`] などの塗り替え対象から外れる（水深グリッドと
+    /// 地表が食い違うと壊れるため）ので、先にここで水を抜く。
+    ///
+    /// 水は騎兵を完全に止める（`SURFACE_EFFECTS` の `cavalry_mult` が 0）。
+    /// 展開地に湖が残ったまま騎兵を置くと、動けない兵の塊ができて隊列が
+    /// 押し合いで自壊する。
+    Drain {
+        surface: Surface,
+        x_m: i32,
+        y_m: i32,
+        w_m: i32,
+        h_m: i32,
+    },
     /// `axis` 方向に沿って標高へ緩い勾配を足す。`from_m` 以前は `from_cm`、
     /// `to_m` 以降は `to_cm` で一定なので、どこにも段差ができない
     /// （矩形に限定すると境界が崖になってしまう）。
@@ -81,6 +98,28 @@ fn apply_one(t: &mut Terrain, stamp: Stamp) {
             for_each_cell(t, |x, y| {
                 (x >= x_m && x < x_m + w_m && y >= y_m && y < y_m + h_m).then_some(surface)
             });
+        }
+        Stamp::Drain {
+            surface,
+            x_m,
+            y_m,
+            w_m,
+            h_m,
+        } => {
+            let dim = t.dim;
+            let cell_m = t.cell_m as i32;
+            for cy in 0..dim {
+                for cx in 0..dim {
+                    let (px, py) = cell_center_m(cx, cy, cell_m);
+                    if px < x_m || px >= x_m + w_m || py < y_m || py >= y_m + h_m {
+                        continue;
+                    }
+                    let idx = t.idx(cx, cy);
+                    t.water[idx] = 0;
+                    t.water_kind[idx] = crate::WaterKind::None;
+                    t.set_surface(idx, surface);
+                }
+            }
         }
         Stamp::SurfaceBelt {
             surface,
@@ -255,6 +294,51 @@ mod tests {
             }
             assert_ne!(Surface::from_u8(t.surface[off]), Surface::DenseForest);
         }
+    }
+
+    #[test]
+    fn drain_removes_water_so_the_ground_becomes_usable() {
+        let mut t = generate(&TerrainParams {
+            seed: 4,
+            marsh_bias: 600,
+            river_density: 600,
+            ..flat_params()
+        });
+        // 水のあるセルを 1 つ選ぶ（この地形には必ずどこかにある）。
+        let wet = (0..t.height.len()).find(|&i| t.water[i] > 0);
+        let Some(wet) = wet else {
+            return;
+        };
+        let (cx, cy) = ((wet as u32) % t.dim, (wet as u32) / t.dim);
+        let (px, py) = cell_center_m(cx, cy, t.cell_m as i32);
+
+        // 水域は通常の塗り替えでは変わらない。
+        apply(
+            &mut t,
+            &[Stamp::SurfaceRect {
+                surface: Surface::Farmland,
+                x_m: px - 4,
+                y_m: py - 4,
+                w_m: 8,
+                h_m: 8,
+            }],
+        );
+        assert!(t.water[wet] > 0, "水域が塗り替えで消えている");
+
+        // 水を抜けば、地表も通行コストも乾いた地面になる。
+        apply(
+            &mut t,
+            &[Stamp::Drain {
+                surface: Surface::Farmland,
+                x_m: px - 4,
+                y_m: py - 4,
+                w_m: 8,
+                h_m: 8,
+            }],
+        );
+        assert_eq!(t.water[wet], 0);
+        assert_eq!(Surface::from_u8(t.surface[wet]), Surface::Farmland);
+        assert!(t.passability[wet] > 0, "水を抜いても通れない");
     }
 
     #[test]

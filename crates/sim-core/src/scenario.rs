@@ -26,7 +26,7 @@ use crate::combat::{Armor, Weapon};
 use crate::commander_ai::archetype_index;
 use crate::organization::{
     formation_def, BattlePlan, FactionId, FormationId, Unit, FORMATION_LINE, FORMATION_PAVISE_LINE,
-    FORMATION_WEDGE,
+    FORMATION_SCHILTRON, FORMATION_SHIELDWALL, FORMATION_WEDGE,
 };
 use crate::soldiers::{flags, Attrs, SoldierId};
 use crate::structures::StructureKind;
@@ -129,6 +129,13 @@ pub enum Loadout {
     DismountedLancers,
     /// 槍と鎖帷子。
     Spearmen,
+    /// 長槍（パイク）と鎖帷子。スコットランドのシルトロンのような、
+    /// 後列も穂先を出す密集槍陣に使う。
+    ///
+    /// `Weapon::pike` は `requires_front_row = false` なので、後列の兵も
+    /// 攻撃に参加できる——それが槍衾の本質であり、騎兵の忌避判定
+    /// （`cavalry` の `spear_wall`）にも効く。
+    Pikemen,
     /// 長弓と胴衣。矢は 2 束（72 本）。
     Longbowmen,
     /// 弩と鎖帷子。
@@ -148,6 +155,7 @@ impl Loadout {
             Loadout::PollaxeMenAtArms => Weapon::mace(),
             Loadout::DismountedLancers => Weapon::spear(),
             Loadout::Spearmen => Weapon::spear(),
+            Loadout::Pikemen => Weapon::pike(),
             Loadout::Longbowmen => Weapon::longbow(),
             Loadout::Crossbowmen => Weapon::crossbow(),
             Loadout::MountedKnights => Weapon::lance(),
@@ -159,7 +167,10 @@ impl Loadout {
             Loadout::FootMenAtArms | Loadout::PollaxeMenAtArms | Loadout::DismountedLancers => {
                 Armor::plate()
             }
-            Loadout::Spearmen | Loadout::Crossbowmen | Loadout::MountedKnights => Armor::mail(),
+            Loadout::Spearmen
+            | Loadout::Pikemen
+            | Loadout::Crossbowmen
+            | Loadout::MountedKnights => Armor::mail(),
             Loadout::Longbowmen => Armor::cloth(),
         }
     }
@@ -181,6 +192,24 @@ impl Loadout {
         }
     }
 }
+
+/// 会戦が始まる前に完成している障害物。
+///
+/// 仕様 07 章 7 節の「会戦前フェーズ」で工兵が作り終えた状態を、工事を待たずに
+/// 再現するためのもの。部隊の正面の幅いっぱいに、`ahead_m` だけ前方へ置く。
+///
+/// 1 本の長い線分ではなく短い区画に分けて建てる。構造物の耐久は 1 本ごとに
+/// 独立していて（`StructureKind::hp_max`）、突っ込んだ馬に削られるため、
+/// 全長を 1 本にすると数騎の突破で防御線が丸ごと消えてしまう。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObstacleDef {
+    pub kind: StructureKind,
+    /// 最前列の何 m 前方に置くか。
+    pub ahead_m: u16,
+}
+
+/// 障害物を区切る 1 区画の長さ（m）。
+const OBSTACLE_SEGMENT_M: i32 = 5;
 
 /// 指揮官 1 人。
 #[derive(Clone, Copy, Debug)]
@@ -206,7 +235,9 @@ pub struct ContingentDef {
     /// 隊列の間隔（mm）。0 なら陣形プリセットの値を使う。
     ///
     /// 陣形プリセットの間隔は徒歩兵を前提にしているので、騎兵の部隊は
-    /// 馬の当たり判定（半径 90 cm）に合う広さをここで指定する。
+    /// 馬の当たり判定（半径 90 cm = 直径 1.8 m）に合う広さをここで指定する。
+    /// 2.0 m だと隣同士が触れ合ったままになり、押し合いが止まらずに
+    /// 隊列が自壊する。2.5 m 取れば余裕ができる。
     pub file_spacing_mm: u16,
     pub rank_spacing_mm: u16,
     /// 最前列の中央（m）。隊列は `facing` の逆向きに奥行きぶん伸びる。
@@ -216,8 +247,8 @@ pub struct ContingentDef {
     pub facing: Brad,
     /// この部隊に軍司令官が随伴するか。どの部隊にも無ければ先頭の部隊。
     pub hosts_army_commander: bool,
-    /// 会戦前に完成している杭列を、最前列の何 m 前方に立てるか。0 なら立てない。
-    pub stakes_ahead_m: u16,
+    /// 会戦前に完成している障害物（杭列・堀など）。無ければ `None`。
+    pub obstacle: Option<ObstacleDef>,
 }
 
 /// 1 つの軍（ルートノード）。
@@ -273,7 +304,7 @@ impl ScenarioDef {
 // ----------------------------------------------------------------------
 
 /// 選択できる会戦プリセットの一覧。index が UI・wasm 境界での ID になる。
-pub static SCENARIOS: &[ScenarioDef] = &[AGINCOURT_1415];
+pub static SCENARIOS: &[ScenarioDef] = &[AGINCOURT_1415, CRECY_1346, BANNOCKBURN_1314];
 
 /// index からプリセットを引く。
 pub fn get(index: usize) -> Option<&'static ScenarioDef> {
@@ -379,8 +410,8 @@ pub fn deploy(world: &mut World, def: &ScenarioDef) {
                 archetype_index(cont.commander.archetype).unwrap_or(0),
                 deploy_salt(army_idx, c_idx),
             );
-            if cont.stakes_ahead_m > 0 {
-                plant_stakes(world, cont, army.faction);
+            if let Some(obstacle) = cont.obstacle {
+                place_obstacle(world, cont, obstacle, army.faction);
             }
         }
     }
@@ -505,19 +536,31 @@ fn build_unit(cont: &ContingentDef, soldiers: Vec<SoldierId>) -> Unit {
     }
 }
 
-/// 最前列の前方へ、完成済みの杭列を立てる（アジンクールの長弓兵）。
+/// 最前列の前方へ、完成済みの障害物を並べる（アジンクールの杭列、
+/// バノックバーンの落とし穴など）。
 ///
-/// 会戦前の準備時間（仕様 07 章 7 節）で工兵が打ち終えた状態を、工事を待たずに
-/// 再現するためのもの。
-fn plant_stakes(world: &mut World, cont: &ContingentDef, faction: FactionId) {
+/// 部隊の正面幅を [`OBSTACLE_SEGMENT_M`] ごとに区切り、隙間なく並べた
+/// 短い区画として建てる（[`ObstacleDef`] の注記を参照）。
+fn place_obstacle(
+    world: &mut World,
+    cont: &ContingentDef,
+    obstacle: ObstacleDef,
+    faction: FactionId,
+) {
     let l = layout(cont);
     let front_center = Vec2Fx::new(fx(cont.front_x_m), fx(cont.front_y_m));
-    let center = front_center.add(l.forward.scale(fx(cont.stakes_ahead_m as i32)));
+    let center = front_center.add(l.forward.scale(fx(obstacle.ahead_m as i32)));
     let half_width = fx_mul(fx(l.files.saturating_sub(1) as i32), l.file_spacing) / 2;
-    let a = center.sub(l.right.scale(half_width));
-    let b = center.add(l.right.scale(half_width));
-    let id = world.structures.build(StructureKind::Stakes, a, b, faction);
-    world.structures.set_completion(id, 1000);
+    let width_m = (sim_math::fx_to_mm(half_width) * 2 / 1000).max(OBSTACLE_SEGMENT_M);
+    let segments = width_m.div_euclid(OBSTACLE_SEGMENT_M).max(1);
+    let left = center.sub(l.right.scale(half_width));
+    let step = l.right.scale(fx(width_m) / segments);
+    for i in 0..segments {
+        let a = left.add(step.scale(fx(i)));
+        let b = left.add(step.scale(fx(i + 1)));
+        let id = world.structures.build(obstacle.kind, a, b, faction);
+        world.structures.set_completion(id, 1000);
+    }
 }
 
 /// 練度から 12 個の能力値を引く。
@@ -604,6 +647,15 @@ pub const AGINCOURT_1415: ScenarioDef = ScenarioDef {
 /// 適用順に意味がある。耕地を敷いてから泥濘の帯を重ね、最後に森を置くことで、
 /// 森の縁が耕地に侵食されない。
 const AGINCOURT_SHAPING: &[Stamp] = &[
+    // まず会戦場の水を抜く。手続き生成が窪地に作った湖が両軍の展開地に
+    // かかっていると、そこだけ騎兵が動けず、隊列が押し合いで自壊する。
+    Stamp::Drain {
+        surface: Surface::Farmland,
+        x_m: 380,
+        y_m: 150,
+        w_m: 440,
+        h_m: 950,
+    },
     // 会戦場は刈り取りの済んだ耕地。
     Stamp::SurfaceRect {
         surface: Surface::Farmland,
@@ -697,7 +749,10 @@ const ENGLISH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_ENGLISH_FRONT_Y,
         facing: 0,
         hosts_army_commander: false,
-        stakes_ahead_m: 8,
+        obstacle: Some(ObstacleDef {
+            kind: StructureKind::Stakes,
+            ahead_m: 8,
+        }),
     },
     ContingentDef {
         name_ja: "前衛（ヨーク公）",
@@ -717,7 +772,7 @@ const ENGLISH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_ENGLISH_FRONT_Y,
         facing: 0,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "本隊（国王）",
@@ -737,7 +792,7 @@ const ENGLISH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_ENGLISH_FRONT_Y,
         facing: 0,
         hosts_army_commander: true,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "後衛（カモイス卿）",
@@ -757,7 +812,7 @@ const ENGLISH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_ENGLISH_FRONT_Y,
         facing: 0,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "右翼 長弓隊",
@@ -777,7 +832,10 @@ const ENGLISH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_ENGLISH_FRONT_Y,
         facing: 0,
         hosts_army_commander: false,
-        stakes_ahead_m: 8,
+        obstacle: Some(ObstacleDef {
+            kind: StructureKind::Stakes,
+            ahead_m: 8,
+        }),
     },
 ];
 
@@ -803,7 +861,7 @@ const FRENCH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: AG_FRENCH_FRONT_Y,
         facing: BRAD_HALF as u16,
         hosts_army_commander: true,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "左翼騎兵",
@@ -817,13 +875,13 @@ const FRENCH_CONTINGENTS: &[ContingentDef] = &[
         count: 200,
         files: 30,
         formation: FORMATION_WEDGE,
-        file_spacing_mm: 2000,
-        rank_spacing_mm: 2000,
-        front_x_m: 515,
-        front_y_m: 640,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: 520,
+        front_y_m: 628,
         facing: BRAD_HALF as u16,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "右翼騎兵",
@@ -837,13 +895,13 @@ const FRENCH_CONTINGENTS: &[ContingentDef] = &[
         count: 150,
         files: 30,
         formation: FORMATION_WEDGE,
-        file_spacing_mm: 2000,
-        rank_spacing_mm: 2000,
-        front_x_m: 690,
-        front_y_m: 640,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: 678,
+        front_y_m: 628,
         facing: BRAD_HALF as u16,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "本隊（アランソン公）",
@@ -863,7 +921,7 @@ const FRENCH_CONTINGENTS: &[ContingentDef] = &[
         front_y_m: 700,
         facing: BRAD_HALF as u16,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
     },
     ContingentDef {
         name_ja: "第三線（騎乗）",
@@ -878,13 +936,738 @@ const FRENCH_CONTINGENTS: &[ContingentDef] = &[
         count: 300,
         files: 50,
         formation: FORMATION_LINE,
-        file_spacing_mm: 2000,
-        rank_spacing_mm: 2000,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
         front_x_m: AG_CENTER_X,
         front_y_m: 760,
         facing: BRAD_HALF as u16,
         hosts_army_commander: false,
-        stakes_ahead_m: 0,
+        obstacle: None,
+    },
+];
+
+// ----------------------------------------------------------------------
+// バノックバーン 1314
+// ----------------------------------------------------------------------
+//
+// 数値は `data/scenarios/bannockburn_1314.toml` と同じものを持つ。
+
+/// 地図の一辺（m）。
+const BB_SIZE_M: i32 = 1200;
+/// スコットランド軍の最前列（南）。森（ニューパーク）を出たところ。
+const BB_SCOTS_FRONT_Y: i32 = 560;
+/// イングランド軍の最前列（北）。両軍の間合いは 140 m——シルトロンは
+/// `move_mult` 300 と極端に遅いので、近づけないと会戦にならない。
+const BB_ENGLISH_FRONT_Y: i32 = 700;
+/// 会戦場の中心線（東西）。
+const BB_CENTER_X: i32 = 600;
+
+/// バノックバーンの会戦（1314 年 6 月 24 日、2 日目）。
+///
+/// イングランド軍は 2 つの小川に挟まれた低湿地（カース）で夜を明かし、
+/// そこへスコットランド軍が森を出て降りてきた。数で 2 倍以上まさりながら、
+/// 湿地では騎兵が働かず、後ろは水で退けず、正面の幅も足りない——**数を
+/// 使えないまま押し込まれる**のがこの会戦の骨格になる。
+///
+/// アジンクールが「泥と狭隘と射撃」なら、こちらは「湿地と長槍と密集」。
+/// スコットランド軍の主力はパイクのシルトロンで、`Weapon::pike` は
+/// `requires_front_row = false`（後列も突ける）かつ間合い 5 m なので、
+/// 騎兵の忌避判定（`cavalry` の `spear_wall`）を強く働かせる。
+///
+/// 小川そのものは `Surface::Marsh` で近似している。地形整形は水深グリッドを
+/// 書かないため（`sim_terrain::shaping` 参照）、開けた水面ではなく
+/// 「騎兵が入れない（`cavalry_mult` 0）・移動 35%・疲労 2.2 倍」の湿地として
+/// 表現する。
+pub const BANNOCKBURN_1314: ScenarioDef = ScenarioDef {
+    id: "bannockburn_1314",
+    name_ja: "バノックバーンの会戦",
+    name_en: "Battle of Bannockburn",
+    year: 1314,
+    place_ja: "スコットランド・スターリング近郊",
+    summary_ja: "低湿地に押し込まれたイングランド軍へ、パイクのシルトロンが降りてくる。",
+    historical_strength_ja:
+        "史実の推定兵力: スコットランド 約6,000〜7,000 / イングランド 約15,000〜20,000",
+    scale_note_ja: "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/6 に縮尺してある",
+    terrain: TerrainParams {
+        seed: 0x8A11_0CB0_1314_0001,
+        size_m: BB_SIZE_M as u32,
+        cell_m: 2,
+        relief: 0,
+        // 周囲はニューパークの森。
+        forest_cover: 350,
+        // 6 月とはいえカースは水を含んでいる。
+        marsh_bias: 400,
+        thermal_iterations: 6,
+        river_density: 0,
+        road_count: 1,
+        sea_edge: SeaEdge::None,
+        sea_level_cm: 0,
+    },
+    shaping: BANNOCKBURN_SHAPING,
+    armies: BANNOCKBURN_ARMIES,
+};
+
+/// バノックバーンの地勢。カース（低湿地）を敷き、その左右から小川の湿地で
+/// 挟み込み、南のスコットランド側を高くする。
+const BANNOCKBURN_SHAPING: &[Stamp] = &[
+    // 会戦場の水を抜く。低湿地そのものは下の `Marsh` で表現するので、
+    // ここで消すのは手続き生成が作った湖（騎兵が完全に止まる）。
+    Stamp::Drain {
+        surface: Surface::Meadow,
+        x_m: 330,
+        y_m: 280,
+        w_m: 540,
+        h_m: 800,
+    },
+    // スコットランド側は森を出た先の牧草地。
+    Stamp::SurfaceRect {
+        surface: Surface::Meadow,
+        x_m: 330,
+        y_m: 300,
+        w_m: 540,
+        h_m: 360,
+    },
+    // イングランド軍が夜を明かしたカース。踏めば沈む軟らかい地面で、
+    // 騎兵は速度 4 割・歩兵は疲労 1.9 倍になる。
+    //
+    // ここを `Marsh` にはしない。湿地は騎兵の速度倍率が 0——つまり馬が
+    // 1 mm も動けない——ので、部隊が固まったまま押し合って圧死する。
+    // 「動けるが最悪の足場」は `Mud` が担う。湿地は下の 2 本の小川、
+    // すなわち**入ったら終わりの縁**にだけ使う。
+    Stamp::SurfaceRect {
+        surface: Surface::Mud,
+        x_m: 380,
+        y_m: 660,
+        w_m: 440,
+        h_m: 400,
+    },
+    // 西のバノック川。北へ行くほど内側へ食い込み、退路を狭める。
+    Stamp::SurfaceBelt {
+        surface: Surface::Marsh,
+        ax_m: 330,
+        ay_m: 620,
+        bx_m: 450,
+        by_m: 1100,
+        half_width_m: 110,
+    },
+    // 東のペルストリーム川。
+    Stamp::SurfaceBelt {
+        surface: Surface::Marsh,
+        ax_m: 870,
+        ay_m: 620,
+        bx_m: 750,
+        by_m: 1100,
+        half_width_m: 110,
+    },
+    // 南（スコットランド側）が高い。降りてくる側にモメンタムが乗る。
+    Stamp::HeightRamp {
+        axis: RampAxis::Y,
+        from_m: 400,
+        to_m: 800,
+        from_cm: 700,
+        to_cm: 0,
+    },
+];
+
+const BANNOCKBURN_ARMIES: &[ArmyDef] = &[
+    ArmyDef {
+        faction: 0,
+        name_ja: "スコットランド軍",
+        commander: CommanderDef {
+            name_ja: "ロバート1世（ブルース）",
+            // 数で劣る側が地形を選んで仕掛けた——狡猾さと柔軟さ。
+            archetype: "cunning_captain",
+        },
+        // 4 個のシルトロンが順に前へ出て、湿地へ押し込む。
+        battle_plan: Some(BattlePlan::EchelonAttack),
+        contingents: SCOTS_CONTINGENTS,
+    },
+    ArmyDef {
+        faction: 1,
+        name_ja: "イングランド軍",
+        commander: CommanderDef {
+            name_ja: "エドワード2世",
+            archetype: "stubborn_baron",
+        },
+        // 合意された会戦プランが無いまま夜明けを迎えた軍。ここだけ `None` に
+        // して、指揮官 AI にその場で選ばせる。
+        battle_plan: None,
+        contingents: BB_ENGLISH_CONTINGENTS,
+    },
+];
+
+/// スコットランド軍。パイクのシルトロン 4 個と、少数の軽騎兵。
+/// 正面 `facing = 0` はランクが +Y（北＝イングランド軍側）へ伸びる向き。
+const SCOTS_CONTINGENTS: &[ContingentDef] = &[
+    ContingentDef {
+        name_ja: "左翼シルトロン（ダグラス）",
+        commander: CommanderDef {
+            name_ja: "ジェームズ・ダグラス",
+            archetype: "cunning_captain",
+        },
+        troop_type: 1,
+        quality: Quality::Professional,
+        loadout: Loadout::Pikemen,
+        count: 260,
+        files: 40,
+        formation: FORMATION_SCHILTRON,
+        // 陣形プリセットのファイル間隔（0.5 m）は兵士の当たり判定の直径
+        // （0.7 m）より狭く、そのまま使うと隊列が常時重なって自分で圧死する
+        // （`sim-headless` の `form_battle_units` も同じ理由で 0.8 m を明示
+        // している）。
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: 470,
+        front_y_m: BB_SCOTS_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "中央シルトロン（モレー伯）",
+        commander: CommanderDef {
+            name_ja: "モレー伯トマス・ランドルフ",
+            archetype: "veteran_mercenary",
+        },
+        troop_type: 1,
+        quality: Quality::Veteran,
+        loadout: Loadout::Pikemen,
+        count: 260,
+        files: 40,
+        formation: FORMATION_SCHILTRON,
+        // 陣形プリセットのファイル間隔（0.5 m）は兵士の当たり判定の直径
+        // （0.7 m）より狭く、そのまま使うと隊列が常時重なって自分で圧死する
+        // （`sim-headless` の `form_battle_units` も同じ理由で 0.8 m を明示
+        // している）。
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: 555,
+        front_y_m: BB_SCOTS_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "右翼シルトロン（エドワード・ブルース）",
+        commander: CommanderDef {
+            name_ja: "エドワード・ブルース",
+            archetype: "honor_hungry_knight",
+        },
+        troop_type: 1,
+        quality: Quality::Professional,
+        loadout: Loadout::Pikemen,
+        count: 260,
+        files: 40,
+        formation: FORMATION_SCHILTRON,
+        // 陣形プリセットのファイル間隔（0.5 m）は兵士の当たり判定の直径
+        // （0.7 m）より狭く、そのまま使うと隊列が常時重なって自分で圧死する
+        // （`sim-headless` の `form_battle_units` も同じ理由で 0.8 m を明示
+        // している）。
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: 640,
+        front_y_m: BB_SCOTS_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "国王シルトロン",
+        commander: CommanderDef {
+            name_ja: "ロバート1世 直率",
+            archetype: "professional_marshal",
+        },
+        troop_type: 1,
+        quality: Quality::Elite,
+        loadout: Loadout::Pikemen,
+        count: 260,
+        files: 40,
+        formation: FORMATION_SCHILTRON,
+        // 陣形プリセットのファイル間隔（0.5 m）は兵士の当たり判定の直径
+        // （0.7 m）より狭く、そのまま使うと隊列が常時重なって自分で圧死する
+        // （`sim-headless` の `form_battle_units` も同じ理由で 0.8 m を明示
+        // している）。
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: 725,
+        front_y_m: BB_SCOTS_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: true,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "キース卿の軽騎兵",
+        commander: CommanderDef {
+            name_ja: "ロバート・キース",
+            archetype: "cunning_captain",
+        },
+        troop_type: 3,
+        quality: Quality::Veteran,
+        loadout: Loadout::MountedKnights,
+        count: 90,
+        files: 18,
+        formation: FORMATION_WEDGE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: 750,
+        front_y_m: 520,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+];
+
+/// イングランド軍。湿地の中で騎兵も弓兵も持て余す。
+/// 正面 `facing = BRAD_HALF` はランクが -Y（南＝スコットランド軍側）へ伸びる。
+const BB_ENGLISH_CONTINGENTS: &[ContingentDef] = &[
+    ContingentDef {
+        name_ja: "前衛騎兵（グロスター伯）",
+        commander: CommanderDef {
+            name_ja: "グロスター伯ギルバート・ド・クレア",
+            // 支援を待たずに単独で突っ込み、討たれた。
+            archetype: "reckless_youth",
+        },
+        troop_type: 3,
+        quality: Quality::Elite,
+        loadout: Loadout::MountedKnights,
+        count: 400,
+        files: 40,
+        formation: FORMATION_WEDGE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: 545,
+        front_y_m: BB_ENGLISH_FRONT_Y,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "騎兵（ヘレフォード伯）",
+        commander: CommanderDef {
+            name_ja: "ヘレフォード伯ハンフリー・ド・ボーハン",
+            archetype: "honor_hungry_knight",
+        },
+        troop_type: 3,
+        quality: Quality::Veteran,
+        loadout: Loadout::MountedKnights,
+        count: 300,
+        files: 30,
+        formation: FORMATION_WEDGE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: 665,
+        front_y_m: BB_ENGLISH_FRONT_Y,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "本隊（国王）",
+        commander: CommanderDef {
+            name_ja: "エドワード2世 直率",
+            archetype: "stubborn_baron",
+        },
+        troop_type: 0,
+        quality: Quality::Professional,
+        loadout: Loadout::FootMenAtArms,
+        count: 900,
+        files: 90,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: BB_CENTER_X,
+        front_y_m: 760,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: true,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "長弓隊",
+        commander: CommanderDef {
+            name_ja: "弓兵隊長",
+            // 展開する場所を与えられないまま軽騎兵に蹴散らされた。
+            archetype: "cautious_commander",
+        },
+        troop_type: 2,
+        // 展開する場所も指揮も与えられなかった一団。練度も落として扱う。
+        quality: Quality::Militia,
+        loadout: Loadout::Longbowmen,
+        count: 350,
+        files: 35,
+        formation: FORMATION_PAVISE_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: 700,
+        front_y_m: 930,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "徴募歩兵",
+        commander: CommanderDef {
+            name_ja: "州徴募隊長",
+            archetype: "disciplinarian",
+        },
+        troop_type: 1,
+        quality: Quality::Levy,
+        loadout: Loadout::Spearmen,
+        count: 600,
+        files: 60,
+        formation: FORMATION_SHIELDWALL,
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: 520,
+        front_y_m: 870,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+];
+
+// ----------------------------------------------------------------------
+// クレシー 1346
+// ----------------------------------------------------------------------
+//
+// 数値は `data/scenarios/crecy_1346.toml` と同じものを持つ。
+
+/// 地図の一辺（m）。アジンクールより広い開けた斜面。
+const CR_SIZE_M: i32 = 1400;
+/// イングランド軍・重装兵の最前列（南、斜面の上）。
+const CR_ENGLISH_FRONT_Y: i32 = 440;
+/// 前方へ張り出した長弓兵の最前列。
+const CR_ARCHER_FRONT_Y: i32 = 470;
+/// ジェノヴァ弩兵の最前列（北、斜面の下）。
+const CR_GENOESE_FRONT_Y: i32 = 700;
+/// 会戦場の中心線（東西）。
+const CR_CENTER_X: i32 = 700;
+
+/// クレシーの会戦（1346 年 8 月 26 日）。
+///
+/// アジンクールが「狭い泥の隘路」なら、こちらは**開けた緩斜面**。挟み込む
+/// 森は無く、効いているのは高低差・射程差・そして到着順に突っ込む指揮の
+/// 混乱になる。
+///
+/// - 長弓（射程 120 m・発射間隔 3.5 秒）とジェノヴァの弩（80 m・6 秒）が
+///   撃ち合う。射程と手数の差がそのまま出る
+/// - 長弓兵の前には掘った落とし穴（`StructureKind::Ditch`）。堀は騎兵の
+///   進入そのものを塞ぐ（`hard_blocks_cavalry`）
+/// - 仏軍は行軍からそのまま到着し、弩兵の頭越しに騎兵が突入した。この
+///   「順番待ちのできない軍」を、前後に重ねた 4 つの部隊と、名誉に飢えた
+///   指揮官たちで表現する
+///
+/// 雨で弩の弦が伸びていた点は、弩兵の練度を `Militia` に落として代用して
+/// いる（天候はまだ実装されていない）。
+pub const CRECY_1346: ScenarioDef = ScenarioDef {
+    id: "crecy_1346",
+    name_ja: "クレシーの会戦",
+    name_en: "Battle of Crécy",
+    year: 1346,
+    place_ja: "北フランス・ポンチュー",
+    summary_ja: "開けた緩斜面。上に立つ英軍の長弓が、順に到着する仏軍を迎え撃つ。",
+    historical_strength_ja: "史実の推定兵力: 英 約14,000 / 仏 約25,000〜30,000",
+    scale_note_ja: "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/8 に縮尺してある",
+    terrain: TerrainParams {
+        seed: 0xC5EC_1346_0000_0001,
+        size_m: CR_SIZE_M as u32,
+        cell_m: 2,
+        relief: 0,
+        forest_cover: 250,
+        marsh_bias: 120,
+        thermal_iterations: 6,
+        river_density: 0,
+        road_count: 1,
+        sea_edge: SeaEdge::None,
+        sea_level_cm: 0,
+    },
+    shaping: CRECY_SHAPING,
+    armies: CRECY_ARMIES,
+};
+
+/// クレシーの地勢。開けた耕地と、南（英軍側）へ登る緩斜面。挟む森は西側だけ
+/// （クレシーの森）で、東は開いたまま——アジンクールとの対比になる。
+const CRECY_SHAPING: &[Stamp] = &[
+    // 会戦場の水を抜いてから耕地を敷く（`Stamp::Drain` の注記を参照）。
+    Stamp::Drain {
+        surface: Surface::Farmland,
+        x_m: 350,
+        y_m: 200,
+        w_m: 700,
+        h_m: 960,
+    },
+    Stamp::SurfaceRect {
+        surface: Surface::Farmland,
+        x_m: 350,
+        y_m: 200,
+        w_m: 700,
+        h_m: 960,
+    },
+    // 8 月の刈り入れ後。踏み固められてはいるが泥濘ではない。
+    Stamp::SurfaceRect {
+        surface: Surface::Meadow,
+        x_m: 420,
+        y_m: 480,
+        w_m: 560,
+        h_m: 240,
+    },
+    // 西のクレシーの森。英軍の右翼を守る。
+    Stamp::SurfaceBelt {
+        surface: Surface::DenseForest,
+        ax_m: 300,
+        ay_m: 1400,
+        bx_m: 340,
+        by_m: 0,
+        half_width_m: 120,
+    },
+    // 斜面。英軍の立つ南が 9 m 高い。登る側は疲れ、下る側の射撃は届く。
+    Stamp::HeightRamp {
+        axis: RampAxis::Y,
+        from_m: 300,
+        to_m: 900,
+        from_cm: 900,
+        to_cm: 0,
+    },
+];
+
+const CRECY_ARMIES: &[ArmyDef] = &[
+    ArmyDef {
+        faction: 0,
+        name_ja: "イングランド軍",
+        commander: CommanderDef {
+            name_ja: "エドワード3世",
+            archetype: "professional_marshal",
+        },
+        battle_plan: Some(BattlePlan::DefendHighGround),
+        contingents: CR_ENGLISH_CONTINGENTS,
+    },
+    ArmyDef {
+        faction: 1,
+        name_ja: "フランス軍",
+        commander: CommanderDef {
+            name_ja: "フィリップ6世",
+            archetype: "stubborn_baron",
+        },
+        battle_plan: Some(BattlePlan::CenterPush),
+        contingents: CRECY_FRENCH_CONTINGENTS,
+    },
+];
+
+/// 英軍。両翼の長弓兵が重装兵より前へ張り出す（ハロー隊形）。その前には
+/// 掘った落とし穴。後方に国王の予備。
+const CR_ENGLISH_CONTINGENTS: &[ContingentDef] = &[
+    ContingentDef {
+        name_ja: "左翼 長弓隊",
+        commander: CommanderDef {
+            name_ja: "アランデル伯",
+            archetype: "veteran_mercenary",
+        },
+        troop_type: 2,
+        quality: Quality::Professional,
+        loadout: Loadout::Longbowmen,
+        count: 500,
+        files: 50,
+        formation: FORMATION_PAVISE_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: 610,
+        front_y_m: CR_ARCHER_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: Some(ObstacleDef {
+            kind: StructureKind::Ditch,
+            ahead_m: 10,
+        }),
+    },
+    ContingentDef {
+        name_ja: "黒太子隊（下馬重装兵）",
+        commander: CommanderDef {
+            name_ja: "ウォリック伯（黒太子後見）",
+            archetype: "disciplinarian",
+        },
+        troop_type: 0,
+        quality: Quality::Elite,
+        loadout: Loadout::PollaxeMenAtArms,
+        count: 300,
+        files: 50,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: CR_CENTER_X,
+        front_y_m: CR_ENGLISH_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "右翼 長弓隊",
+        commander: CommanderDef {
+            name_ja: "ノーサンプトン伯",
+            archetype: "veteran_mercenary",
+        },
+        troop_type: 2,
+        quality: Quality::Professional,
+        loadout: Loadout::Longbowmen,
+        count: 500,
+        files: 50,
+        formation: FORMATION_PAVISE_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: 790,
+        front_y_m: CR_ARCHER_FRONT_Y,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: Some(ObstacleDef {
+            kind: StructureKind::Ditch,
+            ahead_m: 10,
+        }),
+    },
+    ContingentDef {
+        name_ja: "第二陣（下馬重装兵）",
+        commander: CommanderDef {
+            name_ja: "ノーサンプトン伯麾下",
+            archetype: "veteran_mercenary",
+        },
+        troop_type: 0,
+        quality: Quality::Veteran,
+        loadout: Loadout::PollaxeMenAtArms,
+        count: 250,
+        files: 50,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: CR_CENTER_X,
+        front_y_m: 415,
+        facing: 0,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "国王予備",
+        commander: CommanderDef {
+            name_ja: "エドワード3世 直率",
+            // 「息子に拍車を勝ち取らせよ」と援軍を送らなかった王。
+            archetype: "cautious_commander",
+        },
+        troop_type: 0,
+        quality: Quality::Elite,
+        loadout: Loadout::PollaxeMenAtArms,
+        count: 200,
+        files: 40,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: CR_CENTER_X,
+        front_y_m: 370,
+        facing: 0,
+        hosts_army_commander: true,
+        obstacle: None,
+    },
+];
+
+/// 仏軍。弩兵を先に立て、その後ろに騎兵が前後 3 段で詰めている。
+const CRECY_FRENCH_CONTINGENTS: &[ContingentDef] = &[
+    ContingentDef {
+        name_ja: "ジェノヴァ弩兵",
+        commander: CommanderDef {
+            name_ja: "オットーネ・ドーリア",
+            archetype: "veteran_mercenary",
+        },
+        troop_type: 2,
+        // 長い行軍の直後に、パヴィス（大盾）を輜重に置いたまま前へ出された。
+        // 雨で弦が伸びていたぶんも含めて練度を落として表現する。
+        quality: Quality::Militia,
+        loadout: Loadout::Crossbowmen,
+        count: 700,
+        files: 70,
+        formation: FORMATION_PAVISE_LINE,
+        file_spacing_mm: 0,
+        rank_spacing_mm: 0,
+        front_x_m: CR_CENTER_X,
+        front_y_m: CR_GENOESE_FRONT_Y,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "アランソン公騎兵",
+        commander: CommanderDef {
+            name_ja: "アランソン公シャルル",
+            // 弩兵の頭越しに突っ込んだ。
+            archetype: "honor_hungry_knight",
+        },
+        troop_type: 3,
+        quality: Quality::Elite,
+        loadout: Loadout::MountedKnights,
+        count: 350,
+        files: 50,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: CR_CENTER_X - 140,
+        front_y_m: 820,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "ボヘミア王隊",
+        commander: CommanderDef {
+            name_ja: "ボヘミア王ヨハン（盲目王）",
+            archetype: "reckless_youth",
+        },
+        troop_type: 3,
+        quality: Quality::Veteran,
+        loadout: Loadout::MountedKnights,
+        count: 300,
+        files: 50,
+        formation: FORMATION_WEDGE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: CR_CENTER_X + 140,
+        front_y_m: 820,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "第二陣騎兵",
+        commander: CommanderDef {
+            name_ja: "フィリップ6世 直率",
+            archetype: "stubborn_baron",
+        },
+        troop_type: 3,
+        quality: Quality::Veteran,
+        loadout: Loadout::MountedKnights,
+        count: 350,
+        files: 50,
+        formation: FORMATION_LINE,
+        file_spacing_mm: 2500,
+        rank_spacing_mm: 2500,
+        front_x_m: CR_CENTER_X - 70,
+        front_y_m: 960,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: true,
+        obstacle: None,
+    },
+    ContingentDef {
+        name_ja: "徴募歩兵",
+        commander: CommanderDef {
+            name_ja: "民兵隊長",
+            archetype: "cautious_commander",
+        },
+        troop_type: 1,
+        quality: Quality::Levy,
+        loadout: Loadout::Spearmen,
+        count: 600,
+        files: 60,
+        formation: FORMATION_SHIELDWALL,
+        file_spacing_mm: 800,
+        rank_spacing_mm: 800,
+        front_x_m: CR_CENTER_X,
+        front_y_m: 1090,
+        facing: BRAD_HALF as u16,
+        hosts_army_commander: false,
+        obstacle: None,
     },
 ];
 
@@ -944,42 +1727,52 @@ mod tests {
 
     #[test]
     fn deploys_the_declared_number_of_soldiers_into_a_two_level_command_tree() {
-        let w = agincourt();
-        assert_eq!(w.soldiers.len() as u32, AGINCOURT_1415.soldier_count());
+        for def in SCENARIOS {
+            let w = build_world(def);
+            assert_eq!(w.soldiers.len() as u32, def.soldier_count(), "{}", def.id);
 
-        let roots: Vec<_> = w
-            .command
-            .nodes
-            .iter()
-            .filter(|n| n.parent.is_none())
-            .collect();
-        assert_eq!(roots.len(), 2, "軍のルートノードは陣営ごとに 1 つ");
-        for root in &roots {
-            assert!(root.unit.is_none(), "軍ノードは実体を持たない");
-            assert!(!root.children.is_empty());
-            assert_eq!(root.command_state, CommandState::Commanded);
-        }
-        let leaves = w.command.nodes.iter().filter(|n| n.unit.is_some()).count();
-        assert_eq!(
-            leaves,
-            AGINCOURT_1415
-                .armies
+            let roots: Vec<_> = w
+                .command
+                .nodes
                 .iter()
-                .map(|a| a.contingents.len())
-                .sum::<usize>()
-        );
+                .filter(|n| n.parent.is_none())
+                .collect();
+            assert_eq!(roots.len(), def.armies.len(), "{}: 軍ノードの数", def.id);
+            for root in &roots {
+                assert!(root.unit.is_none(), "{}: 軍ノードは実体を持たない", def.id);
+                assert!(!root.children.is_empty(), "{}", def.id);
+                assert_eq!(root.command_state, CommandState::Commanded, "{}", def.id);
+            }
+            let leaves = w.command.nodes.iter().filter(|n| n.unit.is_some()).count();
+            assert_eq!(
+                leaves,
+                def.armies
+                    .iter()
+                    .map(|a| a.contingents.len())
+                    .sum::<usize>(),
+                "{}",
+                def.id
+            );
+        }
     }
 
     #[test]
     fn soldiers_start_on_their_formation_slots() {
-        let mut w = agincourt();
-        let before: Vec<Vec2Fx> = (0..w.soldiers.len()).map(|i| w.soldiers.pos(i)).collect();
-        w.tick();
-        // 陣形スロットの上に生成しているので、開始直後に隊列を組み直す動き
-        // （数十 cm 以上の移動）は起きない。
-        for (i, &was) in before.iter().enumerate() {
-            let moved = sim_math::fx_to_mm(sim_math::dist(was, w.soldiers.pos(i)));
-            assert!(moved < 300, "兵士 {i} が開始直後に {moved} mm 動いた");
+        for def in SCENARIOS {
+            let mut w = build_world(def);
+            let before: Vec<Vec2Fx> = (0..w.soldiers.len()).map(|i| w.soldiers.pos(i)).collect();
+            w.tick();
+            // 陣形スロットの上に生成しているので、開始直後に隊列を組み直す動き
+            // （数十 cm 以上の移動）は起きない。押し合いが起きる配置は、
+            // 部隊の間隔か陣形の間隔が足りていないということ。
+            for (i, &was) in before.iter().enumerate() {
+                let moved = sim_math::fx_to_mm(sim_math::dist(was, w.soldiers.pos(i)));
+                assert!(
+                    moved < 300,
+                    "{}: 兵士 {i} が開始直後に {moved} mm 動いた",
+                    def.id
+                );
+            }
         }
     }
 
@@ -1070,12 +1863,29 @@ mod tests {
             .iter()
             .filter(|s| s.kind == StructureKind::Stakes)
             .collect();
-        assert_eq!(stakes.len(), 2, "長弓隊 2 隊ぶんの杭列");
+        // 1 本の長い線分ではなく、耐久が独立した短い区画の連なりになっている
+        // （数騎の突破で防御線が丸ごと消えないように）。
+        assert!(stakes.len() >= 20, "杭列が区画に分かれていない");
         for s in &stakes {
             assert_eq!(s.owner, 0);
             assert_eq!(s.completion_permille, 1000, "会戦前に打ち終えている");
             // 杭列は長弓兵の前（＝仏軍側）にある。
             assert!(sim_math::fx_to_mm(s.a.y) / 1000 > AG_ENGLISH_FRONT_Y);
+        }
+
+        // 両翼それぞれの正面を、隙間なく覆っている。
+        for wing_center_x in [530, 675] {
+            let covered: Vec<&&crate::structures::Structure> = stakes
+                .iter()
+                .filter(|s| {
+                    let mid_x = sim_math::fx_to_mm(s.a.x + s.b.x) / 2000;
+                    (mid_x - wing_center_x).abs() < 40
+                })
+                .collect();
+            assert!(
+                covered.len() >= 10,
+                "x={wing_center_x} の長弓隊の正面が杭列で覆われていない"
+            );
         }
     }
 
@@ -1099,18 +1909,166 @@ mod tests {
 
     #[test]
     fn the_same_scenario_always_produces_the_same_world() {
-        let a = agincourt();
-        let b = agincourt();
-        assert_eq!(a.terrain.hash(), b.terrain.hash());
-        assert_eq!(a.state_hash(), b.state_hash());
-
-        let mut a = a;
-        let mut b = b;
-        for _ in 0..120 {
-            a.tick();
-            b.tick();
+        for def in SCENARIOS {
+            let mut a = build_world(def);
+            let mut b = build_world(def);
+            assert_eq!(a.terrain.hash(), b.terrain.hash(), "{}", def.id);
+            assert_eq!(a.state_hash(), b.state_hash(), "{}", def.id);
+            for _ in 0..120 {
+                a.tick();
+                b.tick();
+            }
+            assert_eq!(a.state_hash(), b.state_hash(), "{}: 120 tick 後", def.id);
         }
-        assert_eq!(a.state_hash(), b.state_hash());
+    }
+
+    /// どのプリセットでも、兵士は最初から**歩ける地面**の上に立っている。
+    ///
+    /// 手続き生成の湖が展開地にかかっていると、そこだけ騎兵が完全に止まり
+    /// （`cavalry_mult` 0）、隊列が押し合ったまま圧死していく。目に見える
+    /// 戦闘が起きないまま片方の軍が溶けるので、必ずここで捕まえる。
+    #[test]
+    fn every_soldier_starts_on_ground_they_can_stand_on() {
+        for def in SCENARIOS {
+            let w = build_world(def);
+            for i in 0..w.soldiers.len() {
+                let pos = w.soldiers.pos(i);
+                let (cx, cy) = w.terrain.world_to_cell(pos.x, pos.y);
+                let idx = w.terrain.idx(cx, cy);
+                let surface = Surface::from_u8(w.terrain.surface[idx]);
+                assert!(
+                    w.terrain.passability[idx] > 0,
+                    "{}: 兵士 {i} が通行不能な {surface:?} の上にいる",
+                    def.id
+                );
+                assert_eq!(
+                    w.terrain.water[idx], 0,
+                    "{}: 兵士 {i} が水域（{surface:?}）の上にいる",
+                    def.id
+                );
+                assert!(
+                    SURFACE_EFFECTS[surface as usize].cavalry_mult > 0
+                        || w.soldiers.hot.flags[i] & flags::MOUNTED == 0,
+                    "{}: 騎兵 {i} が馬の入れない {surface:?} の上にいる",
+                    def.id
+                );
+            }
+        }
+    }
+
+    /// プリセットが違えば、地形も陣容も別物になっている（同じ地形を使い回して
+    /// いないことの確認）。
+    #[test]
+    fn presets_describe_distinct_battles() {
+        let mut seen_terrain = Vec::new();
+        let mut seen_id = Vec::new();
+        for def in SCENARIOS {
+            let w = build_world(def);
+            assert!(!seen_id.contains(&def.id), "id が重複している: {}", def.id);
+            seen_id.push(def.id);
+            let hash = w.terrain.hash();
+            assert!(
+                !seen_terrain.contains(&hash),
+                "{} の地形が他のプリセットと同一",
+                def.id
+            );
+            seen_terrain.push(hash);
+        }
+    }
+
+    /// バノックバーン: イングランド軍は騎兵の使えない低湿地に立ち、退路は
+    /// 北へ行くほど狭まる。
+    #[test]
+    fn bannockburn_pins_the_english_in_a_carse_hemmed_by_impassable_marsh() {
+        let w = build_world(&BANNOCKBURN_1314);
+        let surface_at = |x: i32, y: i32| w.terrain.surface_at(fx(x), fx(y));
+
+        // 立っているのは軟らかい泥。動けるが、遅く、疲れる。
+        assert_eq!(
+            surface_at(BB_CENTER_X, BB_ENGLISH_FRONT_Y + 40),
+            Surface::Mud,
+            "イングランド軍がカースに立っていない"
+        );
+        let mud = &SURFACE_EFFECTS[Surface::Mud as usize];
+        assert!(mud.cavalry_mult > 0 && mud.cavalry_mult < 500);
+        assert!(mud.fatigue_mult > 1500);
+        // 左右と背後の小川は湿地。馬は 1 mm も入れない。
+        assert_eq!(surface_at(400, 900), Surface::Marsh);
+        assert_eq!(surface_at(800, 900), Surface::Marsh);
+        let marsh = &SURFACE_EFFECTS[Surface::Marsh as usize];
+        assert_eq!(marsh.cavalry_mult, 0);
+        assert!(marsh.fatigue_mult > 2000);
+        // スコットランド側は乾いた牧草地。
+        assert_eq!(
+            surface_at(BB_CENTER_X, BB_SCOTS_FRONT_Y - 40),
+            Surface::Meadow
+        );
+
+        // 退路（北）は小川に挟まれて狭まっていく。
+        let open_width_at = |y: i32| {
+            (300..900)
+                .filter(|&x| surface_at(x, y) != Surface::Marsh)
+                .count()
+        };
+        let _ = open_width_at(0);
+        assert!(
+            open_width_at(1000) < open_width_at(BB_ENGLISH_FRONT_Y),
+            "イングランド軍の背後が狭まっていない"
+        );
+
+        // 主力はパイクのシルトロン。後列も突ける間合いが騎兵の忌避を誘う。
+        let pikes = (0..w.soldiers.len())
+            .filter(|&i| w.soldiers.faction[i] == 0 && w.combat.weapons[i] == Weapon::pike())
+            .count();
+        assert_eq!(pikes, 1040, "シルトロン 4 個ぶんのパイク");
+        assert!(!Weapon::pike().requires_front_row);
+    }
+
+    /// クレシー: 英軍は斜面の上に立ち、長弓はジェノヴァの弩より遠くへ届く。
+    /// 長弓兵の前には騎兵を通さない落とし穴がある。
+    #[test]
+    fn crecy_gives_the_longbows_range_and_height_over_the_crossbows() {
+        let w = build_world(&CRECY_1346);
+
+        let english_h = w.terrain.height_at(fx(CR_CENTER_X), fx(CR_ENGLISH_FRONT_Y));
+        let genoese_h = w.terrain.height_at(fx(CR_CENTER_X), fx(CR_GENOESE_FRONT_Y));
+        let diff_mm = sim_math::fx_to_mm(english_h - genoese_h);
+        assert!(
+            diff_mm > 2_000,
+            "英軍が斜面の上に立っていない（{diff_mm} mm）"
+        );
+
+        assert!(
+            Weapon::longbow().reach > Weapon::crossbow().reach,
+            "長弓が弩より短射程になっている"
+        );
+
+        // 落とし穴は騎兵の進入そのものを塞ぐ。
+        let ditches: Vec<_> = w
+            .structures
+            .structures
+            .iter()
+            .filter(|s| s.kind == StructureKind::Ditch)
+            .collect();
+        assert!(ditches.len() >= 18, "長弓隊 2 隊ぶんの落とし穴が足りない");
+        assert!(StructureKind::Ditch.hard_blocks_cavalry());
+        for d in &ditches {
+            assert_eq!(d.owner, 0);
+            assert_eq!(d.completion_permille, 1000);
+            assert!(sim_math::fx_to_mm(d.a.y) / 1000 > CR_ARCHER_FRONT_Y);
+        }
+
+        // 仏軍の第一線は弩兵、その後ろは騎兵。
+        let crossbows = (0..w.soldiers.len())
+            .filter(|&i| w.soldiers.faction[i] == 1 && w.combat.weapons[i] == Weapon::crossbow())
+            .count();
+        assert_eq!(crossbows, 700);
+        let french_mounted = (0..w.soldiers.len())
+            .filter(|&i| {
+                w.soldiers.faction[i] == 1 && w.soldiers.hot.flags[i] & flags::MOUNTED != 0
+            })
+            .count();
+        assert_eq!(french_mounted, 1000, "コンロワ 3 隊ぶん");
     }
 
     /// 会戦が「勝手に始まる」ことの確認。命令を一切与えていないのに、性格の

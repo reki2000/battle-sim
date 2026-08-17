@@ -21,7 +21,7 @@ M3 では編成・陣形のプリセットを追加した。読み込み機構�
 | `factions/medieval_western.toml` | M3 のプリセットデータ |
 | `visual-profiles/medieval_western.toml` | 14世紀ヨーロッパの兵科・行動・画像再生契約 |
 | `morale.toml` | `crates/sim-core/src/soldiers.rs` の初期士気 |
-| `scenarios/agincourt_1415.toml` | `crates/sim-core/src/scenario.rs` の `AGINCOURT_1415` |
+| `scenarios/*.toml` | `crates/sim-core/src/scenario.rs` の会戦プリセット定数 |
 
 M3（編成）で `sim-data` を追加し、以下を順に外へ出す。
 

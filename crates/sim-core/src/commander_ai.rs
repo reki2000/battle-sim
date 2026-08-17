@@ -449,10 +449,31 @@ impl Scored {
     }
 }
 
-fn score_envelop(a: &SituationAssessment, attrs: &CommanderAttrs, plan_bonus: i32) -> Scored {
+/// 兵数（人）を、自軍の規模に対する割合（‰）へ直す。
+///
+/// スコアの他の項はどれも 0..±150 程度に収まるよう作られているのに、兵数だけは
+/// 生の人数で入っていた。数千人規模の軍では 1 項だけが数千点になり、性格も
+/// 会戦プランのバイアスも押し流されて、どんな指揮官でも同じ目的を選んでしまう。
+fn permille_of(count: u32, own_strength: u32) -> i32 {
+    if own_strength == 0 {
+        0
+    } else {
+        (count as i64 * 1000 / own_strength as i64).min(2000) as i32
+    }
+}
+
+fn score_envelop(
+    a: &SituationAssessment,
+    attrs: &CommanderAttrs,
+    own_strength: u32,
+    plan_bonus: i32,
+) -> Scored {
     Scored::new()
         .add("force_ratio", (a.force_ratio_permille - 1000).max(0) / 30)
-        .add("reserve", (a.reserve_available as i32) * 3)
+        .add(
+            "reserve",
+            permille_of(a.reserve_available, own_strength) / 10,
+        )
         .add("boldness", attrs.boldness as i32 * 3 / 10)
         .add("tactical_skill", attrs.tactical_skill as i32 * 2 / 10)
         .add("caution", -(attrs.caution as i32) * 3 / 10)
@@ -479,10 +500,14 @@ fn score_hold_high_ground(
 fn score_commit_reserve(
     a: &SituationAssessment,
     attrs: &CommanderAttrs,
+    own_strength: u32,
     plan_bonus: i32,
 ) -> Scored {
     Scored::new()
-        .add("front_line_crisis", (a.rear_threat as i32) / 4)
+        .add(
+            "front_line_crisis",
+            permille_of(a.rear_threat as u32, own_strength) / 8,
+        )
         .add("boldness", attrs.boldness as i32 * 2 / 10)
         .add("momentum", a.momentum.max(0) * 3 / 10)
         .add("caution", -(attrs.caution as i32) * 3 / 10)
@@ -546,6 +571,7 @@ fn choose_objective(
     };
     let attrs = node.commander_attrs;
     let plan = node.battle_plan;
+    let own_strength = node.stats.alive.max(subtree_alive(command, node_id));
 
     let mut candidates: Vec<(Objective, Scored)> = Vec::new();
     candidates.push((
@@ -561,6 +587,7 @@ fn choose_objective(
         score_commit_reserve(
             &assessment,
             &attrs,
+            own_strength,
             plan_objective_bias(plan, ObjectiveKind::CommitReserve),
         ),
     ));
@@ -570,6 +597,7 @@ fn choose_objective(
             score_envelop(
                 &assessment,
                 &attrs,
+                own_strength,
                 plan_objective_bias(plan, ObjectiveKind::Envelop),
             ),
         ));
@@ -662,9 +690,19 @@ fn decompose_objective(
     match objective {
         Objective::HoldHighGround => {
             for &child in &children {
+                // 「その場を保て」の目標は、部隊が既に組んでいる陣形の原点
+                // （最後尾ランクの中心）。重心を渡すと、`formation_origin` が
+                // 重心へ移って隊列全体が奥行きの半分だけ前へずれる——命令の
+                // たびに前進してしまい、止まっているはずの部隊が前の部隊を
+                // 押して圧死させる。
                 let pos = command
                     .node(child)
-                    .map(|n| n.stats.centroid)
+                    .map(|n| {
+                        n.unit
+                            .as_ref()
+                            .map(|u| u.formation_origin)
+                            .unwrap_or(n.stats.centroid)
+                    })
                     .unwrap_or(own_centroid);
                 command.issue_order(
                     node_id,
