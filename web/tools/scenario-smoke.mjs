@@ -41,35 +41,31 @@ const waitForDeploy = () =>
   );
 
 /**
- * ワールドが組み直されるまで待つ。
+ * ワールドが組み直され、HUD が落ち着くまで待って兵数を返す。
  *
- * 「兵士が 1 人以上いる」だけでは足りない——切り替えの瞬間はまだ前の
- * ワールドが動いており、その HUD をそのまま読んでしまう（前の会戦の兵数と
- * 進んだ tick を読み、新しい会戦が「進んでいない」ように見える）。
- * 組み直しでは tick が 0 に戻るので、それを合図にする。
+ * 途中の HUD は当てにならない。切り替えた直後はまだ前のワールドが動いて
+ * いるし（前の会戦の兵数と進んだ tick を読んでしまう）、組み直しの最中は
+ * 一瞬「兵士 0」を通る。さらに `?scenario=` 起動では、URL による選択と
+ * ループ先頭の再選択で組み直しが 2 回続けて走ることもある。
+ *
+ * そこで「兵数が 1 人以上で、続けて 2 回読んでも同じ」まで待つ。
  */
-const waitForRebuild = async (tickBefore) => {
-  if (tickBefore <= 0) {
-    // まだ 1 tick も進んでいないなら「0 に戻る」を待てない。
-    await waitForDeploy();
-    await page.waitForTimeout(1000);
-    return;
+const waitForSettledDeploy = async () => {
+  const deadline = Date.now() + 60_000;
+  let previous = -1;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(400);
+    const count = await soldiers();
+    if (count > 0 && count === previous) return count;
+    previous = count;
   }
-  await page.waitForFunction(
-    (prev) => {
-      const text = document.getElementById("hud")?.textContent ?? "";
-      const now = Number(/tick (\d+)/.exec(text)?.[1] ?? -1);
-      const count = Number(/兵士 (\d+)/.exec(text)?.[1] ?? 0);
-      return count > 0 && now >= 0 && now < prev;
-    },
-    tickBefore,
-    { timeout: 60_000 },
-  );
+  return await soldiers();
 };
 
 // 1. URL からプリセットを指定して起動できる
 await page.goto(`${URL}?scenario=${FIRST}`, { waitUntil: "networkidle" });
 await waitForDeploy();
+await waitForSettledDeploy();
 
 const options = await page.$$eval("#scenario-panel select option", (els) =>
   els.map((e) => ({ value: e.value, label: e.textContent ?? "" })),
@@ -82,10 +78,9 @@ await page.keyboard.press("4"); // 8x
 
 // 2. どのプリセットも、選ぶと陣容が入れ替わり、命令なしで会戦が進む
 for (const preset of presets) {
-  const tickBeforeSwitch = await tick();
   await page.selectOption("#scenario-panel select", preset.value);
-  await waitForRebuild(tickBeforeSwitch);
-  const deployed = await soldiers();
+  await waitForDeploy();
+  const deployed = await waitForSettledDeploy();
 
   const panel = ((await page.textContent("#scenario-panel")) ?? "").replace(/\s+/g, " ");
   const armies = (panel.match(/■/g) ?? []).length;
@@ -105,9 +100,9 @@ for (const preset of presets) {
 }
 
 // 3. 対称デモ配置へ戻せる（ワールドを組み直しても壊れない）
-const tickBeforeSandbox = await tick();
 await page.selectOption("#scenario-panel select", "-1");
-await waitForRebuild(tickBeforeSandbox);
+await waitForDeploy();
+await waitForSettledDeploy();
 await page.waitForTimeout(4000);
 console.log("デモへ復帰:", (await hud()).replace(/\n/g, " | "));
 await page.screenshot({ path: `${OUT}/scenario-sandbox.png` });
