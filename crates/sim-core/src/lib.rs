@@ -1659,6 +1659,81 @@ mod tests {
         );
     }
 
+    /// 戦列に立っている疲れた兵士は、後ろで休んでいる仲間と入れ替わる
+    /// （仕様 06 章 6.1 節）。スロット番号ではなく「実際に交戦しているか」で
+    /// 戦列を判定していることの確認。
+    #[test]
+    fn tired_fighters_are_relieved_by_rested_comrades() {
+        let mut w = small_world();
+        let attrs = Attrs::new(140, 140, 140, 140, 140, 140, 140, 240, 60, 120, 140, 140);
+        // 交戦する 4 人（疲れきっている）＋ 後ろで休む 4 人
+        let mut ours = Vec::new();
+        for k in 0..4 {
+            let id = w.spawn(
+                Vec2Fx::new(fx(150) + fx(k), fx(150)),
+                sim_math::brad_from_deg(90),
+                0,
+                0,
+                attrs,
+                0,
+            );
+            w.soldiers.fatigue[id as usize] = 9_000;
+            ours.push(id);
+        }
+        let rested: Vec<SoldierId> = (0..4)
+            .map(|k| {
+                w.spawn(
+                    Vec2Fx::new(fx(150) + fx(k), fx(146)),
+                    sim_math::brad_from_deg(90),
+                    0,
+                    0,
+                    attrs,
+                    0,
+                )
+            })
+            .collect();
+        ours.extend(rested.iter().copied());
+        // 敵の戦列（すぐ目の前）
+        for k in 0..4 {
+            w.spawn(
+                Vec2Fx::new(fx(150) + fx(k), fx(150) + fx_from_mm(900)),
+                sim_math::brad_from_deg(270),
+                0,
+                1,
+                attrs,
+                0,
+            );
+        }
+
+        let unit = organization::Unit {
+            soldiers: ours.clone(),
+            troop_type: 0,
+            formation: organization::FORMATION_LINE,
+            formation_origin: Vec2Fx::new(fx(150), fx(150)),
+            formation_facing: sim_math::brad_from_deg(90),
+            ranks: 2,
+            file_spacing: fx_from_mm(1_000),
+            rank_spacing: fx_from_mm(1_000),
+            banner: None,
+            formation_change: None,
+            path: Vec::new(),
+            path_final: Vec2Fx::new(fx(150), fx(150)),
+            pursuit_leash: None,
+        };
+        let node = w.add_command_node(None, 0, 0, ours[0], vec![], Some(unit));
+
+        for _ in 0..120 {
+            w.tick();
+        }
+        assert!(w.command.rotations > 0, "戦列の疲れた兵士が交代していない");
+        // 交代は並び順（＝スロット）の入れ替えとして現れる
+        let after = w.command.node(node).unwrap().unit.as_ref().unwrap();
+        assert_ne!(
+            after.soldiers, ours,
+            "交代したのにスロットの並びが変わっていない"
+        );
+    }
+
     #[test]
     fn soldiers_track_terrain_height() {
         let mut w = small_world();

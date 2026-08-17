@@ -560,8 +560,11 @@ const FLANK_OFFSET_M: i32 = 60;
 const ROTATION_INTERVAL_TICKS: u32 = 40;
 /// 前列の兵士がこの疲労を超えたら、交代の対象になる。
 const ROTATION_FATIGUE_THRESHOLD: u16 = 5_500;
-/// 後列と入れ替える意味があるとみなす疲労差。
+/// 交代する意味があるとみなす疲労差。
 const ROTATION_FATIGUE_MARGIN: u16 = 1_500;
+/// 1 回の判定で入れ替える人数の上限。列がまるごと入れ替わって陣形が溶けない
+/// ようにするためと、部隊が大きくても走査を O(人数) に抑えるため。
+const MAX_ROTATIONS_PER_INTERVAL: usize = 4;
 
 /// 追撃の紐（leash）。仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに
 /// 現実的な時間がかかる」を実装するための、部隊単位の上限距離。
@@ -1372,13 +1375,21 @@ impl CommandTree {
         }
     }
 
-    /// 疲れた前列を後列と入れ替える（仕様 06 章 6 節「指揮官は交代を命じる」）。
+    /// 疲れた兵士を、戦っていない仲間と入れ替える（仕様 06 章 6 節
+    /// 「指揮官は交代を命じられる」）。
     ///
     /// 陣形スロットは `unit.soldiers` の並び順から決まるので、**配列の要素を
-    /// 入れ替えるだけで前列と後列が入れ替わる**。中世会戦は疲労で決まるので、
-    /// これができる部隊は持久戦に強い——そして誰でもできる芸当ではないので、
-    /// 入れ替わる 2 人の `discipline` が確率を決める。規律の低い部隊では
-    /// 疲れた兵士が前列に残り続ける。
+    /// 入れ替えるだけで立ち位置が入れ替わる**。入れ替えた 2 人はそれぞれ相手の
+    /// スロットへ歩き出す。
+    ///
+    /// 「前列」をスロット番号で決めないのは、スロットの幾何（`formation_facing`
+    /// と rank の伸びる向き）から見て、どちら側が敵に近いかが部隊の向きと敵の
+    /// 位置で変わるため。代わりに**実際に交戦している（`target` を持つ）者**を
+    /// 戦列とみなす。誰も交戦していない部隊——行軍中の疲労——では、単に最も
+    /// 疲れた者と最も元気な者を入れ替える。
+    ///
+    /// 交代は訓練の産物なので、入れ替わる 2 人の `discipline` が確率を決める。
+    /// 規律の低い部隊では疲れた兵士が戦列に残り続け、そのまま崩れる。
     ///
     /// `world_seed` と `tick` から判定を導くので、実行順序に依存しない。
     pub fn rotate_tired_ranks(&mut self, soldiers: &Soldiers, world_seed: u64, tick: u32) {
@@ -1389,57 +1400,87 @@ impl CommandTree {
             let Some(unit) = self.nodes[index].unit.as_mut() else {
                 continue;
             };
-            if unit.ranks < 2 || unit.formation_change.is_some() {
+            if unit.ranks < 2 || unit.formation_change.is_some() || unit.soldiers.len() < 2 {
                 continue;
             }
-            // 生きている者だけがスロットを占める（`formation_goals` と同じ規則）
-            let alive: Vec<usize> = (0..unit.soldiers.len())
-                .filter(|&k| soldiers.is_active_id(unit.soldiers[k]))
-                .collect();
-            let ranks = unit.ranks as usize;
-            let files = alive.len().div_ceil(ranks).max(1);
-            if alive.len() <= files {
-                continue;
+            // 借用を跨がないよう、判定は ID を受け取る関数にしておく
+            // （`unit.soldiers` は最後に swap で書き換える）
+            let fighting = |id: SoldierId| soldiers.target[id as usize] != crate::soldiers::NO_ID;
+            let alive = |id: SoldierId| soldiers.is_active_id(id);
+            let fatigue = |id: SoldierId| soldiers.fatigue[id as usize];
+
+            let mut anyone_fighting = false;
+            // 交代で下がる側の候補（疲れて戦っている者）と、上がる側の候補
+            // （元気で戦っていない者）を 1 パスで集める。上がる側は
+            // 「最も元気な数人」だけ持てばよいので、固定長の配列に収める
+            // ——部隊が 500 人でも走査は 1 回、確保はゼロ。
+            let mut fresh: [(u16, usize); MAX_ROTATIONS_PER_INTERVAL] =
+                [(u16::MAX, usize::MAX); MAX_ROTATIONS_PER_INTERVAL];
+            for k in 0..unit.soldiers.len() {
+                let id = unit.soldiers[k];
+                if !alive(id) {
+                    continue;
+                }
+                if fighting(id) {
+                    anyone_fighting = true;
+                    continue;
+                }
+                let f = fatigue(id);
+                // 挿入ソート（要素は MAX_ROTATIONS_PER_INTERVAL 個だけ）
+                let mut slot = MAX_ROTATIONS_PER_INTERVAL;
+                for (n, entry) in fresh.iter().enumerate() {
+                    if f < entry.0 {
+                        slot = n;
+                        break;
+                    }
+                }
+                if slot < MAX_ROTATIONS_PER_INTERVAL {
+                    for n in (slot + 1..MAX_ROTATIONS_PER_INTERVAL).rev() {
+                        fresh[n] = fresh[n - 1];
+                    }
+                    fresh[slot] = (f, k);
+                }
             }
 
             let mut rotated = 0usize;
-            let limit = (files / 2).max(1);
-            for slot in 0..files.min(alive.len()) {
-                if rotated >= limit {
+            for k in 0..unit.soldiers.len() {
+                if rotated >= MAX_ROTATIONS_PER_INTERVAL {
                     break;
                 }
-                let front = alive[slot];
-                let front_id = unit.soldiers[front];
-                if soldiers.fatigue[front_id as usize] < ROTATION_FATIGUE_THRESHOLD {
+                let tired_id = unit.soldiers[k];
+                if !alive(tired_id) || fatigue(tired_id) < ROTATION_FATIGUE_THRESHOLD {
                     continue;
                 }
-                // 後列のいちばん元気な者を選ぶ（同値なら後ろの列を優先）
-                let mut best: Option<(u16, usize)> = None;
-                for &candidate in alive.iter().skip(files) {
-                    let id = unit.soldiers[candidate];
-                    let fatigue = soldiers.fatigue[id as usize];
-                    if fatigue + ROTATION_FATIGUE_MARGIN > soldiers.fatigue[front_id as usize] {
-                        continue;
-                    }
-                    if best.map_or(true, |(best_fatigue, _)| fatigue <= best_fatigue) {
-                        best = Some((fatigue, candidate));
-                    }
+                // 交戦している部隊では、下がるのは戦列に立っている者だけ
+                if anyone_fighting && !fighting(tired_id) {
+                    continue;
                 }
-                let Some((_, rear)) = best else {
+                let tired_fatigue = fatigue(tired_id);
+                let Some(&(_, rested)) = fresh.iter().find(|&&(f, idx)| {
+                    idx != usize::MAX && f + ROTATION_FATIGUE_MARGIN <= tired_fatigue
+                }) else {
                     continue;
                 };
-                let rear_id = unit.soldiers[rear];
-                // 交代は訓練の産物。規律の低い 2 人では入れ替わらない
-                let discipline = (soldiers.attrs[front_id as usize].discipline as i32
-                    + soldiers.attrs[rear_id as usize].discipline as i32)
+                if rested == k {
+                    continue;
+                }
+                let rested_id = unit.soldiers[rested];
+                let discipline = (soldiers.attrs[tired_id as usize].discipline as i32
+                    + soldiers.attrs[rested_id as usize].discipline as i32)
                     / 2;
                 let chance = (discipline * 3).clamp(0, 900) as u32;
                 let mut rng =
-                    Rng::stream(world_seed, front_id, sim_math::Purpose::DecisionNoise, tick);
+                    Rng::stream(world_seed, tired_id, sim_math::Purpose::DecisionNoise, tick);
                 if !rng.chance_permille(chance) {
                     continue;
                 }
-                unit.soldiers.swap(front, rear);
+                unit.soldiers.swap(k, rested);
+                // 使った受け手は空にする（同じ兵士を二重に上げない）
+                for entry in fresh.iter_mut() {
+                    if entry.1 == rested || entry.1 == k {
+                        *entry = (u16::MAX, usize::MAX);
+                    }
+                }
                 rotated += 1;
                 self.rotations = self.rotations.saturating_add(1);
             }
