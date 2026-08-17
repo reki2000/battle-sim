@@ -171,7 +171,7 @@ function assetUrl(path: string): string {
   if (!path.startsWith("sprites/v2/sets/") || path.includes("..") || path.startsWith("/")) {
     throw new Error(`manifest に非正規パスがあります: ${path}`);
   }
-  return `/assets/${path}`;
+  return `${import.meta.env.BASE_URL}assets/${path}`;
 }
 
 async function loadSpriteSheet(url: string): Promise<SpriteSheet> {
@@ -201,12 +201,15 @@ async function loadSpriteSheet(url: string): Promise<SpriteSheet> {
  */
 export async function loadSpriteRuntime(profileId = "medieval_western"): Promise<SpriteRuntime> {
   const profile = await fetchJson<SpriteRuntimeProfile>(
-    `/assets/sprites/v2/profiles/${profileId}.json`,
+    `${import.meta.env.BASE_URL}assets/sprites/v2/profiles/${profileId}.json`,
   );
   if (!profile) throw new Error(`スプライト実行時プロファイル ${profileId} がありません`);
   validateProfile(profile);
 
-  const manifest = await fetchJson<SpriteManifestV2>("/assets/sprites/v2/manifest.json", true);
+  const manifest = await fetchJson<SpriteManifestV2>(
+    `${import.meta.env.BASE_URL}assets/sprites/v2/manifest.json`,
+    true,
+  );
   const loaded = new Map<string, SpriteSheet>();
   if (manifest) {
     validateManifest(manifest);

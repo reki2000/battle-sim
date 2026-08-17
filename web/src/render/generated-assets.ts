@@ -72,7 +72,7 @@ function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
 export async function loadTerrainAtlas(): Promise<TerrainAtlas> {
   let image: HTMLImageElement;
   try {
-    image = await loadImage("/assets/terrain-atlas.png");
+    image = await loadImage(`${import.meta.env.BASE_URL}assets/terrain-atlas.png`);
   } catch (err) {
     console.warn("地形タイルアトラスが見つからないため、手続き生成のプレースホルダを使う", err);
     return proceduralTerrainAtlas();
@@ -107,7 +107,7 @@ function isCheckerboardPixel(r: number, g: number, b: number): boolean {
  * シールドの白い紋章など、人物内部の明るい部分は連結していないので保たれる。
  */
 export async function loadSoldierSprite(): Promise<HTMLCanvasElement> {
-  const image = await loadImage("/assets/soldier-blue.png");
+  const image = await loadImage(`${import.meta.env.BASE_URL}assets/soldier-blue.png`);
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth;
   canvas.height = image.naturalHeight;
