@@ -9,6 +9,20 @@
 export const SOLDIER_STRIDE = 20;
 
 /** State enum。crates/sim-core/src/soldiers.rs と一致させること。 */
+/** `soldiers::flags` のビット（Rust 側と一致させること）。 */
+export enum SoldierFlag {
+  Mounted = 1 << 0,
+  Commander = 1 << 1,
+  BannerBearer = 1 << 2,
+  Engineer = 1 << 3,
+  MissileTroop = 1 << 4,
+  Sleeping = 1 << 5,
+  /** 転倒中。倒れていて動けず攻撃もできない */
+  Stumbling = 1 << 6,
+  /** 盾を構えて突撃を受け止める姿勢 */
+  Braced = 1 << 7,
+}
+
 export enum SoldierState {
   Idle = 0,
   Marching = 1,
@@ -105,6 +119,16 @@ export class SnapshotView {
 
   flags(i: number): number {
     return this.view.getUint8(i * this.stride + (this.stride === 16 ? 15 : 17));
+  }
+
+  /** 転倒中か（倒れて動けない）。 */
+  isStumbling(i: number): boolean {
+    return (this.flags(i) & SoldierFlag.Stumbling) !== 0;
+  }
+
+  /** 盾を構えて踏ん張っているか。 */
+  isBraced(i: number): boolean {
+    return (this.flags(i) & SoldierFlag.Braced) !== 0;
   }
 
   faction(i: number): number {

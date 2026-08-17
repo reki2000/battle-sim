@@ -323,6 +323,10 @@ struct BattleReport {
     /// 決着時点の陣営 0 / 1 の生存数。
     alive: (u32, u32),
     stats: sim_core::combat::CombatStats,
+    /// 徒歩の助走突撃・転倒の統計。
+    charge: sim_core::charge::ChargeStats,
+    /// 疲れた前列と後列の交代が起きた回数。
+    rotations: u32,
 }
 
 fn run_battle(o: &Opts) -> BattleReport {
@@ -353,6 +357,8 @@ fn finish_battle(mut w: World, o: &Opts) -> BattleReport {
         timed_out,
         alive: (alive_a, alive_b),
         stats: w.combat.stats,
+        charge: w.charge.stats,
+        rotations: w.command.rotations,
     }
 }
 
@@ -520,7 +526,12 @@ fn battle(o: &Opts) {
         pct(s.bleed_kills)
     );
     println!("  \"friendly_fire_hits\": {},", s.friendly_fire_hits);
-    println!("  \"shots_fired\": {}", s.shots_fired);
+    println!("  \"shots_fired\": {},", s.shots_fired);
+    println!("  \"foot_charge_impacts\": {},", report.charge.impacts);
+    println!("  \"stumbles\": {},", report.charge.stumbles);
+    println!("  \"charge_falters\": {},", report.charge.falters);
+    println!("  \"braces\": {},", report.charge.braces);
+    println!("  \"rank_rotations\": {}", report.rotations);
     println!("}}");
 
     eprintln!(
@@ -607,7 +618,14 @@ fn scenario_run(o: &Opts) {
     println!("  \"shots_fired\": {},", s.shots_fired);
     println!("  \"charge_kills\": {},", s.charge_kills);
     println!("  \"horse_refusals\": {},", s.horse_refusals);
-    println!("  \"dismounts\": {}", s.dismounts);
+    println!("  \"dismounts\": {},", s.dismounts);
+    println!("  \"foot_charge_impacts\": {},", report.charge.impacts);
+    println!("  \"foot_charge_runups\": {},", report.charge.runups);
+    println!("  \"foot_charge_backoffs\": {},", report.charge.backoffs);
+    println!("  \"stumbles\": {},", report.charge.stumbles);
+    println!("  \"charge_falters\": {},", report.charge.falters);
+    println!("  \"braces\": {},", report.charge.braces);
+    println!("  \"rank_rotations\": {}", report.rotations);
     println!("}}");
 }
 

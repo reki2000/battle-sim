@@ -5,7 +5,7 @@
 //! 伝令ごとに距離から遅延を計算するため、発令順や走査順に結果が依存しない。
 
 use sim_math::{
-    dist, fx, fx_from_mm, fx_mul, ms_to_ticks, per_sec_to_per_tick, Brad, Fx, Vec2Fx, FX_ONE,
+    dist, fx, fx_from_mm, fx_mul, ms_to_ticks, per_sec_to_per_tick, Brad, Fx, Rng, Vec2Fx, FX_ONE,
 };
 use sim_terrain::Terrain;
 
@@ -364,6 +364,8 @@ pub enum CommandEventKind {
     /// M7: 命令に反して指揮官が独断で行動した（仕様 05 章「ambition の高い
     /// 騎士が命令を無視して突撃する」）。
     Insubordination,
+    /// 疲れた前列を後列と入れ替えた（仕様 06 章 6 節）。
+    RanksRotated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -554,6 +556,16 @@ pub struct Unit {
 /// 側面へ回り込まずに正面衝突するので、いったん敵の横を目指させる。
 const FLANK_OFFSET_M: i32 = 60;
 
+/// 前後列の交代を検討する間隔（tick）。20 Hz なので 40 tick = 2 秒。
+const ROTATION_INTERVAL_TICKS: u32 = 40;
+/// 前列の兵士がこの疲労を超えたら、交代の対象になる。
+const ROTATION_FATIGUE_THRESHOLD: u16 = 5_500;
+/// 交代する意味があるとみなす疲労差。
+const ROTATION_FATIGUE_MARGIN: u16 = 1_500;
+/// 1 回の判定で入れ替える人数の上限。列がまるごと入れ替わって陣形が溶けない
+/// ようにするためと、部隊が大きくても走査を O(人数) に抑えるため。
+const MAX_ROTATIONS_PER_INTERVAL: usize = 4;
+
 /// 追撃の紐（leash）。仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに
 /// 現実的な時間がかかる」を実装するための、部隊単位の上限距離。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +617,8 @@ pub struct CommandTree {
     pub nodes: Vec<CommandNode>,
     pub messengers: Vec<Messenger>,
     pub events: Vec<CommandEvent>,
+    /// 前後列の交代が起きた回数（UI とテスト用）。
+    pub rotations: u32,
     next_order_id: OrderId,
 }
 
@@ -1361,6 +1375,126 @@ impl CommandTree {
         }
     }
 
+    /// 疲れた兵士を、戦っていない仲間と入れ替える（仕様 06 章 6 節
+    /// 「指揮官は交代を命じられる」）。
+    ///
+    /// 陣形スロットは `unit.soldiers` の並び順から決まるので、**配列の要素を
+    /// 入れ替えるだけで立ち位置が入れ替わる**。入れ替えた 2 人はそれぞれ相手の
+    /// スロットへ歩き出す。
+    ///
+    /// 「前列」をスロット番号で決めないのは、スロットの幾何（`formation_facing`
+    /// と rank の伸びる向き）から見て、どちら側が敵に近いかが部隊の向きと敵の
+    /// 位置で変わるため。代わりに**実際に交戦している（`target` を持つ）者**を
+    /// 戦列とみなす。誰も交戦していない部隊——行軍中の疲労——では、単に最も
+    /// 疲れた者と最も元気な者を入れ替える。
+    ///
+    /// 交代は訓練の産物なので、入れ替わる 2 人の `discipline` が確率を決める。
+    /// 規律の低い部隊では疲れた兵士が戦列に残り続け、そのまま崩れる。
+    ///
+    /// `world_seed` と `tick` から判定を導くので、実行順序に依存しない。
+    pub fn rotate_tired_ranks(&mut self, soldiers: &Soldiers, world_seed: u64, tick: u32) {
+        if tick % ROTATION_INTERVAL_TICKS != 0 {
+            return;
+        }
+        for index in 0..self.nodes.len() {
+            let Some(unit) = self.nodes[index].unit.as_mut() else {
+                continue;
+            };
+            if unit.ranks < 2 || unit.formation_change.is_some() || unit.soldiers.len() < 2 {
+                continue;
+            }
+            // 借用を跨がないよう、判定は ID を受け取る関数にしておく
+            // （`unit.soldiers` は最後に swap で書き換える）
+            let fighting = |id: SoldierId| soldiers.target[id as usize] != crate::soldiers::NO_ID;
+            let alive = |id: SoldierId| soldiers.is_active_id(id);
+            let fatigue = |id: SoldierId| soldiers.fatigue[id as usize];
+
+            let mut anyone_fighting = false;
+            // 交代で下がる側の候補（疲れて戦っている者）と、上がる側の候補
+            // （元気で戦っていない者）を 1 パスで集める。上がる側は
+            // 「最も元気な数人」だけ持てばよいので、固定長の配列に収める
+            // ——部隊が 500 人でも走査は 1 回、確保はゼロ。
+            let mut fresh: [(u16, usize); MAX_ROTATIONS_PER_INTERVAL] =
+                [(u16::MAX, usize::MAX); MAX_ROTATIONS_PER_INTERVAL];
+            for k in 0..unit.soldiers.len() {
+                let id = unit.soldiers[k];
+                if !alive(id) {
+                    continue;
+                }
+                if fighting(id) {
+                    anyone_fighting = true;
+                    continue;
+                }
+                let f = fatigue(id);
+                // 挿入ソート（要素は MAX_ROTATIONS_PER_INTERVAL 個だけ）
+                let mut slot = MAX_ROTATIONS_PER_INTERVAL;
+                for (n, entry) in fresh.iter().enumerate() {
+                    if f < entry.0 {
+                        slot = n;
+                        break;
+                    }
+                }
+                if slot < MAX_ROTATIONS_PER_INTERVAL {
+                    for n in (slot + 1..MAX_ROTATIONS_PER_INTERVAL).rev() {
+                        fresh[n] = fresh[n - 1];
+                    }
+                    fresh[slot] = (f, k);
+                }
+            }
+
+            let mut rotated = 0usize;
+            for k in 0..unit.soldiers.len() {
+                if rotated >= MAX_ROTATIONS_PER_INTERVAL {
+                    break;
+                }
+                let tired_id = unit.soldiers[k];
+                if !alive(tired_id) || fatigue(tired_id) < ROTATION_FATIGUE_THRESHOLD {
+                    continue;
+                }
+                // 交戦している部隊では、下がるのは戦列に立っている者だけ
+                if anyone_fighting && !fighting(tired_id) {
+                    continue;
+                }
+                let tired_fatigue = fatigue(tired_id);
+                let Some(&(_, rested)) = fresh.iter().find(|&&(f, idx)| {
+                    idx != usize::MAX && f + ROTATION_FATIGUE_MARGIN <= tired_fatigue
+                }) else {
+                    continue;
+                };
+                if rested == k {
+                    continue;
+                }
+                let rested_id = unit.soldiers[rested];
+                let discipline = (soldiers.attrs[tired_id as usize].discipline as i32
+                    + soldiers.attrs[rested_id as usize].discipline as i32)
+                    / 2;
+                let chance = (discipline * 3).clamp(0, 900) as u32;
+                let mut rng =
+                    Rng::stream(world_seed, tired_id, sim_math::Purpose::DecisionNoise, tick);
+                if !rng.chance_permille(chance) {
+                    continue;
+                }
+                unit.soldiers.swap(k, rested);
+                // 使った受け手は空にする（同じ兵士を二重に上げない）
+                for entry in fresh.iter_mut() {
+                    if entry.1 == rested || entry.1 == k {
+                        *entry = (u16::MAX, usize::MAX);
+                    }
+                }
+                rotated += 1;
+                self.rotations = self.rotations.saturating_add(1);
+            }
+            if rotated > 0 {
+                self.events.push(CommandEvent {
+                    tick,
+                    node: index as NodeId,
+                    order: None,
+                    kind: CommandEventKind::RanksRotated,
+                });
+            }
+        }
+    }
+
     /// 葉ノードの兵士に、現在の陣形スロットを目標として設定する。
     pub fn formation_goals(&mut self, soldiers: &mut Soldiers, goals: &mut [Vec2Fx], tick: u32) {
         for index in 0..self.nodes.len() {
@@ -1564,6 +1698,10 @@ impl CommandTree {
                 mix(unit.formation_origin.x as u32 as u64);
                 mix(unit.formation_origin.y as u32 as u64);
                 mix(unit.path.len() as u64);
+                // スロットの並び（前後列の交代で変わる）も決定論の検証対象
+                for &id in &unit.soldiers {
+                    mix(id as u64);
+                }
             }
             // M7: 指揮官 AI の状態も決定論検証の対象にする。
             mix(node.blackboard.enemy_forces.len() as u64);
