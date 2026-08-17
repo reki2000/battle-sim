@@ -55,6 +55,37 @@ pub mod flags {
     pub const MISSILE_TROOP: u8 = 1 << 4;
     /// 静止していて衝突判定から外してよい
     pub const SLEEPING: u8 = 1 << 5;
+    /// 転倒中。立ち上がるまで動けず、攻撃もできない（`charge::ChargeSystem` が管理）
+    pub const STUMBLING: u8 = 1 << 6;
+}
+
+/// 徒歩兵の体の半径（mm）。肩幅ベース（仕様 06 章 2.2 節）。
+pub const BODY_RADIUS_MM: i32 = 350;
+/// 騎乗時の半径（mm）。1.2 m × 0.5 m の馬体を円で近似したもの。
+pub const MOUNTED_RADIUS_MM: i32 = 900;
+
+/// 歩いている兵士がすり抜けるのに必要な隙間（mm）。半身になれば 20 cm で通れる。
+pub const PASS_CLEARANCE_WALK_MM: i32 = 200;
+/// 走っている兵士がすり抜けるのに必要な隙間（mm）。速度があると半身になれず、
+/// 40 cm は要る。
+pub const PASS_CLEARANCE_RUN_MM: i32 = 400;
+
+/// 「歩いている」とみなす最低速度（1 tick あたりの移動量 mm）。
+/// 20 Hz なので 20 mm/tick = 0.4 m/s。
+pub const WALK_MIN_SPEED_MM_PER_TICK: i32 = 20;
+/// 「走っている」とみなす最低速度（1 tick あたりの移動量 mm）。
+/// 100 mm/tick = 2.0 m/s。
+pub const RUN_MIN_SPEED_MM_PER_TICK: i32 = 100;
+
+/// 歩容。すり抜けに必要な隙間・疲労の消費・つまずきやすさを決める。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Gait {
+    /// 立ち止まっている。体の幅そのままの障害物になる
+    Standing,
+    /// 歩いている。隙間があれば半身ですり抜ける
+    Walking,
+    /// 走っている。すり抜けにはより広い隙間が要る
+    Running,
 }
 
 /// 運動能力と性格。生成時に一度だけ決まり、以降ほぼ変わらない。
@@ -256,14 +287,65 @@ impl Soldiers {
         self.hot.state[i].is_active()
     }
 
-    /// 衝突半径。騎乗しているかで変わる（仕様 06 章 2.2）。
+    /// 体の半径。騎乗しているかで変わる（仕様 06 章 2.2）。
+    ///
+    /// 「そこにどれだけの体積があるか」を表す値で、圧迫の実害や敵との押し合いに
+    /// 使う。味方の隊列をすり抜けるときの当たり判定は [`Self::pass_radius`]。
     #[inline]
     pub fn radius(&self, i: usize) -> Fx {
         if self.hot.flags[i] & flags::MOUNTED != 0 {
-            sim_math::fx_from_mm(900)
+            sim_math::fx_from_mm(MOUNTED_RADIUS_MM)
         } else {
-            sim_math::fx_from_mm(350)
+            sim_math::fx_from_mm(BODY_RADIUS_MM)
         }
+    }
+
+    /// 1 tick の移動量（mm）。歩容の判定に使う。
+    #[inline]
+    pub fn speed_mm_per_tick(&self, i: usize) -> i32 {
+        let v = sim_math::Vec2Fx::new(self.hot.vel_x[i] as Fx, self.hot.vel_y[i] as Fx);
+        sim_math::fx_to_mm(v.len()).max(0)
+    }
+
+    /// 現在の歩容。
+    #[inline]
+    pub fn gait(&self, i: usize) -> Gait {
+        if self.hot.flags[i] & flags::STUMBLING != 0 || !self.is_alive(i) {
+            return Gait::Standing;
+        }
+        match self.speed_mm_per_tick(i) {
+            s if s >= RUN_MIN_SPEED_MM_PER_TICK => Gait::Running,
+            s if s >= WALK_MIN_SPEED_MM_PER_TICK => Gait::Walking,
+            _ => Gait::Standing,
+        }
+    }
+
+    /// 味方の隊列をすり抜けるときの実効半径。
+    ///
+    /// 人の体は円柱ではない。歩いている兵士は半身になって隣との隙間を抜けられる
+    /// し、走っていればもう少し広い隙間が要る。二人の兵士の**体の間の隙間**が
+    /// `2 × pass_radius` あれば、その間を通れる——という形に揃えてあるので、
+    /// 定数はそのまま「必要な隙間の半分」になる（歩行 10 cm × 2 = 20 cm、
+    /// 走行 20 cm × 2 = 40 cm）。
+    ///
+    /// 騎乗兵・転倒中の兵士は体をよじれないので体の半径そのまま。敵に対しても
+    /// 体の半径を使う（相手はどいてくれない）。
+    #[inline]
+    pub fn pass_radius(&self, i: usize) -> Fx {
+        if self.hot.flags[i] & flags::MOUNTED != 0 {
+            return self.radius(i);
+        }
+        match self.gait(i) {
+            Gait::Standing => sim_math::fx_from_mm(BODY_RADIUS_MM),
+            Gait::Walking => sim_math::fx_from_mm(PASS_CLEARANCE_WALK_MM / 2),
+            Gait::Running => sim_math::fx_from_mm(PASS_CLEARANCE_RUN_MM / 2),
+        }
+    }
+
+    /// 転倒中か。
+    #[inline]
+    pub fn is_stumbling(&self, i: usize) -> bool {
+        self.hot.flags[i] & flags::STUMBLING != 0
     }
 
     /// 押し合いでの質量寄与（kg 相当）。

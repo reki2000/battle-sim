@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 pub mod cavalry;
+pub mod charge;
 pub mod combat;
 pub mod commander_ai;
+pub mod corpses;
 pub mod engineering;
 pub mod organization;
 pub mod pathing;
@@ -23,7 +25,9 @@ pub mod spatial;
 pub mod structures;
 
 use cavalry::CavalrySystem;
+use charge::ChargeSystem;
 use combat::CombatSystem;
+use corpses::CorpseField;
 use engineering::EngineeringSystem;
 use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
@@ -39,7 +43,9 @@ use structures::StructureSystem;
 /// 追加したため 4 → 5。
 /// 射撃兵の士気・着弾判定・包囲目標の再選択を直したため 5 → 6（同じ命令ログ
 /// でも結果が変わるので、それ以前の記録とは互換しない）。
-pub const SIM_VERSION: u32 = 6;
+/// 兵士同士の当たり判定（歩容によるすり抜け・転倒）、死体の障害物化、
+/// 徒歩兵の助走突撃と移動疲労を入れたため 6 → 7。
+pub const SIM_VERSION: u32 = 7;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -79,6 +85,10 @@ pub struct World {
     pub combat: CombatSystem,
     /// M5 の騎兵：突撃のモメンタム・馬の忌避・衝撃・落馬後の徒歩化。
     pub cavalry: CavalrySystem,
+    /// 徒歩兵の助走突撃・すり抜けの失敗による転倒・微視的な行動決定。
+    pub charge: ChargeSystem,
+    /// 倒れた兵士が作る低い障害物（跨げるが時間がかかる）。
+    pub corpses: CorpseField,
     /// M6 の野戦築城・地形改修の対象（杭列・堀・鹿砦・土塁・馬防柵・橋）。
     pub structures: StructureSystem,
     /// M6 の工兵：作業タスク・矢の補給・負傷者回収。
@@ -90,6 +100,10 @@ pub struct World {
     push_y: Vec<Fx>,
     /// 衝突解決の全反復で蓄積した重なり量。圧迫（crush）判定に使う。
     crush_accum: Vec<Fx>,
+    /// 歩容から決まるすり抜け半径のキャッシュ。速度は衝突解決のあいだ変わら
+    /// ないので、tick ごとに 1 回だけ計算して全反復で使い回す（ペアごとに
+    /// 計算すると平方根が近傍数 × 反復数だけ走る）。
+    pass_radius: Vec<Fx>,
 }
 
 impl core::fmt::Debug for World {
@@ -125,12 +139,15 @@ impl World {
             command: CommandTree::new(),
             combat: CombatSystem::default(),
             cavalry: CavalrySystem::default(),
+            charge: ChargeSystem::default(),
+            corpses: CorpseField::default(),
             structures: StructureSystem::default(),
             engineering: EngineeringSystem::default(),
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
             crush_accum: Vec::new(),
+            pass_radius: Vec::new(),
         }
     }
 
@@ -171,6 +188,7 @@ impl World {
         );
         self.combat.register();
         self.cavalry.register();
+        self.charge.register();
         self.engineering.register();
         if soldier_flags & flags::MOUNTED != 0 {
             self.combat.set_mounted(id, true);
@@ -179,6 +197,7 @@ impl World {
         self.push_x.push(0);
         self.push_y.push(0);
         self.crush_accum.push(0);
+        self.pass_radius.push(0);
         let i = id as usize;
         self.soldiers.z_cm[i] =
             sim_math::fx_to_mm(self.terrain.height_at(pos.x, pos.y)) as i16 / 10;
@@ -417,6 +436,17 @@ impl World {
             &mut self.structures,
             map_limit,
         );
+        // 徒歩兵の助走も、騎兵と同じ理由で `combat.tick` の前に置く。助走を
+        // つけた衝撃で `Engaged` に落ちた兵士を、同じ tick 内で通常の白兵戦
+        // ロジックが拾える。
+        self.charge.tick(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &self.hash,
+            &mut self.combat,
+            map_limit,
+        );
         self.combat
             .tick(self.seed, self.tick, &mut self.soldiers, &self.hash);
         // 工兵（M6）は白兵・射撃・騎兵の交戦判定の後に置く。こうすると、
@@ -432,11 +462,62 @@ impl World {
             &mut self.combat,
             &mut self.goal,
         );
+        // 兵士自身の判断（下がって助走をつける・離れた敵へ走り込む）は、
+        // 部隊の陣形目標と交戦相手が確定した後に、その tick 分だけ `goal` を
+        // 上書きする形で入れる。命令が変われば次の tick から自然に元へ戻る。
+        self.charge.decide(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &self.hash,
+            &self.combat,
+            &mut self.goal,
+            map_limit,
+        );
         self.steer();
         self.integrate_motion();
         self.resolve_collisions();
+        // 走り抜けようとして人や死体にぶつかった者を転ばせる。位置が確定した
+        // 後でないと「隙間が足りなかったか」を判定できない（空間ハッシュは
+        // `resolve_collisions` 末尾の圧迫判定が最新の位置で張り直している）。
+        self.charge.resolve_run_collisions(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &self.hash,
+            &self.corpses,
+        );
         self.follow_terrain();
+        self.apply_movement_fatigue();
+        self.corpses.maybe_rebuild(&self.soldiers, self.tick);
         self.tick += 1;
+    }
+
+    /// 移動による疲労の増減（仕様 06 章 6 節）。1 秒に 1 回まとめて適用する。
+    ///
+    /// 走れば疲れる、という当たり前の代償がないと、兵士は常に全力疾走した方が
+    /// 得になってしまう。助走突撃を「使いどころのある手」に留めるための土台。
+    fn apply_movement_fatigue(&mut self) {
+        if self.tick % sim_math::TICK_HZ != 0 {
+            return;
+        }
+        for i in 0..self.soldiers.len() {
+            if !self.soldiers.is_alive(i) {
+                continue;
+            }
+            let delta = charge::movement_fatigue_delta(
+                self.soldiers.speed_mm_per_tick(i),
+                self.soldiers.attrs[i].endurance,
+            );
+            let fatigue = self.soldiers.fatigue[i];
+            self.soldiers.fatigue[i] = if delta >= 0 {
+                fatigue
+                    .saturating_add(delta as u16)
+                    .min(soldiers::MAX_FATIGUE)
+            } else {
+                fatigue.saturating_sub((-delta) as u16)
+            };
+        }
     }
 
     /// フェーズ 5（簡略版）: 目標に向かう操舵。
@@ -446,6 +527,12 @@ impl World {
         let n = self.soldiers.len();
         for i in 0..n {
             if !self.soldiers.is_alive(i) {
+                continue;
+            }
+            // 転倒中は起き上がるまで動けない
+            if self.soldiers.is_stumbling(i) {
+                self.soldiers.hot.vel_x[i] = 0;
+                self.soldiers.hot.vel_y[i] = 0;
                 continue;
             }
             // 命令を受けていない兵士はその場を保つ。押し合いで動かされても
@@ -485,6 +572,12 @@ impl World {
             let next = cur.add(delta);
             self.soldiers.hot.vel_x[i] = next.x.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
             self.soldiers.hot.vel_y[i] = next.y.clamp(i16::MIN as Fx, i16::MAX as Fx) as i16;
+            // 助走の距離を取るために後ろへ下がっている兵士は、背中を向けずに
+            // 敵を見たまま退がる（向きは `charge.decide` が毎 tick 敵の方へ
+            // 向け直している）。それ以外は進行方向を向く。
+            if self.charge.is_backing_off(i as SoldierId) {
+                continue;
+            }
             self.soldiers.hot.facing[i] = dir.angle();
             // 進行方向を向くのが基本だが、間合いの範囲内に敵がいれば
             // そちらを優先して向く。行軍の目標方向と実際に隣接した敵の
@@ -542,10 +635,25 @@ impl World {
         } else {
             1200 + (self.soldiers.attrs[i].speed as i32) * 3
         };
-        let base_mm_per_s = if mounted && self.soldiers.hot.state[i] == State::Charging {
-            const CHARGE_TOP_MM_PER_S: i32 = 8000;
-            let m = self.cavalry.momentum_permille(id) as i32;
-            base_mm_per_s + (CHARGE_TOP_MM_PER_S - base_mm_per_s) * m / 1000
+        let base_mm_per_s = if self.soldiers.hot.state[i] == State::Charging {
+            // 助走が乗るほど速くなる。徒歩の上限は全力疾走の 4.5 m/s、
+            // 騎乗は 8 m/s（仕様 06 章 4.1 節）。
+            let (start, top, m) = if mounted {
+                (
+                    base_mm_per_s,
+                    8000,
+                    self.cavalry.momentum_permille(id) as i32,
+                )
+            } else {
+                // 徒歩は「駆け出した瞬間から速歩」。そうしないと助走距離を
+                // 積む速度に届かず、いつまでも momentum が 0 のままになる。
+                (
+                    base_mm_per_s.max(charge::CHARGE_START_MM_PER_S),
+                    charge::SPRINT_TOP_MM_PER_S,
+                    self.charge.momentum_permille(id) as i32,
+                )
+            };
+            start + (top - start) * m / 1000
         } else {
             base_mm_per_s
         };
@@ -564,6 +672,10 @@ impl World {
             let (structure_move_mult, _cohesion_mult) = self.structures.infantry_effect_at(pos);
             sim_math::fx_scale_permille(after_terrain, structure_move_mult as i32)
         };
+        // 死体は高さ 25 cm の低い障害物。跨げば越えられるので通行を塞がず、
+        // 重なった段数のぶんだけ越えるのに時間がかかる（`corpses` モジュール）。
+        let after_terrain =
+            sim_math::fx_scale_permille(after_terrain, self.corpses.move_mult_permille(pos) as i32);
 
         // 疲労 10000 で 40% 減。騎乗中は馬自身の疲労も掛け合わせる
         // （仕様「馬の疲労は騎手より早く蓄積する」）。
@@ -634,6 +746,32 @@ impl World {
         }
     }
 
+    /// 2 人の兵士が「重なっている」とみなす距離。
+    ///
+    /// 敵に対しては体の半径どうしの和——相手はどいてくれないので、体の幅が
+    /// そのまま壁になる。味方に対しては歩容で決まるすり抜け半径
+    /// （[`Soldiers::pass_radius`]）を使い、**体の間に 20 cm（歩行）/ 40 cm
+    /// （走行）の隙間があれば通れる**ようにする。密集した隊列の中を歩いて
+    /// 通り抜けられるのも、走って抜けようとすると隙間が足りずにぶつかるのも、
+    /// この 1 行の違いから出る。
+    #[inline]
+    fn contact_distance(&self, i: usize, j: usize) -> Fx {
+        if self.soldiers.faction[i] == self.soldiers.faction[j] {
+            self.pass_radius[i] + self.pass_radius[j]
+        } else {
+            self.soldiers.radius(i) + self.soldiers.radius(j)
+        }
+    }
+
+    /// すり抜け半径のキャッシュを現在の速度から作り直す。
+    fn refresh_pass_radii(&mut self) {
+        let n = self.soldiers.len();
+        self.pass_radius.resize(n, 0);
+        for i in 0..n {
+            self.pass_radius[i] = self.soldiers.pass_radius(i);
+        }
+    }
+
     /// フェーズ 10: 衝突解決（押し合い）。
     ///
     /// 読み取り（現在位置）と書き込み（押し戻し量）を分けることで、
@@ -644,6 +782,7 @@ impl World {
             return;
         }
         let relax = (SEPARATION_RELAX_PERMILLE * FX_ONE) / 1000;
+        self.refresh_pass_radii();
 
         for _ in 0..SEPARATION_ITERATIONS {
             self.hash.rebuild(&self.soldiers);
@@ -656,7 +795,6 @@ impl World {
                     continue;
                 }
                 let pi = self.soldiers.pos(i);
-                let ri = self.soldiers.radius(i);
                 let mi = self.soldiers.mass(i);
                 let cnt = self.hash.query_neighbors(pi.x, pi.y, &mut neighbors);
 
@@ -666,7 +804,7 @@ impl World {
                         continue;
                     }
                     let pj = self.soldiers.pos(j);
-                    let rsum = ri + self.soldiers.radius(j);
+                    let rsum = self.contact_distance(i, j);
                     let d2 = sim_math::dist_sq(pi, pj);
                     if d2 >= (rsum as i64) * (rsum as i64) {
                         continue;
@@ -730,7 +868,6 @@ impl World {
                 continue;
             }
             let pi = self.soldiers.pos(i);
-            let ri = self.soldiers.radius(i);
             let cnt = self.hash.query_neighbors(pi.x, pi.y, &mut neighbors);
             let mut residual = 0 as Fx;
             for &jid in &neighbors[..cnt] {
@@ -739,7 +876,10 @@ impl World {
                     continue;
                 }
                 let pj = self.soldiers.pos(j);
-                let rsum = ri + self.soldiers.radius(j);
+                // 押し合いと同じ基準で測る。動いている兵士が隙間をすり抜けて
+                // いる状態を「圧迫」と数えないため（すり抜けは体を半身にして
+                // いるだけで、押し潰されているわけではない）。
+                let rsum = self.contact_distance(i, j);
                 let d2 = sim_math::dist_sq(pi, pj);
                 if d2 >= (rsum as i64) * (rsum as i64) {
                     continue;
@@ -792,6 +932,7 @@ impl World {
         mix(self.command.state_hash());
         mix(self.combat.state_hash());
         mix(self.cavalry.state_hash());
+        mix(self.charge.state_hash());
         mix(self.structures.state_hash());
         mix(self.engineering.state_hash());
         for i in 0..self.soldiers.len() {
@@ -801,6 +942,7 @@ impl World {
             mix(self.soldiers.hot.vel_y[i] as u16 as u64);
             mix(self.soldiers.hot.facing[i] as u64);
             mix(self.soldiers.hot.state[i] as u64);
+            mix(self.soldiers.hot.flags[i] as u64);
             mix(self.soldiers.hp[i] as u64);
             mix(self.soldiers.morale[i] as u64);
             mix(self.soldiers.fatigue[i] as u64);
@@ -1011,6 +1153,223 @@ mod tests {
             assert!((0..limit).contains(&p.x), "x={}", p.x);
             assert!((0..limit).contains(&p.y), "y={}", p.y);
         }
+    }
+
+    /// 味方 2 人のあいだを通り抜けさせ、通過中に相手の体とどれだけ近づいたかを
+    /// 返す。`gap_mm` は 2 人の**体の間の隙間**。
+    ///
+    /// 押し合いで隙間そのものが広がってしまうと「必要な隙間」を測れないので、
+    /// 立ち塞がる 2 人は毎 tick 元の位置へ戻す（動かない壁として扱う）。
+    fn squeeze_through(gap_mm: i32, running: bool) -> (bool, Fx) {
+        let mut w = small_world();
+        let body = fx_from_mm(soldiers::BODY_RADIUS_MM);
+        let half = fx_from_mm(gap_mm / 2) + body;
+        let lane_y = fx(200);
+        let wall_x = fx(200);
+        let blockers = [
+            w.spawn(
+                Vec2Fx::new(wall_x, lane_y - half),
+                0,
+                0,
+                0,
+                Attrs::default(),
+                0,
+            ),
+            w.spawn(
+                Vec2Fx::new(wall_x, lane_y + half),
+                0,
+                0,
+                0,
+                Attrs::default(),
+                0,
+            ),
+        ];
+        let blocker_pos: Vec<Vec2Fx> = blockers
+            .iter()
+            .map(|&id| w.soldiers.pos(id as usize))
+            .collect();
+        let mover = w.spawn(
+            Vec2Fx::new(wall_x - fx(4), lane_y),
+            0,
+            0,
+            0,
+            Attrs::default(),
+            0,
+        );
+        w.set_goal(mover, Vec2Fx::new(wall_x + fx(4), lane_y));
+
+        let mut worst_overlap = 0;
+        for _ in 0..400 {
+            for (k, &id) in blockers.iter().enumerate() {
+                w.soldiers.set_pos(id as usize, blocker_pos[k]);
+                w.soldiers.hot.state[id as usize] = State::Idle;
+            }
+            if running {
+                w.soldiers.hot.state[mover as usize] = State::Charging;
+            }
+            w.tick();
+            let m = mover as usize;
+            for &id in &blockers {
+                let j = id as usize;
+                let rsum = w.soldiers.pass_radius(m) + w.soldiers.pass_radius(j);
+                let d = sim_math::dist(w.soldiers.pos(m), w.soldiers.pos(j));
+                worst_overlap = worst_overlap.max(rsum - d);
+            }
+            if w.soldiers.pos(m).x > wall_x + fx(1) {
+                return (true, worst_overlap);
+            }
+        }
+        (false, worst_overlap)
+    }
+
+    /// 歩いている兵士は 20 cm の隙間があれば、誰にも触れずに通り抜けられる。
+    #[test]
+    fn walking_soldiers_slip_through_a_twenty_centimeter_gap() {
+        let (passed, overlap) = squeeze_through(soldiers::PASS_CLEARANCE_WALK_MM + 50, false);
+        assert!(passed, "20 cm の隙間を歩いて抜けられない");
+        assert!(
+            overlap <= fx_from_mm(10),
+            "隙間が足りているのにぶつかっている: {} mm",
+            sim_math::fx_to_mm(overlap)
+        );
+    }
+
+    /// 同じ隙間でも、走っているとぶつかる。走り抜けるには 40 cm 要る。
+    #[test]
+    fn running_soldiers_need_a_wider_gap() {
+        let narrow = soldiers::PASS_CLEARANCE_WALK_MM + 50;
+        let (_, walking_overlap) = squeeze_through(narrow, false);
+        let (_, narrow_overlap) = squeeze_through(narrow, true);
+        assert!(
+            narrow_overlap > walking_overlap + fx_from_mm(20),
+            "20 cm の隙間を走って抜けても、歩いたときと同じようにぶつからない:              走行 {} mm / 歩行 {} mm",
+            sim_math::fx_to_mm(narrow_overlap),
+            sim_math::fx_to_mm(walking_overlap)
+        );
+
+        let wide = soldiers::PASS_CLEARANCE_RUN_MM + 50;
+        let (passed, wide_overlap) = squeeze_through(wide, true);
+        assert!(passed, "40 cm の隙間を走って抜けられない");
+        assert!(
+            wide_overlap <= fx_from_mm(10),
+            "40 cm あってもぶつかっている: {} mm",
+            sim_math::fx_to_mm(wide_overlap)
+        );
+    }
+
+    /// 死体は高さ 25 cm の障害物。跨げるので通れるが、重なっているほど遅い。
+    #[test]
+    fn corpses_slow_movement_without_blocking_it() {
+        fn traveled(corpse_layers: u32) -> Fx {
+            let mut w = small_world();
+            let start = Vec2Fx::new(fx(150), fx(150));
+            // 進路上に死体を敷き詰める
+            for step in 0..20 {
+                for _ in 0..corpse_layers {
+                    let id = w.spawn(
+                        Vec2Fx::new(start.x + fx(1 + step), start.y),
+                        0,
+                        0,
+                        0,
+                        Attrs::default(),
+                        0,
+                    );
+                    w.soldiers.hot.state[id as usize] = State::Dead;
+                }
+            }
+            let walker = w.spawn(start, 0, 0, 0, Attrs::default(), 0);
+            w.set_goal(walker, Vec2Fx::new(start.x + fx(25), start.y));
+            for _ in 0..300 {
+                w.tick();
+            }
+            sim_math::dist(start, w.soldiers.pos(walker as usize))
+        }
+
+        let clear = traveled(0);
+        let single = traveled(1);
+        let piled = traveled(3);
+        assert!(
+            single < clear && piled < single,
+            "死体が増えても遅くならない: clear={clear} single={single} piled={piled}"
+        );
+        // 何段積み上がっても通れなくはならない
+        assert!(
+            piled > fx(5),
+            "死体の山が通行を塞いでいる: {} m 進んだだけ",
+            piled / FX_ONE
+        );
+    }
+
+    /// 助走をつけた兵士は、止まったまま殴り合うより強い衝撃を与える
+    /// （＝兵士に「下がって走り込む」動機が生まれる）。
+    #[test]
+    fn a_run_up_adds_impact_on_contact() {
+        let mut w = small_world();
+        let attacker = w.spawn(
+            Vec2Fx::new(fx(150), fx(150)),
+            0,
+            0,
+            0,
+            Attrs::new(160, 160, 160, 180, 140, 140, 150, 140, 220, 100, 140, 140),
+            0,
+        );
+        let defender = w.spawn(
+            Vec2Fx::new(fx(158), fx(150)),
+            sim_math::brad_from_deg(180),
+            0,
+            1,
+            Attrs::default(),
+            0,
+        );
+        w.set_goal(attacker, w.soldiers.pos(defender as usize));
+        for _ in 0..200 {
+            w.soldiers.hot.state[attacker as usize] = State::Charging;
+            w.tick();
+            if w.charge.stats.impacts > 0 {
+                break;
+            }
+        }
+        assert!(
+            w.charge.stats.impacts > 0,
+            "8 m 助走して当たっても衝撃が入らない"
+        );
+        assert!(
+            w.soldiers.hp[defender as usize] < soldiers::MAX_HP,
+            "衝撃で損害が出ていない"
+        );
+    }
+
+    /// 兵士は自分の判断で敵へ走り込む（仕様「距離が離れている敵に向かって
+    /// 走っていってから攻撃する」）。
+    #[test]
+    fn soldiers_run_up_to_nearby_enemies_on_their_own() {
+        let mut w = small_world();
+        let aggressive = Attrs::new(150, 150, 150, 150, 150, 140, 160, 80, 250, 90, 140, 140);
+        for k in 0..4 {
+            w.spawn(
+                Vec2Fx::new(fx(150) + fx(k), fx(150)),
+                0,
+                0,
+                0,
+                aggressive,
+                0,
+            );
+            w.spawn(
+                Vec2Fx::new(fx(150) + fx(k), fx(153)),
+                sim_math::brad_from_deg(180),
+                0,
+                1,
+                aggressive,
+                0,
+            );
+        }
+        for _ in 0..300 {
+            w.tick();
+        }
+        assert!(
+            w.charge.stats.runups > 0,
+            "誰も走り込まない（助走の判断が働いていない）"
+        );
     }
 
     #[test]

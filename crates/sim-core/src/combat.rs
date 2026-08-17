@@ -667,6 +667,8 @@ impl CombatSystem {
             if !soldiers.is_alive(i)
                 || matches!(soldiers.hot.state[i], State::Broken | State::Rallying)
                 || self.targets[i] == NO_ID
+                // 転倒中は武器を振れない（`charge::ChargeSystem` が管理する）
+                || soldiers.is_stumbling(i)
             {
                 continue;
             }
@@ -737,6 +739,9 @@ impl CombatSystem {
                 } else {
                     0
                 }
+                // 倒れた相手はほとんど受けられない。密集した戦列で転ぶことが
+                // 致命的なのは中世会戦の現実そのもの
+                - if soldiers.is_stumbling(defender) { 90 } else { 0 }
                 + Rng::stream(world_seed, defender as u32, Purpose::HitRoll, tick).range(-30, 31);
 
             if attack_roll <= defense_roll {

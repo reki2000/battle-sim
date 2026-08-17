@@ -29,6 +29,10 @@ pub enum Purpose {
     Terrain = 14,
     Crush = 15,
     EngineerDanger = 16,
+    /// 走り抜けようとして人や死体につまずく判定。
+    Stumble = 17,
+    /// 徒歩兵が「一旦下がって助走をつける」かどうかの判定。
+    ChargeDecision = 18,
 }
 
 /// SplitMix64 のミキサ。
