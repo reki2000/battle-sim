@@ -29,8 +29,18 @@ export interface CachedTerrain {
   battleSitesFlat: number[];
 }
 
-export function terrainCacheKey(seed: number, sizeM: number, relief: number): string {
-  return `${seed}:${sizeM}:${relief}:v${TERRAIN_CACHE_VERSION}`;
+/**
+ * 会戦プリセット（`scenario`）の地形は、生成後にシナリオ固有の地勢へ整形
+ * される。同じ (seed, sizeM, relief) でも中身が違うので、キーを分ける。
+ */
+export function terrainCacheKey(
+  seed: number,
+  sizeM: number,
+  relief: number,
+  scenario?: number,
+): string {
+  const variant = scenario === undefined ? "proc" : `sc${scenario}`;
+  return `${seed}:${sizeM}:${relief}:${variant}:v${TERRAIN_CACHE_VERSION}`;
 }
 
 function openDb(): Promise<IDBDatabase> {

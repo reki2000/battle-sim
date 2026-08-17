@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "wasm": "wasm-pack build ../crates/sim-wasm --target web --out-dir ../../web/src/wasm --out-name sim",
-    "smoke": "node tools/smoke.mjs"
+    "smoke": "node tools/smoke.mjs",
+    "smoke:scenario": "node tools/scenario-smoke.mjs"
   },
   "devDependencies": {
     "playwright": "^1.62.1",

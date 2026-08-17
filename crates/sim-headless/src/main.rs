@@ -10,6 +10,7 @@
 //! sim-headless battle   --soldiers 4000                 会戦を最後まで回して死因・所要時間を見る
 //! sim-headless winrate  --soldiers 2000 --runs 200       対称な兵力を繰り返し戦わせて勝率を見る
 //! sim-headless prep     --soldiers 2000 --runs 100       準備時間の長短が防御側の勝率に効くか見る（M6）
+//! sim-headless scenario --scenario agincourt_1415        史実の会戦プリセットを最後まで回す
 //! ```
 
 use std::time::Instant;
@@ -33,6 +34,7 @@ fn main() {
         "battle" => battle(&opts),
         "winrate" => winrate(&opts),
         "prep" => prep_experiment(&opts),
+        "scenario" => scenario_run(&opts),
         _ => {
             eprintln!(
                 "使い方:\n  \
@@ -44,7 +46,9 @@ fn main() {
                  winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る\n  \
                  prep    [--soldiers N] [--runs N] [--prep-short N] [--prep-long N]\n          \
                  防御側（陣営 1）に杭列・堀を築かせる準備時間を短/長で比較し、\n          \
-                 勝率が有意に変わるか見る（M6 受け入れ条件）"
+                 勝率が有意に変わるか見る（M6 受け入れ条件）\n  \
+                 scenario [--scenario ID] [--max-ticks N]                  史実の会戦プリセットを決着まで回す\n          \
+                 ID を省略すると登録されているプリセットの一覧を出す"
             );
             std::process::exit(2);
         }
@@ -64,6 +68,7 @@ struct Opts {
     max_ticks: u32,
     prep_short: u32,
     prep_long: u32,
+    scenario: Option<String>,
 }
 
 impl Opts {
@@ -84,6 +89,7 @@ impl Opts {
             // 準備なし（0 分）と、たっぷり準備できた場合（12.5 分）の対比。
             prep_short: 0,
             prep_long: 15_000,
+            scenario: None,
         };
         let mut i = 1;
         while i + 1 < args.len() {
@@ -100,6 +106,7 @@ impl Opts {
                 "--max-ticks" => o.max_ticks = v.parse().unwrap_or(o.max_ticks),
                 "--prep-short" => o.prep_short = v.parse().unwrap_or(o.prep_short),
                 "--prep-long" => o.prep_long = v.parse().unwrap_or(o.prep_long),
+                "--scenario" => o.scenario = Some(v.clone()),
                 "--sea" => {
                     o.sea_edge = match v.as_str() {
                         "north" => SeaEdge::North,
@@ -313,6 +320,8 @@ struct BattleReport {
     winner: Option<u8>,
     ticks: u32,
     timed_out: bool,
+    /// 決着時点の陣営 0 / 1 の生存数。
+    alive: (u32, u32),
     stats: sim_core::combat::CombatStats,
 }
 
@@ -342,6 +351,7 @@ fn finish_battle(mut w: World, o: &Opts) -> BattleReport {
         winner,
         ticks: w.tick,
         timed_out,
+        alive: (alive_a, alive_b),
         stats: w.combat.stats,
     }
 }
@@ -525,6 +535,82 @@ fn battle(o: &Opts) {
     }
 }
 
+/// 史実の会戦プリセット（`sim_core::scenario`）を決着まで回し、両軍の残存と
+/// 死因内訳、指揮官が下した判断を出す。
+///
+/// ブラウザを開かずにプリセットの妥当性——狭隘・泥濘・杭列・指揮の分裂が
+/// 効いているか——を見るための入口。
+fn scenario_run(o: &Opts) {
+    let Some(id) = o.scenario.as_deref() else {
+        println!("登録されている会戦プリセット:");
+        for def in sim_core::scenario::SCENARIOS {
+            println!(
+                "  {:<16} {}（{}年・{}）兵 {}",
+                def.id,
+                def.name_ja,
+                def.year,
+                def.place_ja,
+                def.soldier_count()
+            );
+        }
+        return;
+    };
+    let Some(index) = sim_core::scenario::index_of(id) else {
+        eprintln!("そのようなプリセットはありません: {id}");
+        std::process::exit(2);
+    };
+    let def = sim_core::scenario::get(index).unwrap();
+
+    let t0 = Instant::now();
+    let w = sim_core::scenario::build_world(def);
+    eprintln!(
+        "{}（{}年）: 兵 {} を配置（地形と配置に {:.1} ms）",
+        def.name_ja,
+        def.year,
+        w.soldiers.len(),
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    let t1 = Instant::now();
+    let report = finish_battle(w, o);
+    let elapsed_s = t1.elapsed().as_secs_f64();
+    let game_minutes = report.ticks as f64 / sim_math::TICK_HZ as f64 / 60.0;
+    let s = &report.stats;
+
+    println!("{{");
+    println!("  \"scenario\": \"{}\",", def.id);
+    println!(
+        "  \"winner_faction\": {},",
+        report.winner.map_or("null".to_string(), |f| f.to_string())
+    );
+    println!("  \"timed_out\": {},", report.timed_out);
+    println!("  \"ticks\": {},", report.ticks);
+    println!("  \"game_minutes\": {game_minutes:.1},");
+    println!("  \"wall_clock_s\": {elapsed_s:.1},");
+    for (faction, army) in def.armies.iter().enumerate() {
+        let alive = if faction == 0 {
+            report.alive.0
+        } else {
+            report.alive.1
+        };
+        println!(
+            "  \"{}\": {{ \"配置\": {}, \"生存\": {alive} }},",
+            army.name_ja,
+            def.army_soldier_count(army)
+        );
+    }
+    println!("  \"melee_kills\": {},", s.melee_kills);
+    println!("  \"missile_kills\": {},", s.missile_kills);
+    println!("  \"crush_kills\": {},", s.crush_kills);
+    println!("  \"bleed_kills\": {},", s.bleed_kills);
+    println!("  \"pursuit_kills\": {},", s.pursuit_kills);
+    println!("  \"shots_fired\": {},", s.shots_fired);
+    println!("  \"charge_kills\": {},", s.charge_kills);
+    println!("  \"horse_refusals\": {},", s.horse_refusals);
+    println!("  \"dismounts\": {}", s.dismounts);
+    println!("}}");
+}
+
 fn winrate(o: &Opts) {
     let t0 = Instant::now();
     let mut wins_a = 0u32;
@@ -576,6 +662,7 @@ fn clone_opts(o: &Opts) -> Opts {
         max_ticks: o.max_ticks,
         prep_short: o.prep_short,
         prep_long: o.prep_long,
+        scenario: o.scenario.clone(),
     }
 }
 

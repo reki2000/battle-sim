@@ -1,0 +1,247 @@
+# バノックバーンの会戦（1314 年 6 月 24 日、2 日目）。
+#
+# 仕様 10 章 10 節のシナリオ形式のうち、現時点のシミュレータが解釈できる範囲。
+# 実際に読まれるのは同じ内容を写した `crates/sim-core/src/scenario.rs` の
+# `BANNOCKBURN_1314`。数値を変えるときは両方を直すこと。
+#
+# 座標系: x は西→東、y は南→北。スコットランド軍が南（森を出た側）、
+# イングランド軍が北（低湿地）に立つ。`facing` はランクが伸びる向き。
+
+[scenario]
+id = "bannockburn_1314"
+name_ja = "バノックバーンの会戦"
+name_en = "Battle of Bannockburn"
+year = 1314
+place_ja = "スコットランド・スターリング近郊"
+summary_ja = "低湿地に押し込まれたイングランド軍へ、パイクのシルトロンが降りてくる。"
+historical_strength_ja = "史実の推定兵力: スコットランド 約6,000〜7,000 / イングランド 約15,000〜20,000"
+scale_note_ja = "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/6 に縮尺してある"
+
+[terrain]
+seed = "0x8A11_0CB0_1314_0001"
+size_m = 1200
+cell_m = 2
+relief = 0
+forest_cover = 350        # 周囲はニューパークの森
+marsh_bias = 400          # 6 月とはいえカースは水を含んでいる
+thermal_iterations = 6
+river_density = 0
+road_count = 1
+sea = "none"
+
+# 会戦場の水を抜く。低湿地そのものは下の Marsh で表現するので、ここで消すのは
+# 手続き生成が窪地に作った湖。湖は騎兵の速度倍率が 0 なので、展開地に残ると
+# 部隊が固まったまま押し合って圧死する。
+[[terrain.shaping]]
+kind = "drain"
+surface = "Meadow"
+x_m = 330
+y_m = 280
+w_m = 540
+h_m = 800
+
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Meadow"        # スコットランド側は森を出た先の牧草地
+x_m = 330
+y_m = 300
+w_m = 540
+h_m = 360
+
+# イングランド軍が夜を明かしたカース。踏めば沈む軟らかい地面で、騎兵は
+# 速度 4 割・歩兵は疲労 1.9 倍になる。ここを Marsh にはしない——湿地は
+# 騎兵の速度倍率が 0、つまり馬が 1 mm も動けないので、部隊が固まって
+# 圧死する。「動けるが最悪の足場」は Mud が担う。
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Mud"
+x_m = 380
+y_m = 660
+w_m = 440
+h_m = 400
+
+[[terrain.shaping]]
+kind = "surface_belt"     # 西のバノック川。北へ行くほど内側へ食い込む
+surface = "Marsh"
+a = [330, 620]
+b = [450, 1100]
+half_width_m = 110
+
+[[terrain.shaping]]
+kind = "surface_belt"     # 東のペルストリーム川
+surface = "Marsh"
+a = [870, 620]
+b = [750, 1100]
+half_width_m = 110
+
+[[terrain.shaping]]
+kind = "height_ramp"      # 南（スコットランド側）が高い
+axis = "y"
+from_m = 400
+to_m = 800
+from_cm = 700
+to_cm = 0
+
+# ── スコットランド軍 ─────────────────────────────────────
+# パイクのシルトロン 4 個と、少数の軽騎兵。`Weapon::pike` は後列も突ける
+# （requires_front_row = false）ので、槍衾がそのまま騎兵の忌避を誘う。
+#
+# シルトロンと盾壁の陣形プリセットはファイル間隔 0.5 m だが、兵士の当たり判定
+# の直径は 0.7 m。そのまま使うと隊列が常時重なって自分で圧死するので、
+# 0.8 m を明示する。
+
+[[army]]
+faction = 0
+name_ja = "スコットランド軍"
+commander = { name_ja = "ロバート1世（ブルース）", archetype = "cunning_captain" }
+battle_plan = "EchelonAttack"
+
+  [[army.contingent]]
+  name_ja = "左翼シルトロン（ダグラス）"
+  commander = { name_ja = "ジェームズ・ダグラス", archetype = "cunning_captain" }
+  troop_type = 1
+  quality = "professional"
+  loadout = "pikemen"
+  count = 260
+  files = 40
+  formation = "schiltron"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [470, 560]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "中央シルトロン（モレー伯）"
+  commander = { name_ja = "モレー伯トマス・ランドルフ", archetype = "veteran_mercenary" }
+  troop_type = 1
+  quality = "veteran"
+  loadout = "pikemen"
+  count = 260
+  files = 40
+  formation = "schiltron"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [555, 560]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "右翼シルトロン（エドワード・ブルース）"
+  commander = { name_ja = "エドワード・ブルース", archetype = "honor_hungry_knight" }
+  troop_type = 1
+  quality = "professional"
+  loadout = "pikemen"
+  count = 260
+  files = 40
+  formation = "schiltron"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [640, 560]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "国王シルトロン"
+  commander = { name_ja = "ロバート1世 直率", archetype = "professional_marshal" }
+  troop_type = 1
+  quality = "elite"
+  loadout = "pikemen"
+  count = 260
+  files = 40
+  formation = "schiltron"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [725, 560]
+  facing = 0
+  hosts_army_commander = true
+
+  [[army.contingent]]
+  name_ja = "キース卿の軽騎兵"
+  commander = { name_ja = "ロバート・キース", archetype = "cunning_captain" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 90
+  files = 18
+  formation = "wedge"
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [750, 520]
+  facing = 0
+
+# ── イングランド軍 ───────────────────────────────────────
+# 低湿地の中で騎兵も弓兵も持て余す。合意された会戦プランが無いまま夜明けを
+# 迎えた軍なので、battle_plan は指定しない（指揮官 AI がその場で選ぶ）。
+
+[[army]]
+faction = 1
+name_ja = "イングランド軍"
+commander = { name_ja = "エドワード2世", archetype = "stubborn_baron" }
+# battle_plan は無し
+
+  [[army.contingent]]
+  name_ja = "前衛騎兵（グロスター伯）"
+  # 支援を待たずに単独で突っ込み、討たれた。
+  commander = { name_ja = "グロスター伯ギルバート・ド・クレア", archetype = "reckless_youth" }
+  troop_type = 3
+  quality = "elite"
+  loadout = "mounted_knights"
+  count = 400
+  files = 40
+  formation = "wedge"
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [545, 700]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "騎兵（ヘレフォード伯）"
+  commander = { name_ja = "ヘレフォード伯ハンフリー・ド・ボーハン", archetype = "honor_hungry_knight" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 300
+  files = 30
+  formation = "wedge"
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [665, 700]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "本隊（国王）"
+  commander = { name_ja = "エドワード2世 直率", archetype = "stubborn_baron" }
+  troop_type = 0
+  quality = "professional"
+  loadout = "foot_men_at_arms"
+  count = 900
+  files = 90
+  formation = "line"
+  front = [600, 760]
+  facing = 180
+  hosts_army_commander = true
+
+  [[army.contingent]]
+  name_ja = "長弓隊"
+  # 展開する場所も指揮も与えられないまま最後尾に置かれ、軽騎兵に蹴散らされた。
+  commander = { name_ja = "弓兵隊長", archetype = "cautious_commander" }
+  troop_type = 2
+  quality = "militia"
+  loadout = "longbowmen"
+  count = 350
+  files = 35
+  formation = "pavise_line"
+  front = [700, 930]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "徴募歩兵"
+  commander = { name_ja = "州徴募隊長", archetype = "disciplinarian" }
+  troop_type = 1
+  quality = "levy"
+  loadout = "spearmen"
+  count = 600
+  files = 60
+  formation = "shieldwall"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [520, 870]
+  facing = 180

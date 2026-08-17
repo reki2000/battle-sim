@@ -70,20 +70,7 @@ impl World {
         battle_sites_flat: Vec<i32>,
     ) -> World {
         let seed = ((seed_hi as u64) << 32) | seed_lo as u64;
-        let mut battle_sites = Vec::with_capacity(battle_sites_flat.len() / 7);
-        let mut i = 0;
-        while i + 7 <= battle_sites_flat.len() {
-            battle_sites.push(BattleSiteCandidate {
-                x_m: battle_sites_flat[i],
-                y_m: battle_sites_flat[i + 1],
-                score: battle_sites_flat[i + 2],
-                passable_permille: battle_sites_flat[i + 3] as u16,
-                asymmetry_permille: battle_sites_flat[i + 4] as u16,
-                openness_permille: battle_sites_flat[i + 5] as u16,
-                bottleneck_count: battle_sites_flat[i + 6] as u16,
-            });
-            i += 7;
-        }
+        let battle_sites = parse_battle_sites(&battle_sites_flat);
         let terrain = Terrain {
             dim,
             cell_m,
@@ -100,6 +87,72 @@ impl World {
             inner: CoreWorld::with_terrain(seed, terrain),
             snapshot: RenderSnapshot::default(),
         }
+    }
+
+    /// 史実の会戦プリセット（`sim_core::scenario`）からワールドを作る。
+    ///
+    /// 地形の生成・整形と、両軍・指揮官・築城の配置まで済んだ状態で返る。
+    /// 命令は与えない——動き出すのは各軍の指揮官 AI の判断による。
+    #[wasm_bindgen(js_name = fromScenario)]
+    pub fn from_scenario(index: usize) -> Option<World> {
+        let def = sim_core::scenario::get(index)?;
+        Some(World {
+            inner: sim_core::scenario::build_world(def),
+            snapshot: RenderSnapshot::default(),
+        })
+    }
+
+    /// キャッシュ済みの地形グリッドから会戦プリセットのワールドを作る（M9）。
+    ///
+    /// グリッドは**整形後**のもの（`scenario::generate_terrain` の出力）で
+    /// なければならない。キャッシュキーにシナリオ id を含めるのは呼び出し側の
+    /// 責任（`from_cached_terrain` と同じ約束）。
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = fromScenarioCachedTerrain)]
+    pub fn from_scenario_cached_terrain(
+        index: usize,
+        dim: u32,
+        cell_m: u32,
+        height: Vec<i16>,
+        surface: Vec<u8>,
+        passability: Vec<u8>,
+        water: Vec<u8>,
+        water_kind: Vec<u8>,
+        cliff: Vec<u8>,
+        battle_sites_flat: Vec<i32>,
+    ) -> Option<World> {
+        let def = sim_core::scenario::get(index)?;
+        let seed = def.terrain.seed;
+        let terrain = Terrain {
+            dim,
+            cell_m,
+            seed,
+            height,
+            surface,
+            passability,
+            water,
+            water_kind: water_kind.iter().map(|&b| WaterKind::from_u8(b)).collect(),
+            cliff,
+            battle_sites: parse_battle_sites(&battle_sites_flat),
+        };
+        let mut inner = CoreWorld::with_terrain(seed, terrain);
+        sim_core::scenario::deploy(&mut inner, def);
+        Some(World {
+            inner,
+            snapshot: RenderSnapshot::default(),
+        })
+    }
+
+    /// 選択できる会戦プリセットの一覧（JSON、起動時に 1 回だけ読む想定）。
+    ///
+    /// 配列の index が [`World::from_scenario`] の `index` になる。
+    #[wasm_bindgen(js_name = scenarioListJson)]
+    pub fn scenario_list_json() -> String {
+        let entries: Vec<String> = sim_core::scenario::SCENARIOS
+            .iter()
+            .map(scenario_json)
+            .collect();
+        format!("[{}]", entries.join(","))
     }
 
     /// シミュレーションのロジックバージョン。リプレイの互換性判定に使う。
@@ -871,6 +924,79 @@ impl World {
     }
 }
 
+/// `battleSites()` と同じ 7 要素 1 組の平坦な配列を候補の一覧へ戻す。
+fn parse_battle_sites(flat: &[i32]) -> Vec<BattleSiteCandidate> {
+    let mut out = Vec::with_capacity(flat.len() / 7);
+    let mut i = 0;
+    while i + 7 <= flat.len() {
+        out.push(BattleSiteCandidate {
+            x_m: flat[i],
+            y_m: flat[i + 1],
+            score: flat[i + 2],
+            passable_permille: flat[i + 3] as u16,
+            asymmetry_permille: flat[i + 4] as u16,
+            openness_permille: flat[i + 5] as u16,
+            bottleneck_count: flat[i + 6] as u16,
+        });
+        i += 7;
+    }
+    out
+}
+
+/// 会戦プリセット 1 件を UI 向けの JSON にする。
+///
+/// `{:?}`（`Debug for str`）はダブルクォートとバックスラッシュをエスケープし、
+/// 日本語のような表示可能な文字はそのまま残すので、そのまま JSON 文字列に
+/// なる（`commander_decision_log_json` と同じ手）。
+fn scenario_json(def: &sim_core::scenario::ScenarioDef) -> String {
+    let armies: Vec<String> = def
+        .armies
+        .iter()
+        .map(|army| {
+            let contingents: Vec<String> = army
+                .contingents
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"nameJa\":{:?},\"commanderJa\":{:?},\"archetype\":{:?},\"count\":{},\"troopType\":{}}}",
+                        c.name_ja, c.commander.name_ja, c.commander.archetype, c.count, c.troop_type
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"faction\":{},\"nameJa\":{:?},\"commanderJa\":{:?},\"archetype\":{:?},\"battlePlan\":{:?},\"soldiers\":{},\"contingents\":[{}]}}",
+                army.faction,
+                army.name_ja,
+                army.commander.name_ja,
+                army.commander.archetype,
+                army.battle_plan
+                    .map_or_else(|| "-".to_string(), |p| format!("{p:?}")),
+                def.army_soldier_count(army),
+                contingents.join(",")
+            )
+        })
+        .collect();
+    format!(
+        "{{\"id\":{:?},\"nameJa\":{:?},\"nameEn\":{:?},\"year\":{},\"placeJa\":{:?},\
+         \"summaryJa\":{:?},\"historicalStrengthJa\":{:?},\"scaleNoteJa\":{:?},\
+         \"sizeM\":{},\"relief\":{},\"seedLo\":{},\"seedHi\":{},\"soldiers\":{},\"armies\":[{}]}}",
+        def.id,
+        def.name_ja,
+        def.name_en,
+        def.year,
+        def.place_ja,
+        def.summary_ja,
+        def.historical_strength_ja,
+        def.scale_note_ja,
+        def.terrain.size_m,
+        def.terrain.relief,
+        def.terrain.seed as u32,
+        (def.terrain.seed >> 32) as u32,
+        def.soldier_count(),
+        armies.join(",")
+    )
+}
+
 /// パニック時に JS のコンソールへスタックトレースを出す。
 ///
 /// 開発時のみ有効にする想定。
@@ -1017,6 +1143,64 @@ mod tests {
         let detail = w.soldier_detail(0);
         assert_eq!(detail.len(), 9);
         assert!(detail[0] > 0, "hp が 0 以下: {}", detail[0]);
+    }
+
+    /// 会戦プリセットが wasm 境界を越えて、そのまま回せる形で届くこと。
+    #[test]
+    fn scenario_binding_builds_a_playable_world() {
+        let mut w = World::from_scenario(0).expect("プリセット 0 が無い");
+        let def = sim_core::scenario::get(0).unwrap();
+        assert_eq!(w.soldier_count(), def.soldier_count());
+        assert!(w.command_node_count() > 2, "指揮ツリーが組まれていない");
+        for _ in 0..40 {
+            w.tick();
+        }
+        assert_eq!(w.alive_count(), def.soldier_count());
+        assert!(World::from_scenario(999).is_none());
+    }
+
+    /// キャッシュから復元したシナリオのワールドが、生成し直したものと
+    /// 完全に一致すること（`fromCachedTerrain` と同じ保証をシナリオ側にも）。
+    #[test]
+    fn scenario_from_cached_terrain_matches_a_freshly_built_one() {
+        let fresh = World::from_scenario(0).unwrap();
+        let t = &fresh.inner.terrain;
+        let mut cached = World::from_scenario_cached_terrain(
+            0,
+            t.dim,
+            t.cell_m,
+            t.height.clone(),
+            t.surface.clone(),
+            t.passability.clone(),
+            t.water.clone(),
+            t.water_kind.iter().map(|k| *k as u8).collect(),
+            t.cliff.clone(),
+            fresh.battle_sites(),
+        )
+        .unwrap();
+        let mut fresh = fresh;
+        assert_eq!(fresh.state_hash_lo(), cached.state_hash_lo());
+        for _ in 0..60 {
+            fresh.tick();
+            cached.tick();
+        }
+        assert_eq!(fresh.state_hash_lo(), cached.state_hash_lo());
+        assert_eq!(fresh.state_hash_hi(), cached.state_hash_hi());
+    }
+
+    #[test]
+    fn scenario_list_json_describes_every_preset() {
+        let json = World::scenario_list_json();
+        assert!(json.starts_with('['), "JSON 配列で始まっていない: {json}");
+        for def in sim_core::scenario::SCENARIOS {
+            assert!(json.contains(def.id), "{} が一覧に無い", def.id);
+            assert!(json.contains(def.name_ja));
+            for army in def.armies {
+                assert!(json.contains(army.commander.name_ja));
+            }
+        }
+        // 引用符の対応が取れている = そのままパースできる形になっている
+        assert_eq!(json.matches('"').count() % 2, 0);
     }
 
     /// M9: 地形キャッシュ（IndexedDB からの復元）が、再生成した地形と

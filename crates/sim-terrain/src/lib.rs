@@ -11,6 +11,7 @@ pub mod battle_site;
 pub mod hydrology;
 pub mod noise;
 pub mod roads;
+pub mod shaping;
 mod upsample;
 
 use sim_math::{fx, fx_from_mm, Fx, Rng};
@@ -903,6 +904,18 @@ fn derive_passability(t: &mut Terrain) {
             t.passability[idx] = v.clamp(1, 255) as u8;
         }
     }
+}
+
+/// 生成後にグリッドを書き換えたあと、派生グリッド（崖・通行コスト）を
+/// 整合させる。
+///
+/// [`generate`] は段階 11・13 でこれらを求めるが、シナリオの地形整形
+/// （[`shaping`]）は生成が終わったあとに `surface` と `height` を触るので、
+/// そのままでは崖と通行コストが古いままになる。会戦地候補（`battle_sites`）は
+/// 助言的な情報でしかないため再評価しない。
+pub fn recompute_derived(t: &mut Terrain) {
+    t.cliff = compute_cliffs(t);
+    derive_passability(t);
 }
 
 /// 生成された地形の健全性を検査する。テストと CI で使う。

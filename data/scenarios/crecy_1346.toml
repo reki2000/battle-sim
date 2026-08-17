@@ -1,0 +1,235 @@
+# クレシーの会戦（1346 年 8 月 26 日）。
+#
+# 仕様 10 章 10 節のシナリオ形式のうち、現時点のシミュレータが解釈できる範囲。
+# 実際に読まれるのは同じ内容を写した `crates/sim-core/src/scenario.rs` の
+# `CRECY_1346`。数値を変えるときは両方を直すこと。
+#
+# 座標系: x は西→東、y は南→北。英軍が南（斜面の上）、仏軍が北（斜面の下）。
+# `facing` はランクが伸びる向き。
+
+[scenario]
+id = "crecy_1346"
+name_ja = "クレシーの会戦"
+name_en = "Battle of Crécy"
+year = 1346
+place_ja = "北フランス・ポンチュー"
+summary_ja = "開けた緩斜面。上に立つ英軍の長弓が、順に到着する仏軍を迎え撃つ。"
+historical_strength_ja = "史実の推定兵力: 英 約14,000 / 仏 約25,000〜30,000"
+scale_note_ja = "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/8 に縮尺してある"
+
+[terrain]
+seed = "0xC5EC_1346_0000_0001"
+size_m = 1400             # アジンクールより広い開けた斜面
+cell_m = 2
+relief = 0
+forest_cover = 250
+marsh_bias = 120
+thermal_iterations = 6
+river_density = 0
+road_count = 1
+sea = "none"
+
+# 会戦場の水を抜いてから耕地を敷く（手続き生成の湖が展開地に残ると、
+# そこだけ騎兵が動けず隊列が押し合いで自壊する）。
+[[terrain.shaping]]
+kind = "drain"
+surface = "Farmland"
+x_m = 350
+y_m = 200
+w_m = 700
+h_m = 960
+
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Farmland"
+x_m = 350
+y_m = 200
+w_m = 700
+h_m = 960
+
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Meadow"        # 8 月の刈り入れ後。踏み固められてはいるが泥濘ではない
+x_m = 420
+y_m = 480
+w_m = 560
+h_m = 240
+
+# 西のクレシーの森。英軍の右翼を守る。挟む森は西側だけで東は開いたまま——
+# アジンクール（両側から狭まる隘路）との対比になる。
+[[terrain.shaping]]
+kind = "surface_belt"
+surface = "DenseForest"
+a = [300, 1400]
+b = [340, 0]
+half_width_m = 120
+
+[[terrain.shaping]]
+kind = "height_ramp"      # 英軍の立つ南が 9 m 高い
+axis = "y"
+from_m = 300
+to_m = 900
+from_cm = 900
+to_cm = 0
+
+# ── イングランド軍 ───────────────────────────────────────
+# 両翼の長弓兵が重装兵より前へ張り出す（ハロー隊形）。その前には掘った
+# 落とし穴。後方に国王の予備。長弓（射程 120 m・発射間隔 3.5 秒）は
+# ジェノヴァの弩（80 m・6 秒）を射程でも手数でも上回る。
+
+[[army]]
+faction = 0
+name_ja = "イングランド軍"
+commander = { name_ja = "エドワード3世", archetype = "professional_marshal" }
+battle_plan = "DefendHighGround"
+
+  [[army.contingent]]
+  name_ja = "左翼 長弓隊"
+  commander = { name_ja = "アランデル伯", archetype = "veteran_mercenary" }
+  troop_type = 2
+  quality = "professional"
+  loadout = "longbowmen"
+  count = 500
+  files = 50
+  formation = "pavise_line"
+  front = [610, 470]
+  facing = 0
+  # 堀は騎兵の進入そのものを塞ぐ（hard_blocks_cavalry）。
+  obstacle = { kind = "ditch", ahead_m = 10 }
+
+  [[army.contingent]]
+  name_ja = "黒太子隊（下馬重装兵）"
+  commander = { name_ja = "ウォリック伯（黒太子後見）", archetype = "disciplinarian" }
+  troop_type = 0
+  quality = "elite"
+  loadout = "pollaxe_men_at_arms"
+  count = 300
+  files = 50
+  formation = "line"
+  front = [700, 440]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "右翼 長弓隊"
+  commander = { name_ja = "ノーサンプトン伯", archetype = "veteran_mercenary" }
+  troop_type = 2
+  quality = "professional"
+  loadout = "longbowmen"
+  count = 500
+  files = 50
+  formation = "pavise_line"
+  front = [790, 470]
+  facing = 0
+  obstacle = { kind = "ditch", ahead_m = 10 }
+
+  [[army.contingent]]
+  name_ja = "第二陣（下馬重装兵）"
+  commander = { name_ja = "ノーサンプトン伯麾下", archetype = "veteran_mercenary" }
+  troop_type = 0
+  quality = "veteran"
+  loadout = "pollaxe_men_at_arms"
+  count = 250
+  files = 50
+  formation = "line"
+  front = [700, 415]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "国王予備"
+  # 「息子に拍車を勝ち取らせよ」と援軍を送らなかった王。
+  commander = { name_ja = "エドワード3世 直率", archetype = "cautious_commander" }
+  troop_type = 0
+  quality = "elite"
+  loadout = "pollaxe_men_at_arms"
+  count = 200
+  files = 40
+  formation = "line"
+  front = [700, 370]
+  facing = 0
+  hosts_army_commander = true
+
+# ── フランス軍 ───────────────────────────────────────────
+# 弩兵を先に立て、その後ろから騎兵のコンロワ（小隊）が次々に突っ込む。
+# 1 つの巨大な騎兵の塊にはしない——史実でも仏軍は広い正面にばらばらと
+# 到着したし、大きな塊にすると前が止まった瞬間に後ろが押し込んで、
+# 戦う前に押し合いで潰れてしまう。
+
+[[army]]
+faction = 1
+name_ja = "フランス軍"
+commander = { name_ja = "フィリップ6世", archetype = "stubborn_baron" }
+battle_plan = "CenterPush"
+
+  [[army.contingent]]
+  name_ja = "ジェノヴァ弩兵"
+  commander = { name_ja = "オットーネ・ドーリア", archetype = "veteran_mercenary" }
+  troop_type = 2
+  # 長い行軍の直後に、パヴィス（大盾）を輜重に置いたまま前へ出された。
+  # 雨で弦が伸びていたぶんも含めて練度を落として表現する（天候は未実装）。
+  quality = "militia"
+  loadout = "crossbowmen"
+  count = 700
+  files = 70
+  formation = "pavise_line"
+  front = [700, 700]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "アランソン公騎兵"
+  # 弩兵の頭越しに突っ込んだ。
+  commander = { name_ja = "アランソン公シャルル", archetype = "honor_hungry_knight" }
+  troop_type = 3
+  quality = "elite"
+  loadout = "mounted_knights"
+  count = 350
+  files = 50
+  formation = "line"
+  # 馬の当たり判定は半径 90 cm。2.0 m 間隔だと隣同士が触れ合ったままになり、
+  # 押し合いが止まらずに隊列が自壊する。
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [560, 820]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "ボヘミア王隊"
+  commander = { name_ja = "ボヘミア王ヨハン（盲目王）", archetype = "reckless_youth" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 300
+  files = 50
+  formation = "wedge"
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [840, 820]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "第二陣騎兵"
+  commander = { name_ja = "フィリップ6世 直率", archetype = "stubborn_baron" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 350
+  files = 50
+  formation = "line"
+  file_spacing_mm = 2500
+  rank_spacing_mm = 2500
+  front = [630, 960]
+  facing = 180
+  hosts_army_commander = true
+
+  [[army.contingent]]
+  name_ja = "徴募歩兵"
+  commander = { name_ja = "民兵隊長", archetype = "cautious_commander" }
+  troop_type = 1
+  quality = "levy"
+  loadout = "spearmen"
+  count = 600
+  files = 60
+  formation = "shieldwall"
+  file_spacing_mm = 800
+  rank_spacing_mm = 800
+  front = [700, 1090]
+  facing = 180

@@ -1,0 +1,227 @@
+# アジンクールの会戦（1415 年 10 月 25 日）。
+#
+# 仕様 10 章 10 節のシナリオ形式のうち、現時点のシミュレータが解釈できる範囲を
+# 書いたもの。TOML の実行時ローダー（`sim-data`）はまだ無いので、これは
+# 人間が読む正本であり、実際に読まれるのは同じ内容を写した
+# `crates/sim-core/src/scenario.rs` の `AGINCOURT_1415`。
+# 数値を変えるときは両方を直すこと（`data/formations.toml` と
+# `organization::formation_def` の関係と同じ）。
+#
+# 座標系: x は西→東、y は南→北。英軍が南（y 小）、仏軍が北（y 大）に立つ。
+# `facing` は隊列のランクが伸びる向き（0 = +Y、180 = -Y）。
+
+[scenario]
+id = "agincourt_1415"
+name_ja = "アジンクールの会戦"
+name_en = "Battle of Agincourt"
+year = 1415
+place_ja = "北フランス・アルトワ"
+summary_ja = "森に挟まれた泥濘の耕地。数で劣る英軍が杭列と長弓で待ち構える。"
+historical_strength_ja = "史実の推定兵力: 英 約6,000〜9,000 / 仏 約12,000〜15,000"
+# 縮尺: 兵数と会戦場の幅をおよそ 1/4 にしてある。両者を同じ比で縮めることで、
+# 「森に挟まれて敵より広い正面を取れない」という会戦の骨格を保つ。
+scale_note_ja = "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/4 に縮尺してある"
+
+[terrain]
+seed = "0x4A17_C0FF_1415_0001"
+size_m = 1200
+cell_m = 2
+relief = 0                # 起伏のない平野。高低差は下の height_ramp で与える
+forest_cover = 300        # 会戦場の外に散る林の量（会戦場は下の整形で塗り替わる）
+marsh_bias = 250          # 秋の長雨
+thermal_iterations = 6
+river_density = 0         # 会戦場を横切る川は無い（テルヌワーズ川は地図の外）
+road_count = 1
+sea = "none"
+
+# 生成後に焼き込む地勢（`sim_terrain::shaping`）。適用順に意味がある——
+# 耕地を敷き、泥濘の帯を重ね、最後に森を置く。
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Farmland"      # 刈り取りの済んだ耕地
+x_m = 380
+y_m = 150
+w_m = 440
+h_m = 950
+
+[[terrain.shaping]]
+kind = "surface_rect"
+surface = "Mud"           # 前夜からの雨と数千の足で捏ねられた泥
+x_m = 430
+y_m = 400
+w_m = 340
+h_m = 360
+
+[[terrain.shaping]]
+kind = "surface_belt"     # 西のアジャンクール村の森
+surface = "DenseForest"
+a = [300, 1200]
+b = [400, 0]
+half_width_m = 130
+
+[[terrain.shaping]]
+kind = "surface_belt"     # 東のトラムクール村の森
+surface = "DenseForest"
+a = [900, 1200]
+b = [800, 0]
+half_width_m = 130
+# 2 つ合わせて、会戦場は北の 340 m から英軍正面の 210 m まで狭まる。
+
+[[terrain.shaping]]
+kind = "height_ramp"      # 英軍の立つ南側がわずかに高い
+axis = "y"
+from_m = 350
+to_m = 750
+from_cm = 500
+to_cm = 0
+
+# ── イングランド軍 ───────────────────────────────────────
+# 中央に徒歩の重装兵 3 隊、その両翼に長弓兵。長弓兵の前には打ち終えた杭列。
+
+[[army]]
+faction = 0
+name_ja = "イングランド軍"
+commander = { name_ja = "ヘンリー5世", archetype = "professional_marshal" }
+battle_plan = "DefendHighGround"
+
+  [[army.contingent]]
+  name_ja = "左翼 長弓隊"
+  commander = { name_ja = "トマス・アーピンガム卿", archetype = "veteran_mercenary" }
+  troop_type = 2            # longbowmen（data/visual-profiles/medieval_western.toml）
+  quality = "professional"
+  loadout = "longbowmen"
+  count = 700
+  files = 56
+  formation = "pavise_line" # 射撃を許す密な防御線。longbow 用の陣形はまだ無い
+  front = [530, 430]
+  facing = 0
+  stakes_ahead_m = 8
+
+  [[army.contingent]]
+  name_ja = "前衛（ヨーク公）"
+  commander = { name_ja = "ヨーク公エドワード", archetype = "disciplinarian" }
+  troop_type = 0
+  quality = "veteran"
+  loadout = "pollaxe_men_at_arms"
+  count = 125
+  files = 32
+  formation = "line"
+  front = [578, 430]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "本隊（国王）"
+  commander = { name_ja = "ヘンリー5世 直率", archetype = "disciplinarian" }
+  troop_type = 0
+  quality = "elite"
+  loadout = "pollaxe_men_at_arms"
+  count = 125
+  files = 32
+  formation = "line"
+  front = [603, 430]
+  facing = 0
+  hosts_army_commander = true
+
+  [[army.contingent]]
+  name_ja = "後衛（カモイス卿）"
+  commander = { name_ja = "カモイス卿", archetype = "cautious_commander" }
+  troop_type = 0
+  quality = "veteran"
+  loadout = "pollaxe_men_at_arms"
+  count = 125
+  files = 32
+  formation = "line"
+  front = [628, 430]
+  facing = 0
+
+  [[army.contingent]]
+  name_ja = "右翼 長弓隊"
+  commander = { name_ja = "ジョン・コーンウォール卿", archetype = "veteran_mercenary" }
+  troop_type = 2
+  quality = "professional"
+  loadout = "longbowmen"
+  count = 700
+  files = 56
+  formation = "pavise_line"
+  front = [675, 430]
+  facing = 0
+  stakes_ahead_m = 8
+
+# ── フランス軍 ───────────────────────────────────────────
+# 徒歩の重装兵を 2 線、その両翼に騎兵、後方に第 3 線。
+# 前衛の隊長は名誉に飢えた諸侯——命令を待たずに動く（独断専行、仕様 05 章）。
+
+[[army]]
+faction = 1
+name_ja = "フランス軍"
+commander = { name_ja = "シャルル・ダルブレ（大元帥）", archetype = "stubborn_baron" }
+battle_plan = "CenterPush"
+
+  [[army.contingent]]
+  name_ja = "前衛（徒歩重装兵）"
+  commander = { name_ja = "ブシコー元帥", archetype = "honor_hungry_knight" }
+  troop_type = 0
+  quality = "veteran"
+  loadout = "dismounted_lancers"
+  count = 1200
+  files = 120
+  formation = "line"
+  front = [600, 655]
+  facing = 180
+  hosts_army_commander = true
+
+  [[army.contingent]]
+  name_ja = "左翼騎兵"
+  commander = { name_ja = "クリニェ・ド・ブラバン", archetype = "reckless_youth" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 200
+  files = 30
+  formation = "wedge"
+  # 陣形プリセットの間隔は徒歩兵向けなので、馬の当たり判定（半径 90 cm）に
+  # 合う広さを指定する。
+  file_spacing_mm = 2000
+  rank_spacing_mm = 2000
+  front = [515, 640]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "右翼騎兵"
+  commander = { name_ja = "ギヨーム・ド・サヴーズ", archetype = "honor_hungry_knight" }
+  troop_type = 3
+  quality = "veteran"
+  loadout = "mounted_knights"
+  count = 150
+  files = 30
+  formation = "wedge"
+  file_spacing_mm = 2000
+  rank_spacing_mm = 2000
+  front = [690, 640]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "本隊（アランソン公）"
+  commander = { name_ja = "アランソン公", archetype = "stubborn_baron" }
+  troop_type = 0
+  quality = "veteran"
+  loadout = "dismounted_lancers"
+  count = 900
+  files = 90
+  formation = "line"
+  front = [600, 700]
+  facing = 180
+
+  [[army.contingent]]
+  name_ja = "第三線（騎乗）"
+  commander = { name_ja = "ブラバン公", archetype = "cautious_commander" }
+  troop_type = 3
+  quality = "professional"
+  loadout = "mounted_knights"
+  count = 300
+  files = 50
+  formation = "line"
+  file_spacing_mm = 2000
+  rank_spacing_mm = 2000
+  front = [600, 760]
+  facing = 180

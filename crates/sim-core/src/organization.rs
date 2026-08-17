@@ -550,6 +550,10 @@ pub struct Unit {
     pub pursuit_leash: Option<PursuitLeash>,
 }
 
+/// 側面攻撃の目標を、敵部隊の重心から横へずらす距離（m）。真正面へ向かわせると
+/// 側面へ回り込まずに正面衝突するので、いったん敵の横を目指させる。
+const FLANK_OFFSET_M: i32 = 60;
+
 /// 追撃の紐（leash）。仕様 12 章 M5「追撃に出た騎兵が戻ってくるのに
 /// 現実的な時間がかかる」を実装するための、部隊単位の上限距離。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1099,9 +1103,23 @@ impl CommandTree {
         // ノードを可変借用する前に、他ノード（Charge/Pursue の対象）の重心と
         // この部隊の現在地を読んでおく。
         let target_centroid = match intent {
-            Intent::Charge { target } | Intent::Pursue { target, .. } => {
-                self.node(target).map(|n| n.stats.centroid)
-            }
+            Intent::Charge { target }
+            | Intent::Pursue { target, .. }
+            | Intent::Attack { target, .. } => self.node(target).map(|n| n.stats.centroid),
+            // 側面攻撃は敵の重心そのものではなく、その横を目標にする。
+            Intent::Flank { target, side } => self.node(target).map(|n| {
+                let (sin, cos) = (
+                    sim_math::sin_fx(n.stats.facing),
+                    sim_math::cos_fx(n.stats.facing),
+                );
+                // 部隊の正面が (-sin, cos) なので、その右手は (cos, sin)。
+                let right = Vec2Fx::new(cos, sin);
+                let offset = fx(FLANK_OFFSET_M);
+                match side {
+                    Side::Right => n.stats.centroid.add(right.scale(offset)),
+                    Side::Left => n.stats.centroid.sub(right.scale(offset)),
+                }
+            }),
             _ => None,
         };
         let pursuit_origin =
@@ -1148,6 +1166,15 @@ impl CommandTree {
                             } else {
                                 State::Advancing
                             };
+                    }
+                }
+                // 攻撃・側面攻撃も部隊を動かす。ここで経路を与えないと、命令を
+                // 受けた部隊がその場に立ち尽くす——指揮官 AI の `Envelop` は
+                // 子へ Attack/Flank/Charge を配るので、騎兵以外は誰も動かない
+                // ことになってしまう（憑依 UI の「攻撃」「側面」も同じ）。
+                Intent::Attack { .. } | Intent::Flank { .. } => {
+                    if let Some(destination) = target_centroid {
+                        route = Some(destination);
                     }
                 }
                 Intent::Pursue { max_distance_m, .. } => {

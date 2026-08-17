@@ -21,6 +21,7 @@ M3 では編成・陣形のプリセットを追加した。読み込み機構�
 | `factions/medieval_western.toml` | M3 のプリセットデータ |
 | `visual-profiles/medieval_western.toml` | 14世紀ヨーロッパの兵科・行動・画像再生契約 |
 | `morale.toml` | `crates/sim-core/src/soldiers.rs` の初期士気 |
+| `scenarios/*.toml` | `crates/sim-core/src/scenario.rs` の会戦プリセット定数 |
 
 M3（編成）で `sim-data` を追加し、以下を順に外へ出す。
 
@@ -42,6 +43,10 @@ data/
 ├── factions/
 └── scenarios/
 ```
+
+会戦プリセット（`scenarios/`）も同じ扱いで、TOML が人間の読む正本、実際に読まれる
+のは Rust 側の写し。数値を変えるときは両方を直す。解釈できる範囲は
+`docs/spec/10-data-formats.md` 10 節「実装済みの範囲」を参照。
 
 ## 規約
 

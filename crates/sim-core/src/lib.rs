@@ -16,6 +16,7 @@ pub mod commander_ai;
 pub mod engineering;
 pub mod organization;
 pub mod pathing;
+pub mod scenario;
 pub mod snapshot;
 pub mod soldiers;
 pub mod spatial;
@@ -36,7 +37,9 @@ use structures::StructureSystem;
 /// M6 で工兵（野戦築城・地形改修・矢の補給・負傷者回収）を追加したため 3 → 4。
 /// M7 で指揮官 AI（Blackboard・戦況評価・Objective・会戦プラン・独断専行）を
 /// 追加したため 4 → 5。
-pub const SIM_VERSION: u32 = 5;
+/// 射撃兵の士気・着弾判定・包囲目標の再選択を直したため 5 → 6（同じ命令ログ
+/// でも結果が変わるので、それ以前の記録とは互換しない）。
+pub const SIM_VERSION: u32 = 6;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
