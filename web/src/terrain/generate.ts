@@ -226,7 +226,11 @@ function applyConstraints(
         const dz = (z + 0.5) * cellM - c.zM;
         for (let x = minX; x <= maxX; x++) {
           const dx = (x + 0.5) * cellM - c.xM;
-          const q = Math.hypot(dx, dz) / radius;
+          // `Math.hypot` は精度の保護が実装依存で、エンジンが違うと結果が
+          // 1 ulp ずれうる。フィクスチャ（`data/terrain/*.bin`）は CI で
+          // 生成し直して突き合わせるので、ここは IEEE で厳密に定義された
+          // `sqrt` だけで書く。
+          const q = Math.sqrt(dx * dx + dz * dz) / radius;
           if (q >= 1) continue;
           const i = z * dim + x;
           height[i] = clampHeight(height[i]! + Math.round(residual * wendland(q)));
