@@ -133,6 +133,13 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
 
   if (msg.type === "ready") {
     snapshot.setStride(msg.soldierStride);
+    // いま画面に載っているワールドの素性を DOM に出す。疎通確認（web/tools）が
+    // 「切り替えが本当に終わったか」を、兵数や tick の見かけの落ち着きから
+    // 推測せずに判定できるようにするため。地形の生成がワーカーへ移ってから
+    // 組み直しに 1 秒近くかかることがあり、その間は前のワールドの HUD が
+    // 落ち着いて見えてしまう。
+    document.body.dataset.scenario = String(msg.scenario ?? -1);
+    document.body.dataset.worldSeq = String(Number(document.body.dataset.worldSeq ?? 0) + 1);
     try {
       await Promise.all([terrainGl.loadAssets(), soldierRenderer.loadAssets()]);
     } catch (error) {
