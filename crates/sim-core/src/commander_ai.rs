@@ -32,7 +32,7 @@
 //!   個別の分解ロジックを書かずに済む。
 
 use sim_math::{dist, dist_sq, unit_vec, Fx, Purpose, Rng, Vec2Fx};
-use sim_terrain::{Terrain, SURFACE_EFFECTS};
+use sim_terrain::Terrain;
 
 use crate::combat::CombatSystem;
 use crate::organization::{
@@ -174,8 +174,7 @@ fn visibility_permille(terrain: &Terrain, from: Vec2Fx, to: Vec2Fx) -> u32 {
     for permille in [250i32, 500, 750] {
         let t = ((permille as i64 * sim_math::FX_ONE as i64) / 1000) as Fx;
         let p = from.lerp(to, t);
-        let s = terrain.surface_at(p.x, p.y);
-        cover_sum += SURFACE_EFFECTS[s as usize].cover as u32;
+        cover_sum += terrain.effect_at(p.x, p.y).cover as u32;
     }
     (1000u32).saturating_sub(cover_sum / 3)
 }
@@ -1139,19 +1138,8 @@ mod tests {
     use crate::organization::{FormationId, Unit};
     use crate::soldiers::{Attrs, SoldierId};
     use sim_math::{brad_from_deg, fx};
-    use sim_terrain::{generate, TerrainParams};
-
     fn small_terrain(seed: u64) -> Terrain {
-        generate(&TerrainParams {
-            seed,
-            size_m: 400,
-            cell_m: 2,
-            relief: 50,
-            thermal_iterations: 2,
-            river_density: 0,
-            road_count: 0,
-            ..Default::default()
-        })
+        Terrain::flat(200, 2, seed)
     }
 
     fn leaf_unit(soldiers: Vec<SoldierId>, origin: Vec2Fx, facing: sim_math::Brad) -> Unit {

@@ -14,7 +14,8 @@
  * キャンバスに描く分には問題が起きないため、この形にしてある。
  */
 
-import { SURFACE_COLORS } from "./surface-colors";
+import { TILE_COLORS } from "./terrain-tile";
+import { tileAtIndex } from "../sim/terrain-data";
 import type { TerrainData } from "../sim/terrain-data";
 import type { Camera } from "./iso";
 import type { InterpolatedPositions, SnapshotView } from "../sim/snapshot";
@@ -46,7 +47,7 @@ export class MinimapRenderer {
       for (let px = 0; px < SIZE_PX; px++) {
         const gx = Math.min(data.dim - 1, Math.floor((px / SIZE_PX) * data.dim));
         const i = gy * data.dim + gx;
-        const c = SURFACE_COLORS[data.surface[i]! & 0x0f]!;
+        const c = TILE_COLORS[tileAtIndex(data, i)]!;
         const o = (py * SIZE_PX + px) * 4;
         img.data[o] = c[0];
         img.data[o + 1] = c[1];

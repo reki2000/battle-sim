@@ -14,9 +14,9 @@
 
 import { createContext, createProgram, clampTextureSize } from "./gl";
 import { Camera, TILE_H, TILE_M, PX_PER_M } from "./iso";
-import { cliffAt, WaterKind, waterKindAt } from "../sim/terrain-data";
+import { cliffAt, tileAtIndex, WaterKind, waterKindAt } from "../sim/terrain-data";
 import type { TerrainData } from "../sim/terrain-data";
-import { SURFACE_COLORS } from "./surface-colors";
+import { TILE_COLORS } from "./terrain-tile";
 import { loadTerrainAtlas, type TerrainAtlas } from "./generated-assets";
 
 const VERT_SRC = `#version 300 es
@@ -197,9 +197,9 @@ export class TerrainGlRenderer {
       for (let ox = 0; ox < outDim; ox++) {
         const x = Math.min(data.dim - 1, ox * stride);
         const i = y * data.dim + x;
-        const surface = data.surface[i]! & 0x0f;
-        const c = SURFACE_COLORS[surface]!;
-        surfacePx[oy * outDim + ox] = surface;
+        const tile = tileAtIndex(data, i);
+        const c = TILE_COLORS[tile]!;
+        surfacePx[oy * outDim + ox] = tile;
 
         const xn = Math.min(data.dim - 1, x + stride);
         const yn = Math.min(data.dim - 1, y + stride);
@@ -213,7 +213,7 @@ export class TerrainGlRenderer {
           shade *= 0.55;
         }
         // 海は他の水域よりわずかに濃く見せて区別する
-        if (waterKindAt(data, x, y) === WaterKind.Sea) {
+        if (waterKindAt(data, x, y) === WaterKind.SEA) {
           shade *= 0.9;
         }
 

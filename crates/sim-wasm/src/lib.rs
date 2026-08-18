@@ -12,10 +12,9 @@ use sim_core::organization::{ApproachStyle, Intent, MoveSpeed, Priority, ShootMo
 use sim_core::snapshot::RenderSnapshot;
 use sim_core::soldiers::Attrs;
 use sim_core::structures::StructureKind;
-use sim_core::{World as CoreWorld, WorldConfig};
+use sim_core::World as CoreWorld;
 use sim_math::{fx, fx_from_mm, Vec2Fx};
-use sim_terrain::battle_site::BattleSiteCandidate;
-use sim_terrain::{Terrain, TerrainParams, WaterKind};
+use sim_terrain::{BattleSiteCandidate, Terrain, TerrainGrids};
 use wasm_bindgen::prelude::*;
 
 /// wasm 側のワールドハンドル。
@@ -27,125 +26,95 @@ pub struct World {
 
 #[wasm_bindgen]
 impl World {
-    /// 地形を生成してワールドを作る。
-    #[wasm_bindgen(constructor)]
-    pub fn new(seed_lo: u32, seed_hi: u32, size_m: u32, relief: u16) -> World {
-        let seed = ((seed_hi as u64) << 32) | seed_lo as u64;
-        let config = WorldConfig {
-            seed,
-            terrain: TerrainParams {
-                seed,
-                size_m,
-                relief,
-                ..Default::default()
-            },
-        };
-        World {
-            inner: CoreWorld::new(&config),
-            snapshot: RenderSnapshot::default(),
-        }
-    }
-
-    /// キャッシュ済みの地形グリッドからワールドを作る（M9: 地形キャッシュ、
-    /// IndexedDB に保存された前回生成分を再利用し、地形生成をスキップする）。
+    /// 生成済みの地形グリッドからワールドを作る。
     ///
-    /// 各グリッドは `terrainDim()` × `terrainDim()`（行優先）で、既存の
-    /// `terrain*Ptr()` 系バインディングが指す先と同じレイアウト。
-    /// `battleSitesFlat` は `battleSites()` と同じ 7 要素 1 組の平坦な配列。
-    /// 呼び出し側は、これらが同じ (seed, sizeM, relief) から生成されたもので
-    /// あることを保証すること（ここでは検証しない）。
+    /// **地形の生成は JS 側（`web/src/terrain`）にある。** ワーカーが渡して
+    /// くるのは、その場で生成したものか IndexedDB から復元したもののどちらか
+    /// で、どちらもここでは同じ扱いになる。
+    ///
+    /// 各グリッドは `dim` × `dim`（行優先）。通行コストと崖は渡さない——
+    /// 効果テーブルの正本は Rust 側にあり、`Terrain::from_grids` がそこから
+    /// 計算し直す。`battle_sites_flat` は `battleSites()` と同じ 7 要素 1 組の
+    /// 平坦な配列。
     #[allow(clippy::too_many_arguments)]
-    #[wasm_bindgen(js_name = fromCachedTerrain)]
-    pub fn from_cached_terrain(
+    #[wasm_bindgen(js_name = fromTerrain)]
+    pub fn from_terrain(
         seed_lo: u32,
         seed_hi: u32,
         dim: u32,
         cell_m: u32,
         height: Vec<i16>,
-        surface: Vec<u8>,
-        passability: Vec<u8>,
-        water: Vec<u8>,
+        ground: Vec<u8>,
+        vegetation: Vec<u8>,
+        overlay: Vec<u8>,
+        water: Vec<u16>,
         water_kind: Vec<u8>,
-        cliff: Vec<u8>,
+        moisture: Vec<u8>,
         battle_sites_flat: Vec<i32>,
     ) -> World {
         let seed = ((seed_hi as u64) << 32) | seed_lo as u64;
-        let battle_sites = parse_battle_sites(&battle_sites_flat);
-        let terrain = Terrain {
+        let terrain = Terrain::from_grids(TerrainGrids {
             dim,
             cell_m,
             seed,
             height,
-            surface,
-            passability,
+            ground,
+            vegetation,
+            overlay,
             water,
-            water_kind: water_kind.iter().map(|&b| WaterKind::from_u8(b)).collect(),
-            cliff,
-            battle_sites,
-        };
+            water_kind,
+            moisture,
+            battle_sites: parse_battle_sites(&battle_sites_flat),
+        });
         World {
             inner: CoreWorld::with_terrain(seed, terrain),
             snapshot: RenderSnapshot::default(),
         }
     }
 
-    /// 史実の会戦プリセット（`sim_core::scenario`）からワールドを作る。
+    /// 生成済みの地形グリッドから、会戦プリセットのワールドを作る。
     ///
-    /// 地形の生成・整形と、両軍・指揮官・築城の配置まで済んだ状態で返る。
-    /// 命令は与えない——動き出すのは各軍の指揮官 AI の判断による。
-    #[wasm_bindgen(js_name = fromScenario)]
-    pub fn from_scenario(index: usize) -> Option<World> {
-        let def = sim_core::scenario::get(index)?;
-        Some(World {
-            inner: sim_core::scenario::build_world(def),
-            snapshot: RenderSnapshot::default(),
-        })
-    }
-
-    /// キャッシュ済みの地形グリッドから会戦プリセットのワールドを作る（M9）。
-    ///
-    /// グリッドは**整形後**のもの（`scenario::generate_terrain` の出力）で
-    /// なければならない。キャッシュキーにシナリオ id を含めるのは呼び出し側の
-    /// 責任（`from_cached_terrain` と同じ約束）。
+    /// グリッドは**整形後**——シナリオ固有の地勢（森の縁・泥濘の耕地・緩い
+    /// 登り）まで焼き込んだもの——でなければならない。整形は生成器
+    /// （`web/src/terrain/scenarios.ts`）が行う。
     #[allow(clippy::too_many_arguments)]
-    #[wasm_bindgen(js_name = fromScenarioCachedTerrain)]
-    pub fn from_scenario_cached_terrain(
+    #[wasm_bindgen(js_name = fromScenarioTerrain)]
+    pub fn from_scenario_terrain(
         index: usize,
         dim: u32,
         cell_m: u32,
         height: Vec<i16>,
-        surface: Vec<u8>,
-        passability: Vec<u8>,
-        water: Vec<u8>,
+        ground: Vec<u8>,
+        vegetation: Vec<u8>,
+        overlay: Vec<u8>,
+        water: Vec<u16>,
         water_kind: Vec<u8>,
-        cliff: Vec<u8>,
+        moisture: Vec<u8>,
         battle_sites_flat: Vec<i32>,
     ) -> Option<World> {
         let def = sim_core::scenario::get(index)?;
-        let seed = def.terrain.seed;
-        let terrain = Terrain {
+        let terrain = Terrain::from_grids(TerrainGrids {
             dim,
             cell_m,
-            seed,
+            seed: def.terrain_seed,
             height,
-            surface,
-            passability,
+            ground,
+            vegetation,
+            overlay,
             water,
-            water_kind: water_kind.iter().map(|&b| WaterKind::from_u8(b)).collect(),
-            cliff,
+            water_kind,
+            moisture,
             battle_sites: parse_battle_sites(&battle_sites_flat),
-        };
-        let mut inner = CoreWorld::with_terrain(seed, terrain);
-        sim_core::scenario::deploy(&mut inner, def);
+        });
         Some(World {
-            inner,
+            inner: sim_core::scenario::build_world(def, terrain),
             snapshot: RenderSnapshot::default(),
         })
     }
 
     /// 選択できる会戦プリセットの一覧（JSON、起動時に 1 回だけ読む想定）。
     ///
-    /// 配列の index が [`World::from_scenario`] の `index` になる。
+    /// 配列の index が [`World::from_scenario_terrain`] の `index` になる。
     #[wasm_bindgen(js_name = scenarioListJson)]
     pub fn scenario_list_json() -> String {
         let entries: Vec<String> = sim_core::scenario::SCENARIOS
@@ -323,9 +292,28 @@ impl World {
         self.inner.terrain.size_m()
     }
 
-    #[wasm_bindgen(js_name = terrainSurfacePtr)]
-    pub fn terrain_surface_ptr(&self) -> *const u8 {
-        self.inner.terrain.surface.as_ptr()
+    /// 地質グリッド（[`sim_terrain::Ground`] の discriminant）。
+    #[wasm_bindgen(js_name = terrainGroundPtr)]
+    pub fn terrain_ground_ptr(&self) -> *const u8 {
+        self.inner.terrain.ground.as_ptr()
+    }
+
+    /// 植生グリッド（[`sim_terrain::Vegetation`] の discriminant）。
+    #[wasm_bindgen(js_name = terrainVegetationPtr)]
+    pub fn terrain_vegetation_ptr(&self) -> *const u8 {
+        self.inner.terrain.vegetation.as_ptr()
+    }
+
+    /// 人工物グリッド（[`sim_terrain::Overlay`] の discriminant）。
+    #[wasm_bindgen(js_name = terrainOverlayPtr)]
+    pub fn terrain_overlay_ptr(&self) -> *const u8 {
+        self.inner.terrain.overlay.as_ptr()
+    }
+
+    /// 湿度グリッド（0..255）。泥濘の描画とデバッグに使う。
+    #[wasm_bindgen(js_name = terrainMoisturePtr)]
+    pub fn terrain_moisture_ptr(&self) -> *const u8 {
+        self.inner.terrain.moisture.as_ptr()
     }
 
     #[wasm_bindgen(js_name = terrainHeightPtr)]
@@ -338,16 +326,16 @@ impl World {
         self.inner.terrain.passability.as_ptr()
     }
 
-    /// 水深グリッド（10 cm 単位、0 = 陸地）。仕様 08 章の水面描画で使う。
+    /// 水深グリッド（cm、0 = 陸地）。仕様 08 章の水面描画で使う。
     #[wasm_bindgen(js_name = terrainWaterPtr)]
-    pub fn terrain_water_ptr(&self) -> *const u8 {
+    pub fn terrain_water_ptr(&self) -> *const u16 {
         self.inner.terrain.water.as_ptr()
     }
 
     /// 水域種別グリッド（[`sim_terrain::WaterKind`] の discriminant）。
     #[wasm_bindgen(js_name = terrainWaterKindPtr)]
     pub fn terrain_water_kind_ptr(&self) -> *const u8 {
-        self.inner.terrain.water_kind.as_ptr() as *const u8
+        self.inner.terrain.water_kind.as_ptr()
     }
 
     /// 崖ビットマスクグリッド（[`sim_terrain::cliff_bits`]）。
@@ -979,7 +967,7 @@ fn scenario_json(def: &sim_core::scenario::ScenarioDef) -> String {
     format!(
         "{{\"id\":{:?},\"nameJa\":{:?},\"nameEn\":{:?},\"year\":{},\"placeJa\":{:?},\
          \"summaryJa\":{:?},\"historicalStrengthJa\":{:?},\"scaleNoteJa\":{:?},\
-         \"sizeM\":{},\"relief\":{},\"seedLo\":{},\"seedHi\":{},\"soldiers\":{},\"armies\":[{}]}}",
+         \"sizeM\":{},\"seedLo\":{},\"seedHi\":{},\"soldiers\":{},\"armies\":[{}]}}",
         def.id,
         def.name_ja,
         def.name_en,
@@ -988,10 +976,9 @@ fn scenario_json(def: &sim_core::scenario::ScenarioDef) -> String {
         def.summary_ja,
         def.historical_strength_ja,
         def.scale_note_ja,
-        def.terrain.size_m,
-        def.terrain.relief,
-        def.terrain.seed as u32,
-        (def.terrain.seed >> 32) as u32,
+        def.size_m,
+        def.terrain_seed as u32,
+        (def.terrain_seed >> 32) as u32,
         def.soldier_count(),
         armies.join(",")
     )
@@ -1008,11 +995,74 @@ pub fn init_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    /// 一様な傾斜地の上にワールドを作る。
+    ///
+    /// 地形生成は JS 側（`web/src/terrain`）にあるので、wasm 境界のテストは
+    /// 地形を自分で組み立てて渡す。完全な水平面は避ける——兵の前後関係や
+    /// 向きの判断で当たり前に生じる差が消え、突撃が前進を始めない。
+    fn sloped_world(seed_lo: u32, dim: u32) -> World {
+        let n = (dim as usize).pow(2);
+        let mut height = vec![0i16; n];
+        for y in 0..dim {
+            for x in 0..dim {
+                height[(y * dim + x) as usize] = ((x + y) as i16).saturating_mul(2);
+            }
+        }
+        World::from_terrain(
+            seed_lo,
+            0,
+            dim,
+            2,
+            height,
+            vec![sim_terrain::Ground::Grass as u8; n],
+            vec![sim_terrain::Vegetation::ShortGrass as u8; n],
+            vec![0; n],
+            vec![0u16; n],
+            vec![0; n],
+            vec![110; n],
+            Vec::new(),
+        )
+    }
+
+    /// 会戦プリセットのワールドを、固定地形（`data/terrain/*.bin`）から作る。
+    fn scenario_world(index: usize) -> Option<World> {
+        let def = sim_core::scenario::get(index)?;
+        let t = sim_terrain::fixture::load_scenario(def.id).unwrap();
+        let sites: Vec<i32> = t
+            .battle_sites
+            .iter()
+            .flat_map(|s| {
+                [
+                    s.x_m,
+                    s.y_m,
+                    s.score,
+                    s.passable_permille as i32,
+                    s.asymmetry_permille as i32,
+                    s.openness_permille as i32,
+                    s.bottleneck_count as i32,
+                ]
+            })
+            .collect();
+        World::from_scenario_terrain(
+            index,
+            t.dim,
+            t.cell_m,
+            t.height.clone(),
+            t.ground.clone(),
+            t.vegetation.clone(),
+            t.overlay.clone(),
+            t.water.clone(),
+            t.water_kind.clone(),
+            t.moisture.clone(),
+            sites,
+        )
+    }
+
     use super::*;
 
     #[test]
     fn world_can_be_created_and_ticked() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 5, 5, 900, 0, 0, 0, 1);
         assert_eq!(w.soldier_count(), 25);
         w.set_faction_goal(0, 300, 300);
@@ -1025,7 +1075,7 @@ mod tests {
 
     #[test]
     fn snapshot_length_matches_soldier_count() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
         w.write_snapshot();
         assert_eq!(
@@ -1036,7 +1086,7 @@ mod tests {
 
     #[test]
     fn state_hash_halves_reconstruct_the_full_value() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 3, 3, 900, 0, 0, 0, 1);
         w.tick();
         let lo = w.state_hash_lo() as u64;
@@ -1046,7 +1096,7 @@ mod tests {
 
     #[test]
     fn terrain_metadata_is_consistent() {
-        let w = World::new(7, 0, 600, 200);
+        let w = sloped_world(7, 300);
         assert_eq!(w.terrain_size_m(), 600);
         assert_eq!(w.terrain_cell_m(), 2);
         assert_eq!(w.terrain_dim(), 300);
@@ -1054,7 +1104,7 @@ mod tests {
 
     #[test]
     fn water_cliff_and_battle_site_pointers_are_accessible() {
-        let w = World::new(7, 0, 1600, 700);
+        let w = sloped_world(7, 800);
         let n = (w.terrain_dim() * w.terrain_dim()) as usize;
         assert!(!w.terrain_water_ptr().is_null());
         assert!(!w.terrain_water_kind_ptr().is_null());
@@ -1076,7 +1126,7 @@ mod tests {
     /// 責務なので、ここでは「命令が受理されるか」だけを見る）。
     #[test]
     fn order_bindings_issue_orders_that_reach_the_command_tree() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
         w.deploy_block(200, 200, 4, 4, 900, 1, 16, 0, 2);
         let friendly = w.add_line_unit(0, 0, 16, 4, 0);
@@ -1096,7 +1146,7 @@ mod tests {
 
     #[test]
     fn queue_build_structure_binding_creates_a_task() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         let before = w.inner.engineering.tasks.len();
         w.queue_build_structure(0, 100, 100, 100, 110, 0, 5);
         assert_eq!(w.inner.engineering.tasks.len(), before + 1);
@@ -1104,7 +1154,7 @@ mod tests {
 
     #[test]
     fn commander_attrs_reflect_the_chosen_archetype() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 2, 2, 900, 0, 0, 0, 1);
         let node = w.add_line_unit(0, 0, 4, 2, 0);
         w.set_commander_archetype(node, 5, 1); // reckless_youth: boldness 高め・caution 低め
@@ -1118,7 +1168,7 @@ mod tests {
 
     #[test]
     fn commander_assessment_and_decision_log_are_queryable() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
         w.deploy_block(300, 300, 4, 4, 900, 1, 16, 0, 2);
         let friendly = w.add_line_unit(0, 0, 16, 4, 0);
@@ -1134,7 +1184,7 @@ mod tests {
 
     #[test]
     fn node_for_soldier_and_soldier_detail_resolve() {
-        let mut w = World::new(7, 0, 600, 200);
+        let mut w = sloped_world(7, 300);
         w.deploy_block(100, 100, 3, 3, 900, 0, 0, 0, 1);
         let node = w.add_line_unit(0, 0, 9, 3, 0);
         assert_eq!(w.node_for_soldier(0), node as i32);
@@ -1148,7 +1198,7 @@ mod tests {
     /// 会戦プリセットが wasm 境界を越えて、そのまま回せる形で届くこと。
     #[test]
     fn scenario_binding_builds_a_playable_world() {
-        let mut w = World::from_scenario(0).expect("プリセット 0 が無い");
+        let mut w = scenario_world(0).expect("プリセット 0 が無い");
         let def = sim_core::scenario::get(0).unwrap();
         assert_eq!(w.soldier_count(), def.soldier_count());
         assert!(w.command_node_count() > 2, "指揮ツリーが組まれていない");
@@ -1156,25 +1206,30 @@ mod tests {
             w.tick();
         }
         assert_eq!(w.alive_count(), def.soldier_count());
-        assert!(World::from_scenario(999).is_none());
+        assert!(scenario_world(999).is_none());
     }
 
-    /// キャッシュから復元したシナリオのワールドが、生成し直したものと
-    /// 完全に一致すること（`fromCachedTerrain` と同じ保証をシナリオ側にも）。
+    /// 地形グリッドを wasm 境界へもう一度通しても、同じワールドになること。
+    ///
+    /// ブラウザは IndexedDB に保存したグリッドを、生成をやり直さずにここへ
+    /// 渡す。導出グリッド（通行コスト・崖）は渡さず Rust 側で計算し直すので、
+    /// 往復しても経路探索・通行判定・地形速度倍率まで一致していなければ
+    /// ならない。
     #[test]
-    fn scenario_from_cached_terrain_matches_a_freshly_built_one() {
-        let fresh = World::from_scenario(0).unwrap();
+    fn passing_the_same_grids_again_rebuilds_an_identical_scenario_world() {
+        let fresh = scenario_world(0).unwrap();
         let t = &fresh.inner.terrain;
-        let mut cached = World::from_scenario_cached_terrain(
+        let mut cached = World::from_scenario_terrain(
             0,
             t.dim,
             t.cell_m,
             t.height.clone(),
-            t.surface.clone(),
-            t.passability.clone(),
+            t.ground.clone(),
+            t.vegetation.clone(),
+            t.overlay.clone(),
             t.water.clone(),
-            t.water_kind.iter().map(|k| *k as u8).collect(),
-            t.cliff.clone(),
+            t.water_kind.clone(),
+            t.moisture.clone(),
             fresh.battle_sites(),
         )
         .unwrap();
@@ -1203,32 +1258,40 @@ mod tests {
         assert_eq!(json.matches('"').count() % 2, 0);
     }
 
-    /// M9: 地形キャッシュ（IndexedDB からの復元）が、再生成した地形と
-    /// 完全に同じ挙動になることを確認する。地形グリッド自体の一致に加え、
-    /// 同じ操作を続けたときの `state_hash` まで一致することまで見る
-    /// （経路探索・通行判定・地形速度倍率など、地形に依存する全ロジックが
-    /// 復元後も壊れていないことの証明）。
+    /// 地形キャッシュ（IndexedDB からの復元）が、渡し直す前と完全に同じ
+    /// 挙動になることを確認する。地形グリッド自体の一致に加え、同じ操作を
+    /// 続けたときの `state_hash` まで見る（経路探索・通行判定・地形速度倍率
+    /// など、地形に依存する全ロジックが復元後も壊れていないことの証明）。
     #[test]
-    fn from_cached_terrain_matches_a_freshly_generated_world() {
-        let fresh = World::new(42, 0, 500, 300);
+    fn passing_the_same_grids_again_rebuilds_an_identical_world() {
+        let fresh = sloped_world(42, 250);
         let t = &fresh.inner.terrain;
-        let mut cached = World::from_cached_terrain(
+        let mut cached = World::from_terrain(
             42,
             0,
             t.dim,
             t.cell_m,
             t.height.clone(),
-            t.surface.clone(),
-            t.passability.clone(),
+            t.ground.clone(),
+            t.vegetation.clone(),
+            t.overlay.clone(),
             t.water.clone(),
-            t.water_kind.iter().map(|k| *k as u8).collect(),
-            t.cliff.clone(),
+            t.water_kind.clone(),
+            t.moisture.clone(),
             fresh.battle_sites(),
         );
         let mut fresh = fresh;
 
         assert_eq!(fresh.inner.terrain.height, cached.inner.terrain.height);
-        assert_eq!(fresh.inner.terrain.surface, cached.inner.terrain.surface);
+        assert_eq!(fresh.inner.terrain.ground, cached.inner.terrain.ground);
+        assert_eq!(
+            fresh.inner.terrain.vegetation,
+            cached.inner.terrain.vegetation
+        );
+        assert_eq!(
+            fresh.inner.terrain.passability,
+            cached.inner.terrain.passability
+        );
         assert_eq!(
             fresh.inner.terrain.passability,
             cached.inner.terrain.passability

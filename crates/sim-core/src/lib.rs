@@ -31,7 +31,7 @@ use corpses::CorpseField;
 use engineering::EngineeringSystem;
 use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
-use sim_terrain::{Terrain, TerrainParams, SURFACE_EFFECTS};
+use sim_terrain::Terrain;
 use soldiers::{flags, Attrs, SoldierId, Soldiers, State};
 use spatial::{SpatialHash, MAX_NEIGHBORS};
 use structures::StructureSystem;
@@ -61,26 +61,6 @@ const STANDOFF_RETREAT_MM: i32 = 600;
 const STANDOFF_TOLERANCE_MM: i32 = 150;
 /// 間合いを詰める・取り直すときの足の速さ（mm/s）。摺り足で、走りはしない。
 const STANDOFF_STEP_MM_PER_S: i32 = 700;
-
-/// ワールドの生成設定。
-#[derive(Clone, Debug)]
-pub struct WorldConfig {
-    pub seed: u64,
-    pub terrain: TerrainParams,
-}
-
-impl Default for WorldConfig {
-    fn default() -> Self {
-        let seed = 0x5EED_1234_ABCD_0001;
-        Self {
-            seed,
-            terrain: TerrainParams {
-                seed,
-                ..Default::default()
-            },
-        }
-    }
-}
 
 /// シミュレーションのワールド。
 pub struct World {
@@ -127,18 +107,12 @@ impl core::fmt::Debug for World {
 }
 
 impl World {
-    /// 地形を生成し、空のワールドを作る。
-    pub fn new(config: &WorldConfig) -> World {
-        let terrain = sim_terrain::generate(&config.terrain);
-        Self::with_terrain(config.seed, terrain)
-    }
-
-    /// 既に生成済みの地形から、空のワールドを作る（M9: 地形キャッシュ）。
+    /// 地形を受け取って、空のワールドを作る。
     ///
-    /// `terrain` は呼び出し側が用意する。`sim_terrain::generate` と同じ
-    /// (seed, size_m, relief, ...) から作られたものと同一であることは
-    /// 呼び出し側の責任（ここでは検証しない。ブラウザの IndexedDB に
-    /// 保存された地形グリッドを、再生成せずそのまま復元する用途を想定）。
+    /// **`sim-core` は地形を作らない。** 生成器は `web/src/terrain` にあり、
+    /// ブラウザではワーカーが生成したグリッドが、テストと `sim-headless`
+    /// では `sim_terrain::fixture` が読んだ固定地形がここへ渡ってくる。
+    /// グリッドが何から作られたかはここでは検証しない。
     pub fn with_terrain(seed: u64, terrain: sim_terrain::Terrain) -> World {
         World {
             seed,
@@ -759,8 +733,7 @@ impl World {
         let per_tick = per_sec_to_per_tick(fx_from_mm(base_mm_per_s));
 
         let pos = self.soldiers.pos(i);
-        let surface = self.terrain.surface_at(pos.x, pos.y);
-        let eff = &SURFACE_EFFECTS[surface as usize];
+        let eff = self.terrain.effect_at(pos.x, pos.y);
         let after_terrain = sim_math::fx_scale_permille(per_tick, eff.move_mult as i32);
         // 野戦築城（仕様 07 章 2 節、M6）: 杭列・堀・鹿砦・土塁・馬防柵は
         // 歩兵を減速させる。騎兵に対しては速度を落とすのではなく
@@ -1121,17 +1094,8 @@ mod tests {
     use super::*;
 
     fn small_world() -> World {
-        World::new(&WorldConfig {
-            seed: 7,
-            terrain: TerrainParams {
-                seed: 7,
-                size_m: 600,
-                cell_m: 2,
-                relief: 200,
-                thermal_iterations: 3,
-                ..Default::default()
-            },
-        })
+        // わずかな傾きを持たせる（`Terrain::sloped` の注記を参照）
+        World::with_terrain(7, Terrain::sloped(300, 2, 7, 2))
     }
 
     #[test]
@@ -1762,8 +1726,10 @@ mod tests {
         // 同じ距離を進むのに、森は草地より時間がかかる
         // （地形効果テーブルが移動に効いていることの確認）
         let w = small_world();
-        let grass = SURFACE_EFFECTS[sim_terrain::Surface::Grass as usize].move_mult;
-        let forest = SURFACE_EFFECTS[sim_terrain::Surface::DenseForest as usize].move_mult;
+        use sim_terrain::{compose_effect, Ground, Overlay, Vegetation};
+        let grass =
+            compose_effect(Ground::Grass, Vegetation::ShortGrass, 0, Overlay::None).move_mult;
+        let forest = compose_effect(Ground::Grass, Vegetation::Dense, 0, Overlay::None).move_mult;
         assert!(forest < grass);
         drop(w);
     }

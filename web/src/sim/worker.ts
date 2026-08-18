@@ -31,6 +31,9 @@ import type {
 } from "./protocol";
 import { buildCommanderInfo, parseSoldierDetail } from "./detail";
 import { loadCachedTerrain, saveCachedTerrain, terrainCacheKey } from "./terrain-cache";
+import type { CachedTerrain } from "./terrain-cache";
+import { generateTerrain } from "../terrain";
+import { SCENARIO_TERRAINS } from "../terrain/scenarios";
 
 let world: World | null = null;
 let memory: WebAssembly.Memory | null = null;
@@ -297,14 +300,22 @@ function postReady(reason: "init" | "replay", scenarios?: ScenarioInfo[]): void 
 
   const dim = world.terrainDim();
   const cells = dim * dim;
-  const surface = new Uint8Array(
-    new Uint8Array(memory.buffer, world.terrainSurfacePtr(), cells),
-  );
+  // wasm のリニアメモリを指すビューをそのまま渡すと、次の割り当てで
+  // デタッチされうる。転送する前にコピーを取る。
   const height = new Int16Array(
     new Int16Array(memory.buffer, world.terrainHeightPtr(), cells),
   );
-  const water = new Uint8Array(
-    new Uint8Array(memory.buffer, world.terrainWaterPtr(), cells),
+  const ground = new Uint8Array(
+    new Uint8Array(memory.buffer, world.terrainGroundPtr(), cells),
+  );
+  const vegetation = new Uint8Array(
+    new Uint8Array(memory.buffer, world.terrainVegetationPtr(), cells),
+  );
+  const overlay = new Uint8Array(
+    new Uint8Array(memory.buffer, world.terrainOverlayPtr(), cells),
+  );
+  const water = new Uint16Array(
+    new Uint16Array(memory.buffer, world.terrainWaterPtr(), cells),
   );
   const waterKind = new Uint8Array(
     new Uint8Array(memory.buffer, world.terrainWaterKindPtr(), cells),
@@ -327,86 +338,133 @@ function postReady(reason: "init" | "replay", scenarios?: ScenarioInfo[]): void 
         dim,
         cellM: world.terrainCellM(),
         sizeM: world.terrainSizeM(),
-        surface: surface.buffer,
         height: height.buffer,
+        ground: ground.buffer,
+        vegetation: vegetation.buffer,
+        overlay: overlay.buffer,
         water: water.buffer,
         waterKind: waterKind.buffer,
         cliff: cliff.buffer,
         battleSites,
       },
     },
-    [surface.buffer, height.buffer, water.buffer, waterKind.buffer, cliff.buffer],
+    [
+      height.buffer,
+      ground.buffer,
+      vegetation.buffer,
+      overlay.buffer,
+      water.buffer,
+      waterKind.buffer,
+      cliff.buffer,
+    ],
   );
 }
 
 /**
- * 地形キャッシュを引きつつ World を作る（M9）。キャッシュがあれば
- * `fromCachedTerrain` で再生成をスキップし、無ければ通常どおり生成してから
- * 次回のために非同期で保存する（起動をブロックしない・失敗は握りつぶす）。
- * `init`・`loadReplay` の両方から使う。
+ * 地形を用意して World を作る。
+ *
+ * **地形の生成はこのワーカーの中（`web/src/terrain`）で行う。** wasm は
+ * 出来上がった整数グリッドを受け取るだけで、生成には一切関わらない。
+ * 同じ (seed, sizeM, relief) を再訪したときは IndexedDB のキャッシュを使い、
+ * 生成をまるごと飛ばす。`init`・`loadReplay` の両方から使う。
  */
 async function createWorld(config: InitConfig): Promise<World> {
   const { seed, sizeM, relief, scenario } = config;
   const seedLo = seed >>> 0;
   const seedHi = Math.floor(seed / 2 ** 32) >>> 0;
-  // 会戦プリセットの地形は生成後に整形される（森の縁・泥濘・緩斜面）ので、
+  // 会戦プリセットの地形は整形される（森の縁・泥濘・緩斜面）ので、
   // 同じ (seed, sizeM, relief) でも中身が違う。キャッシュキーを分ける。
   const cacheKey = terrainCacheKey(seed, sizeM, relief, scenario);
-  const cached = await loadCachedTerrain(cacheKey);
-  if (cached) {
-    // 同じグリッドから作るので、以後の挙動は再生成した場合と完全に一致する
-    // （sim-wasm の from_cached_terrain_matches_a_freshly_generated_world /
-    // scenario_from_cached_terrain_matches_a_freshly_built_one で検証済み）。
-    const restored =
-      scenario === undefined
-        ? World.fromCachedTerrain(
-            seedLo,
-            seedHi,
-            cached.dim,
-            cached.cellM,
-            cached.height,
-            cached.surface,
-            cached.passability,
-            cached.water,
-            cached.waterKind,
-            cached.cliff,
-            Int32Array.from(cached.battleSitesFlat),
-          )
-        : World.fromScenarioCachedTerrain(
-            scenario,
-            cached.dim,
-            cached.cellM,
-            cached.height,
-            cached.surface,
-            cached.passability,
-            cached.water,
-            cached.waterKind,
-            cached.cliff,
-            Int32Array.from(cached.battleSitesFlat),
-          );
-    if (restored) return restored;
+
+  let grids = await loadCachedTerrain(cacheKey);
+  if (!grids) {
+    grids = generateGrids(config);
+    void saveCachedTerrain(cacheKey, grids);
   }
-  // プリセットの index が未知なら（記録が新しい版で作られた等）、
-  // 従来の手続き生成へ落として起動だけは通す。
-  const w =
-    scenario === undefined
-      ? new World(seedLo, seedHi, sizeM, relief)
-      : (World.fromScenario(scenario) ?? new World(seedLo, seedHi, sizeM, relief));
-  const dim = w.terrainDim();
-  const cells = dim * dim;
-  const mem = memory!;
-  void saveCachedTerrain(cacheKey, {
-    dim,
-    cellM: w.terrainCellM(),
-    height: new Int16Array(new Int16Array(mem.buffer, w.terrainHeightPtr(), cells)),
-    surface: new Uint8Array(new Uint8Array(mem.buffer, w.terrainSurfacePtr(), cells)),
-    passability: new Uint8Array(new Uint8Array(mem.buffer, w.terrainPassabilityPtr(), cells)),
-    water: new Uint8Array(new Uint8Array(mem.buffer, w.terrainWaterPtr(), cells)),
-    waterKind: new Uint8Array(new Uint8Array(mem.buffer, w.terrainWaterKindPtr(), cells)),
-    cliff: new Uint8Array(new Uint8Array(mem.buffer, w.terrainCliffPtr(), cells)),
-    battleSitesFlat: Array.from(w.battleSites()),
-  });
-  return w;
+
+  const sites = Int32Array.from(grids.battleSitesFlat);
+  if (scenario !== undefined) {
+    const w = World.fromScenarioTerrain(
+      scenario,
+      grids.dim,
+      grids.cellM,
+      grids.height,
+      grids.ground,
+      grids.vegetation,
+      grids.overlay,
+      grids.water,
+      grids.waterKind,
+      grids.moisture,
+      sites,
+    );
+    // プリセットの index が未知なら（記録が新しい版で作られた等）、
+    // 素の地形として起動だけは通す。
+    if (w) return w;
+  }
+  return World.fromTerrain(
+    seedLo,
+    seedHi,
+    grids.dim,
+    grids.cellM,
+    grids.height,
+    grids.ground,
+    grids.vegetation,
+    grids.overlay,
+    grids.water,
+    grids.waterKind,
+    grids.moisture,
+    sites,
+  );
+}
+
+/**
+ * シナリオ index が JS 側と Rust 側で同じものを指しているか検査する。
+ *
+ * 越えるのは index だけなので、並びがずれても静かに通ってしまい、
+ * 「アジンクールの軍がクレシーの地形の上に立つ」という形でしか現れない。
+ * 起動時に一度だけ突き合わせて、ずれていればその場で落とす。
+ */
+function assertScenarioOrder(scenarios: ScenarioInfo[]): void {
+  for (let i = 0; i < scenarios.length; i++) {
+    const expected = scenarios[i]!.id;
+    const found = SCENARIO_TERRAINS[i]?.id;
+    if (found !== expected) {
+      throw new Error(
+        `シナリオの並びが Rust 側とずれている: index ${i} は "${expected}" のはずが "${found ?? "なし"}"。` +
+          " web/src/terrain/scenarios.ts の SCENARIO_TERRAINS を sim-core::scenario::SCENARIOS に合わせること",
+      );
+    }
+  }
+}
+
+/** 地形を生成し、キャッシュに入れられる形にする。 */
+function generateGrids(config: InitConfig): CachedTerrain {
+  const { seed, sizeM, relief, scenario } = config;
+  const preset = scenario !== undefined ? SCENARIO_TERRAINS[scenario] : undefined;
+  const t = preset
+    ? generateTerrain(preset.params, preset.stamps)
+    : generateTerrain({ seed: BigInt(seed), sizeM, relief });
+
+  return {
+    dim: t.dim,
+    cellM: t.cellM,
+    height: t.height,
+    ground: t.ground,
+    vegetation: t.vegetation,
+    overlay: t.overlay,
+    water: t.water,
+    waterKind: t.waterKind,
+    moisture: t.moisture,
+    battleSitesFlat: t.battleSites.flatMap((s) => [
+      s.xM,
+      s.yM,
+      s.score,
+      s.passablePermille,
+      s.asymmetryPermille,
+      s.opennessPermille,
+      s.bottleneckCount,
+    ]),
+  };
 }
 
 self.onmessage = async (ev: MessageEvent<ToWorker>) => {
@@ -424,6 +482,8 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
         const wasm = await init();
         memory = wasm.memory;
       }
+      const scenarioList = JSON.parse(World.scenarioListJson()) as ScenarioInfo[];
+      assertScenarioOrder(scenarioList);
       recordedInit = {
         seed: msg.seed,
         sizeM: msg.sizeM,
@@ -437,7 +497,7 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       replayExpected = null;
 
       lastStatsTick = -STATS_INTERVAL_TICKS;
-      postReady("init", JSON.parse(World.scenarioListJson()) as ScenarioInfo[]);
+      postReady("init", scenarioList);
 
       lastRealMs = performance.now();
       // `init` は会戦を選び直すたびに来る。ループは 1 本だけ回す。

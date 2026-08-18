@@ -16,7 +16,7 @@ data/
 ├── archetypes.toml        性格アーキタイプ
 ├── ai_weights.toml        AI の評価関数の係数
 ├── morale.toml            士気の増減量
-├── terrain_surfaces.toml  地表タイプの効果
+├── terrain/               会戦ごとの固定地形（生成器が書き出したバイナリ）
 ├── engineer_tasks.toml    工兵タスクの工数と効果
 ├── sprite_sets.toml       スプライト生成の定義
 ├── visual-profiles/       時代・地域・兵科・行動の描画契約（シミュレーター正本）
@@ -355,13 +355,18 @@ TOML の実行時ローダー（`sim-data`）はまだ無い。`data/scenarios/*
 
 | 節 | 状態 |
 |---|---|
-| `[terrain]` | 生成パラメータ + シナリオ固有の地形整形（03 章 3.3 節） |
+| `[terrain]` | 生成パラメータ + シナリオ固有の地形整形。**正本は `web/src/terrain/scenarios.ts`**（03 章 0 節・3.7 節） |
 | `[[army]]` | 軍 → 部隊の 2 階層。中間階層（Battle/Banner/Company）はまだ作らない |
 | `army.contingent` | 兵科・練度・装備・陣形・配置・杭列 |
 | `commander` | アーキタイプ（性格）と、軍単位の会戦プラン |
 | `[time]` | 未実装（準備時間・開始時刻） |
 | `[victory]` | 未実装（勝敗は死傷と残存で読む） |
 | `weather` | 未実装。結果である泥濘を地形整形で焼き込んで代用する |
+
+`[terrain]` だけは他の節と扱いが違う。地形の生成器は `web/src/terrain`
+（TypeScript）にあり、Rust の `sim_core::scenario` は地形パラメータを持たない
+——受け取るのは出来上がったグリッドだけになる（03 章 0 節）。生成パラメータと
+整形の正本は `web/src/terrain/scenarios.ts` で、この TOML はその写しである。
 
 シナリオは**命令を持たない**。両軍は陣形の上に立つだけで、動き出すのは
 各軍の指揮官 AI（05 章）が性格と会戦プランから下す判断による。

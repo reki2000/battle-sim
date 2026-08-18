@@ -23,6 +23,10 @@ import { OrderPanel } from "./ui/orders";
 import { DetailPanel } from "./ui/detail-panel";
 import { SessionPanel } from "./ui/session-panel";
 import { ScenarioPanel } from "./ui/scenario-panel";
+// Worker は base64 で JS へ畳み込む（`?worker&inline`）。別ファイルのままだと
+// 単一 HTML にできない。畳むと `import.meta.url` が blob: になるので、wasm も
+// data URI で持つ必要がある（`vite.config.ts` を参照）。
+import SimWorker from "./sim/worker.ts?worker&inline";
 import { t, onLangChange } from "./i18n";
 import { getQuality, onQualityChange } from "./quality";
 
@@ -77,9 +81,7 @@ let heldBuffer: ArrayBuffer | null = null;
 /** 指揮ツリー・戦闘統計。間引いて届くので、届いた最新のものを保持する。 */
 let lastStats: ParsedStats | null = null;
 
-const worker = new Worker(new URL("./sim/worker.ts", import.meta.url), {
-  type: "module",
-});
+const worker = new SimWorker();
 
 function send(msg: ToWorker, transfer: Transferable[] = []): void {
   worker.postMessage(msg, transfer);
@@ -133,6 +135,13 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
 
   if (msg.type === "ready") {
     snapshot.setStride(msg.soldierStride);
+    // いま画面に載っているワールドの素性を DOM に出す。疎通確認（web/tools）が
+    // 「切り替えが本当に終わったか」を、兵数や tick の見かけの落ち着きから
+    // 推測せずに判定できるようにするため。地形の生成がワーカーへ移ってから
+    // 組み直しに 1 秒近くかかることがあり、その間は前のワールドの HUD が
+    // 落ち着いて見えてしまう。
+    document.body.dataset.scenario = String(msg.scenario ?? -1);
+    document.body.dataset.worldSeq = String(Number(document.body.dataset.worldSeq ?? 0) + 1);
     try {
       await Promise.all([terrainGl.loadAssets(), soldierRenderer.loadAssets()]);
     } catch (error) {
@@ -145,9 +154,11 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       dim: terrain.dim,
       cellM: terrain.cellM,
       sizeM: terrain.sizeM,
-      surface: new Uint8Array(terrain.surface),
       height: new Int16Array(terrain.height),
-      water: new Uint8Array(terrain.water),
+      ground: new Uint8Array(terrain.ground),
+      vegetation: new Uint8Array(terrain.vegetation),
+      overlay: new Uint8Array(terrain.overlay),
+      water: new Uint16Array(terrain.water),
       waterKind: new Uint8Array(terrain.waterKind),
       cliff: new Uint8Array(terrain.cliff),
     };

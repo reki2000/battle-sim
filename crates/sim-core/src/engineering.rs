@@ -22,7 +22,7 @@
 //!   配線する作業が別途要る）。
 
 use sim_math::{dist, dist_sq, fx_from_mm, Fx, Purpose, Rng, Vec2Fx, FX_HALF};
-use sim_terrain::{Surface, Terrain};
+use sim_terrain::{Overlay, Terrain, Vegetation, FORD_MAX_DEPTH_CM};
 
 use crate::combat::CombatSystem;
 use crate::soldiers::{flags, Attrs, SoldierId, Soldiers, State, MAX_MORALE};
@@ -312,7 +312,9 @@ impl EngineeringSystem {
         if cells.is_empty() {
             return None;
         }
-        let original: Vec<u8> = cells.iter().map(|&idx| terrain.surface[idx]).collect();
+        // 架橋は人工物の軸だけを触るので、元に戻すのに覚えておくのも
+        // オーバーレイだけでよい。橋を落としても川床は川床のまま。
+        let original: Vec<u8> = cells.iter().map(|&idx| terrain.overlay[idx]).collect();
         // 仕様 07 章 3.1 節: 工数 = 川幅(m) × 400 man-s。セル数 × セル一辺を
         // 川幅の近似として使う。
         let work_required_mms = cells.len() as u32 * terrain.cell_m * 400_000;
@@ -374,9 +376,9 @@ impl EngineeringSystem {
         let cell_area_m2 = terrain.cell_m * terrain.cell_m;
         let mut work_required_mms = 0u32;
         for &idx in &cells {
-            let per_m2_mms = match Surface::from_u8(terrain.surface[idx]) {
-                Surface::DenseForest => 8_000,
-                Surface::LightForest => 4_000,
+            let per_m2_mms = match terrain.vegetation_at_index(idx) {
+                Vegetation::Dense => 8_000,
+                Vegetation::Woodland => 4_000,
                 _ => 0,
             };
             work_required_mms += per_m2_mms * cell_area_m2;
@@ -586,9 +588,8 @@ impl EngineeringSystem {
                 if dist(pos, site) > ARRIVAL_RADIUS_FX {
                     continue; // まだ現地へ移動中
                 }
-                let terrain_mult = fixed_terrain_mult.unwrap_or_else(|| {
-                    terrain_work_mult_permille(terrain.surface_at(pos.x, pos.y))
-                });
+                let terrain_mult =
+                    fixed_terrain_mult.unwrap_or_else(|| terrain_work_mult_permille(terrain, pos));
                 let mut rng = Rng::stream(world_seed, sid, Purpose::WorkVariance, tick);
                 work_sum += work_contribution_mms(
                     &soldiers.attrs[i],
@@ -617,14 +618,13 @@ impl EngineeringSystem {
                     }
                 }
                 TaskKind::BuildBridge { cells, .. } => {
-                    apply_cell_progress(terrain, cells, progress, Surface::Bridge)
+                    apply_overlay_progress(terrain, cells, progress, Overlay::Bridge)
                 }
                 TaskKind::DestroyBridge { cells, original } => {
-                    apply_cell_revert_progress(terrain, cells, original, progress)
+                    apply_overlay_revert_progress(terrain, cells, original, progress)
                 }
-                TaskKind::ClearForest { cells } => {
-                    apply_cell_progress(terrain, cells, progress, Surface::Grass)
-                }
+                // 伐採は植生だけを剥ぐ。下の土は土のままで、道にはならない
+                TaskKind::ClearForest { cells } => apply_felling_progress(terrain, cells, progress),
             }
             if t.work_done_mms >= t.work_required_mms {
                 self.finish_task(t_idx);
@@ -1023,11 +1023,8 @@ fn water_cells_along(terrain: &Terrain, a: Vec2Fx, b: Vec2Fx) -> Vec<usize> {
             continue;
         }
         let idx = terrain.idx(x as u32, y as u32);
-        if matches!(
-            Surface::from_u8(terrain.surface[idx]),
-            Surface::DeepWater | Surface::ShallowWater
-        ) && cells.last() != Some(&idx)
-        {
+        // 渡渉できる浅さ（渡渉点）には橋を架けない。歩いて渡れる
+        if terrain.water[idx] > FORD_MAX_DEPTH_CM && cells.last() != Some(&idx) {
             cells.push(idx);
         }
     }
@@ -1044,10 +1041,7 @@ fn forest_cells_in_rect(terrain: &Terrain, corner_a: Vec2Fx, corner_b: Vec2Fx) -
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let idx = terrain.idx(x, y);
-            if matches!(
-                Surface::from_u8(terrain.surface[idx]),
-                Surface::DenseForest | Surface::LightForest
-            ) {
+            if terrain.vegetation_at_index(idx).is_forest() {
                 cells.push(idx);
             }
         }
@@ -1055,51 +1049,62 @@ fn forest_cells_in_rect(terrain: &Terrain, corner_a: Vec2Fx, corner_b: Vec2Fx) -
     cells
 }
 
-/// 進捗（0..=1000‰）に応じて `cells` の先頭から比例した数だけ `target` に変える。
-fn apply_cell_progress(
+/// 進捗（0..=1000‰）に応じて `cells` の先頭から比例した数だけ人工物を置く。
+fn apply_overlay_progress(
     terrain: &mut Terrain,
     cells: &[usize],
     progress_permille: u16,
-    target: Surface,
+    target: Overlay,
 ) {
-    let count =
-        ((cells.len() as u32 * progress_permille as u32) / 1000).min(cells.len() as u32) as usize;
-    for &idx in &cells[..count] {
-        if Surface::from_u8(terrain.surface[idx]) != target {
-            terrain.set_surface(idx, target);
+    for &idx in &cells[..progressed_count(cells.len(), progress_permille)] {
+        if terrain.overlay_at_index(idx) != target {
+            terrain.set_overlay(idx, target);
         }
     }
 }
 
-/// `apply_cell_progress` の逆。進捗に応じて `original` の地表へ戻していく。
-fn apply_cell_revert_progress(
+/// [`apply_overlay_progress`] の逆。進捗に応じて元の人工物へ戻していく。
+fn apply_overlay_revert_progress(
     terrain: &mut Terrain,
     cells: &[usize],
     original: &[u8],
     progress_permille: u16,
 ) {
-    let count =
-        ((cells.len() as u32 * progress_permille as u32) / 1000).min(cells.len() as u32) as usize;
-    for k in 0..count {
-        let idx = cells[k];
-        let orig = Surface::from_u8(original[k]);
-        if Surface::from_u8(terrain.surface[idx]) != orig {
-            terrain.set_surface(idx, orig);
+    for k in 0..progressed_count(cells.len(), progress_permille) {
+        let orig = Overlay::from_u8(original[k]);
+        if terrain.overlay_at_index(cells[k]) != orig {
+            terrain.set_overlay(cells[k], orig);
         }
     }
 }
 
-/// 地表ごとの作業効率（‰、1000 = 標準）。仕様「岩盤は掘りにくい、泥は掘りやすい」。
-fn terrain_work_mult_permille(surface: Surface) -> i32 {
-    match surface {
-        Surface::Rock | Surface::Scree => 400,
-        Surface::DenseForest => 700,
-        Surface::LightForest | Surface::Scrub => 850,
-        Surface::Mud | Surface::Marsh => 1_300,
-        Surface::ShallowWater | Surface::Ford | Surface::Sand => 900,
-        Surface::DeepWater => 0,
-        _ => 1_000,
+/// 進捗に応じて森を伐り倒していく。
+///
+/// 触るのは植生の軸だけ。木を切っても下が草地になるわけではないので、
+/// 地質は生成器が決めたまま残す（移行前は伐採跡が一律 `Grass` になり、
+/// 泥濘の森を切ると足元まで乾いていた）。
+fn apply_felling_progress(terrain: &mut Terrain, cells: &[usize], progress_permille: u16) {
+    for &idx in &cells[..progressed_count(cells.len(), progress_permille)] {
+        if terrain.vegetation_at_index(idx) != Vegetation::None {
+            terrain.set_vegetation(idx, Vegetation::None);
+        }
     }
+}
+
+#[inline]
+fn progressed_count(len: usize, progress_permille: u16) -> usize {
+    ((len as u32 * progress_permille as u32) / 1000).min(len as u32) as usize
+}
+
+/// 足場ごとの作業効率（‰、1000 = 標準）。岩盤は掘りにくく、泥は掘りやすい。
+fn terrain_work_mult_permille(terrain: &Terrain, pos: Vec2Fx) -> i32 {
+    let (cx, cy) = terrain.world_to_cell(pos.x, pos.y);
+    let idx = terrain.idx(cx, cy);
+    sim_terrain::work_mult_permille(
+        terrain.ground_at_index(idx),
+        terrain.vegetation_at_index(idx),
+        terrain.water[idx],
+    )
 }
 
 /// 仕様 07 章 1.2 節の `work_per_tick` 式（1 人分）。`weather_mult` /
@@ -1131,19 +1136,10 @@ mod tests {
     use crate::combat::{Armor, Weapon};
     use crate::soldiers::Attrs;
     use sim_math::{fx, fx_from_mm as mm};
-    use sim_terrain::{generate, TerrainParams};
+    use sim_terrain::WaterKind;
 
     fn small_terrain(seed: u64) -> Terrain {
-        generate(&TerrainParams {
-            seed,
-            size_m: 400,
-            cell_m: 2,
-            relief: 100,
-            thermal_iterations: 2,
-            river_density: 0,
-            road_count: 0,
-            ..Default::default()
-        })
+        Terrain::flat(200, 2, seed)
     }
 
     fn worker_attrs() -> Attrs {
@@ -1324,7 +1320,7 @@ mod tests {
         let (_, cy1) = env.terrain.world_to_cell(b.x, b.y);
         for cy in cy0.min(cy1)..=cy0.max(cy1) {
             let idx = env.terrain.idx(cx, cy);
-            env.terrain.set_surface(idx, Surface::DeepWater);
+            env.terrain.set_water(idx, 400, WaterKind::River);
         }
         let before_idx = env.terrain.idx(cx, cy0);
         assert_eq!(
@@ -1352,7 +1348,7 @@ mod tests {
         };
         let bridged = cells
             .iter()
-            .filter(|&&idx| Surface::from_u8(env.terrain.surface[idx]) == Surface::Bridge)
+            .filter(|&&idx| env.terrain.overlay_at_index(idx) == Overlay::Bridge)
             .count();
         assert!(
             bridged > 0,

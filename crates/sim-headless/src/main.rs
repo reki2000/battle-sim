@@ -18,9 +18,9 @@ use std::time::Instant;
 use sim_core::combat::BattlePhase;
 use sim_core::soldiers::{flags, Attrs};
 use sim_core::structures::StructureKind;
-use sim_core::{deploy_block, World, WorldConfig};
+use sim_core::{deploy_block, World};
 use sim_math::{fx, fx_from_mm, Vec2Fx};
-use sim_terrain::{SeaEdge, TerrainParams};
+use sim_terrain::Terrain;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,8 +40,8 @@ fn main() {
                 "使い方:\n  \
                  bench   [--soldiers N] [--ticks N] [--size M] [--seed N]   性能を計測する\n  \
                  verify  [--soldiers N] [--ticks N] [--seed N]              決定論を検証する\n  \
-                 terrain [--size M] [--relief 0-1000] [--seed N]            地形の統計を出す\n          \
-                 [--river-density 0-1000] [--roads N] [--sea north|east|south|west]\n  \
+                 terrain --scenario ID                                     固定地形（data/terrain/*.bin）の統計を出す\n          \
+                 地形の生成は web/src/terrain にあり、tools/gen_terrain_fixtures.mjs で書き出す\n  \
                  battle  [--soldiers N] [--seed N] [--max-ticks N]          会戦を最後まで回し、死因内訳・所要時間を出す（M4 受け入れ条件）\n  \
                  winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る\n  \
                  prep    [--soldiers N] [--runs N] [--prep-short N] [--prep-long N]\n          \
@@ -61,9 +61,6 @@ struct Opts {
     size_m: u32,
     relief: u16,
     seed: u64,
-    river_density: u16,
-    road_count: u16,
-    sea_edge: SeaEdge,
     runs: u32,
     max_ticks: u32,
     prep_short: u32,
@@ -79,9 +76,6 @@ impl Opts {
             size_m: 2_000,
             relief: 450,
             seed: 0x5EED_1234_ABCD_0001,
-            river_density: 500,
-            road_count: 2,
-            sea_edge: SeaEdge::None,
             runs: 200,
             // 仕様の受け入れ条件（会戦は 20 分〜3 時間）の上限に、判定の余白を
             // 少し足した値。ここに達したら「3 時間以内に終わらなかった」とみなす。
@@ -100,22 +94,11 @@ impl Opts {
                 "--size" => o.size_m = v.parse().unwrap_or(o.size_m),
                 "--relief" => o.relief = v.parse().unwrap_or(o.relief),
                 "--seed" => o.seed = parse_seed(v).unwrap_or(o.seed),
-                "--river-density" => o.river_density = v.parse().unwrap_or(o.river_density),
-                "--roads" => o.road_count = v.parse().unwrap_or(o.road_count),
                 "--runs" => o.runs = v.parse().unwrap_or(o.runs),
                 "--max-ticks" => o.max_ticks = v.parse().unwrap_or(o.max_ticks),
                 "--prep-short" => o.prep_short = v.parse().unwrap_or(o.prep_short),
                 "--prep-long" => o.prep_long = v.parse().unwrap_or(o.prep_long),
                 "--scenario" => o.scenario = Some(v.clone()),
-                "--sea" => {
-                    o.sea_edge = match v.as_str() {
-                        "north" => SeaEdge::North,
-                        "east" => SeaEdge::East,
-                        "south" => SeaEdge::South,
-                        "west" => SeaEdge::West,
-                        _ => SeaEdge::None,
-                    }
-                }
                 _ => {}
             }
             i += 2;
@@ -160,19 +143,18 @@ fn build_world_with_relief(o: &Opts, relief: u16) -> World {
 /// `run_prep_battle` は指揮ツリーの陣形（`form_battle_units`）を組むまで
 /// 兵士を `Idle` のまま留めておきたいので、こちらを直接使う。
 fn deploy_two_armies(o: &Opts, relief: u16) -> World {
-    let config = WorldConfig {
-        seed: o.seed,
-        terrain: TerrainParams {
-            seed: o.seed,
-            size_m: o.size_m,
-            relief,
-            ..Default::default()
-        },
-    };
-    let t0 = Instant::now();
-    let mut w = World::new(&config);
-    let terrain_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("地形生成: {terrain_ms:.1} ms ({} m 四方)", o.size_m);
+    // 地形生成は `web/src/terrain` にあり Rust からは呼べないので、
+    // 性能計測と決定論検証は一様な傾斜地の上で行う。地形の起伏そのものを
+    // 見たいときは `terrain --scenario ID` で固定地形を読むこと。
+    // `relief` は傾きの強さ（セルあたり cm）に写す。
+    let cell_m = 2;
+    let dim = (o.size_m / cell_m).max(8);
+    let rise_cm_per_cell = 1 + (relief as i32 / 250);
+    let mut w = World::with_terrain(
+        o.seed,
+        Terrain::sloped(dim, cell_m, o.seed, rise_cm_per_cell),
+    );
+    eprintln!("地形: {} m 四方の傾斜地（relief {relief}）", o.size_m);
 
     // 両軍を向かい合わせに配置する。1 部隊 = 40 列 × N 列。
     let per_side = o.soldiers / 2;
@@ -573,7 +555,13 @@ fn scenario_run(o: &Opts) {
     let def = sim_core::scenario::get(index).unwrap();
 
     let t0 = Instant::now();
-    let w = sim_core::scenario::build_world(def);
+    let w = match sim_core::scenario::build_world_from_fixture(def) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     eprintln!(
         "{}（{}年）: 兵 {} を配置（地形と配置に {:.1} ms）",
         def.name_ja,
@@ -673,9 +661,6 @@ fn clone_opts(o: &Opts) -> Opts {
         size_m: o.size_m,
         relief: o.relief,
         seed: o.seed,
-        river_density: o.river_density,
-        road_count: o.road_count,
-        sea_edge: o.sea_edge,
         runs: o.runs,
         max_ticks: o.max_ticks,
         prep_short: o.prep_short,
@@ -755,23 +740,33 @@ fn verify(o: &Opts) {
 }
 
 fn terrain_report(o: &Opts) {
-    let params = TerrainParams {
-        seed: o.seed,
-        size_m: o.size_m,
-        relief: o.relief,
-        river_density: o.river_density,
-        road_count: o.road_count,
-        sea_edge: o.sea_edge,
-        ..Default::default()
+    let Some(id) = o.scenario.as_deref() else {
+        eprintln!(
+            "地形の生成は web/src/terrain にあり、Rust からは呼べません。\n\
+             固定地形の統計を見るには --scenario ID を指定してください:"
+        );
+        for def in sim_core::scenario::SCENARIOS {
+            eprintln!("  {}", def.id);
+        }
+        std::process::exit(2);
     };
     let t0 = Instant::now();
-    let t = sim_terrain::generate(&params);
+    let t = match sim_terrain::fixture::load_scenario(id) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     let s = sim_terrain::stats(&t);
-    println!("シード      0x{:016X}", o.seed);
+    let total = s.cells as f64;
+    let impassable = s.cells as u32 - s.passable_cells;
+    println!("シナリオ    {id}");
+    println!("シード      0x{:016X}", t.seed);
     println!("サイズ      {} m ({}² セル)", t.size_m(), t.dim);
-    println!("生成時間    {ms:.1} ms");
+    println!("読み込み    {ms:.1} ms");
     println!(
         "標高        {:.1} m 〜 {:.1} m",
         s.min_height_cm as f64 / 100.0,
@@ -779,20 +774,19 @@ fn terrain_report(o: &Opts) {
     );
     println!(
         "通行不能    {} セル ({:.1}%)",
-        s.impassable,
-        s.impassable as f64 * 100.0 / t.surface.len() as f64
-    );
-    println!(
-        "最大連結域  通行可能セルの {:.1}%",
-        s.largest_passable_component as f64 * 100.0
-            / (t.surface.len() - s.impassable as usize).max(1) as f64
+        impassable,
+        impassable as f64 * 100.0 / total
     );
     println!(
         "水系        河川 {} セル / 湖 {} セル / 海 {} セル",
         s.river_cells, s.lake_cells, s.sea_cells
     );
-    println!("崖          {} エッジ", s.cliff_edges);
-    println!("会戦地候補  {} 件", s.battle_sites);
+    println!(
+        "人工物      道路 {} セル / 橋 {} セル",
+        s.road_cells, s.bridge_cells
+    );
+    println!("崖          {} セル", s.cliff_cells);
+    println!("会戦地候補  {} 件", t.battle_sites.len());
     if let Some(best) = t.battle_sites.first() {
         println!(
             "  最上位候補 ({:>5}, {:>5}) score={} 通行可能={:.0}% 開放度={:.0}%",
@@ -803,37 +797,33 @@ fn terrain_report(o: &Opts) {
             best.openness_permille as f64 / 10.0
         );
     }
-    println!("地表の内訳:");
-    let total = t.surface.len() as f64;
-    let names = [
-        "深水",
-        "浅瀬",
-        "渡渉点",
-        "湿地",
-        "泥",
-        "草地",
+    let ground_names = [
+        "土", "草地", "砂", "岩", "泥", "河床", "海底", "崖錐", "湿地",
+    ];
+    let veg_names = [
+        "なし",
+        "短草",
+        "疎林",
+        "林",
+        "密林",
+        "低木",
         "牧草地",
         "耕地",
-        "低木",
-        "疎林",
-        "密林",
-        "岩",
-        "崖錐",
-        "砂",
-        "道路",
-        "橋",
     ];
-    for (i, &c) in s.surface_counts.iter().enumerate() {
+    println!("地質の内訳:");
+    for (i, &c) in s.ground_counts.iter().enumerate() {
         if c > 0 {
-            println!("  {:<8} {:>6.2}%", names[i], c as f64 * 100.0 / total);
+            println!(
+                "  {:<8} {:>6.2}%",
+                ground_names[i],
+                c as f64 * 100.0 / total
+            );
         }
     }
-
-    match sim_terrain::validate(&t) {
-        Ok(()) => println!("\n検証: OK"),
-        Err(e) => {
-            eprintln!("\n検証: NG — {e}");
-            std::process::exit(1);
+    println!("植生の内訳:");
+    for (i, &c) in s.vegetation_counts.iter().enumerate() {
+        if c > 0 {
+            println!("  {:<8} {:>6.2}%", veg_names[i], c as f64 * 100.0 / total);
         }
     }
 }

@@ -34,38 +34,78 @@ page.on("console", (m) => {
 const hud = async () => (await page.textContent("#hud")) ?? "";
 const tick = async () => Number(/tick (\d+)/.exec(await hud())?.[1] ?? -1);
 const soldiers = async () => Number(/兵士 (\d+)/.exec(await hud())?.[1] ?? -1);
-const waitForDeploy = () =>
-  page.waitForFunction(
-    () => /兵士 [1-9]/.test(document.getElementById("hud")?.textContent ?? ""),
-    { timeout: 60_000 },
-  );
+/**
+ * いま画面に載っているワールドの素性（`main.ts` が `ready` のたびに書く）。
+ * `scenario` は選択中のプリセット index、`seq` は組み直しの通し番号。
+ */
+const worldState = () =>
+  page.evaluate(() => ({
+    scenario: Number(document.body.dataset.scenario ?? "-2"),
+    seq: Number(document.body.dataset.worldSeq ?? "0"),
+  }));
 
 /**
- * ワールドが組み直され、HUD が落ち着くまで待って兵数を返す。
+ * 指定したプリセットのワールドが載り終わるまで待ち、兵数を返す。
  *
- * 途中の HUD は当てにならない。切り替えた直後はまだ前のワールドが動いて
- * いるし（前の会戦の兵数と進んだ tick を読んでしまう）、組み直しの最中は
- * 一瞬「兵士 0」を通る。さらに `?scenario=` 起動では、URL による選択と
- * ループ先頭の再選択で組み直しが 2 回続けて走ることもある。
+ * HUD の見かけから推測してはいけない。切り替えた直後はまだ前のワールドが
+ * 動いていて、前の会戦の兵数と進んだ tick を読んでしまう——しかも地形の
+ * 生成がワーカーへ移ってから組み直しに 1 秒近くかかることがあり、その間
+ * ずっと前のワールドの HUD が「落ち着いて」見える。`ready` のたびに更新
+ * される `data-scenario` / `data-world-seq` を直接見て、目当てのワールドが
+ * 載ったことを確かめる。
  *
- * そこで「兵数が 1 人以上で、続けて 2 回読んでも同じ」まで待つ。
+ * `?scenario=` 起動では、URL による選択とループ先頭の再選択で組み直しが
+ * 2 回続けて走ることがあるので、`seq` が進み終わるのも待つ。
  */
-const waitForSettledDeploy = async () => {
-  const deadline = Date.now() + 60_000;
+const waitForWorld = async (scenarioIndex, sinceSeq) => {
+  const matches = ([want, since]) => {
+    const d = document.body.dataset;
+    return (
+      Number(d.scenario ?? "-2") === want && Number(d.worldSeq ?? "0") > since
+    );
+  };
+  await page.waitForFunction(matches, [scenarioIndex, sinceSeq], { timeout: 60_000 });
+
+  // 組み直しが連続することがあるので、`seq` が止まるまで見届ける
   let previous = -1;
-  while (Date.now() < deadline) {
+  for (let i = 0; i < 20; i++) {
     await page.waitForTimeout(400);
-    const count = await soldiers();
-    if (count > 0 && count === previous) return count;
-    previous = count;
+    const { seq } = await worldState();
+    if (seq === previous) break;
+    previous = seq;
   }
-  return await soldiers();
+
+  // 目当てのワールドが載っていることと兵数を**同じ評価の中で**読む。
+  // `data-scenario` は `ready` を受けた時点で立つが、HUD の兵数が新しい
+  // ワールドのものになるのは次の描画フレームからで、その隙間では
+  // 「兵士 0」を通る。2 回に分けて読むと、その隙間を挟んでしまう。
+  const handle = await page.waitForFunction(
+    ([want, since]) => {
+      const d = document.body.dataset;
+      if (Number(d.scenario ?? "-2") !== want) return false;
+      if (Number(d.worldSeq ?? "0") <= since) return false;
+      const m = /兵士 (\d+)/.exec(document.getElementById("hud")?.textContent ?? "");
+      const n = m ? Number(m[1]) : 0;
+      return n > 0 ? n : false;
+    },
+    [scenarioIndex, sinceSeq],
+    { timeout: 60_000 },
+  );
+  return await handle.jsonValue();
 };
 
 // 1. URL からプリセットを指定して起動できる
 await page.goto(`${URL}?scenario=${FIRST}`, { waitUntil: "networkidle" });
-await waitForDeploy();
-await waitForSettledDeploy();
+// `?scenario=` は id 指定なので、どの index になるかは載ってから分かる。
+// プリセット（index 0 以上）が載り、兵が出るまで待つ。
+await page.waitForFunction(
+  () =>
+    Number(document.body.dataset.scenario ?? "-2") >= 0 &&
+    /兵士 [1-9]/.test(document.getElementById("hud")?.textContent ?? ""),
+  undefined,
+  { timeout: 60_000 },
+);
+await waitForWorld((await worldState()).scenario, 0);
 
 const options = await page.$$eval("#scenario-panel select option", (els) =>
   els.map((e) => ({ value: e.value, label: e.textContent ?? "" })),
@@ -78,9 +118,9 @@ await page.keyboard.press("4"); // 8x
 
 // 2. どのプリセットも、選ぶと陣容が入れ替わり、命令なしで会戦が進む
 for (const preset of presets) {
+  const { seq } = await worldState();
   await page.selectOption("#scenario-panel select", preset.value);
-  await waitForDeploy();
-  const deployed = await waitForSettledDeploy();
+  const deployed = await waitForWorld(Number(preset.value), seq);
 
   const panel = ((await page.textContent("#scenario-panel")) ?? "").replace(/\s+/g, " ");
   const armies = (panel.match(/■/g) ?? []).length;
@@ -100,9 +140,9 @@ for (const preset of presets) {
 }
 
 // 3. 対称デモ配置へ戻せる（ワールドを組み直しても壊れない）
+const { seq: seqBeforeSandbox } = await worldState();
 await page.selectOption("#scenario-panel select", "-1");
-await waitForDeploy();
-await waitForSettledDeploy();
+await waitForWorld(-1, seqBeforeSandbox);
 await page.waitForTimeout(4000);
 console.log("デモへ復帰:", (await hud()).replace(/\n/g, " | "));
 await page.screenshot({ path: `${OUT}/scenario-sandbox.png` });
