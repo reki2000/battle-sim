@@ -23,6 +23,10 @@ import { OrderPanel } from "./ui/orders";
 import { DetailPanel } from "./ui/detail-panel";
 import { SessionPanel } from "./ui/session-panel";
 import { ScenarioPanel } from "./ui/scenario-panel";
+// Worker は base64 で JS へ畳み込む（`?worker&inline`）。別ファイルのままだと
+// 単一 HTML にできない。畳むと `import.meta.url` が blob: になるので、wasm も
+// data URI で持つ必要がある（`vite.config.ts` を参照）。
+import SimWorker from "./sim/worker.ts?worker&inline";
 import { t, onLangChange } from "./i18n";
 import { getQuality, onQualityChange } from "./quality";
 
@@ -77,9 +81,7 @@ let heldBuffer: ArrayBuffer | null = null;
 /** 指揮ツリー・戦闘統計。間引いて届くので、届いた最新のものを保持する。 */
 let lastStats: ParsedStats | null = null;
 
-const worker = new Worker(new URL("./sim/worker.ts", import.meta.url), {
-  type: "module",
-});
+const worker = new SimWorker();
 
 function send(msg: ToWorker, transfer: Transferable[] = []): void {
   worker.postMessage(msg, transfer);

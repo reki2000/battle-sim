@@ -6,11 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "build:single": "npm run build && node tools/bundle-single-file.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "wasm": "wasm-pack build ../crates/sim-wasm --target web --out-dir ../../web/src/wasm --out-name sim",
     "smoke": "node tools/smoke.mjs",
-    "smoke:scenario": "node tools/scenario-smoke.mjs"
+    "smoke:scenario": "node tools/scenario-smoke.mjs",
+    "smoke:single": "node tools/single-file-smoke.mjs"
   },
   "devDependencies": {
     "playwright": "^1.62.1",

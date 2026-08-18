@@ -58,14 +58,14 @@ const worldState = () =>
  * 2 回続けて走ることがあるので、`seq` が進み終わるのも待つ。
  */
 const waitForWorld = async (scenarioIndex, sinceSeq) => {
-  await page.waitForFunction(
-    ([want, since]) =>
-      Number(document.body.dataset.scenario ?? "-2") === want &&
-      Number(document.body.dataset.worldSeq ?? "0") > since &&
-      /兵士 [1-9]/.test(document.getElementById("hud")?.textContent ?? ""),
-    [scenarioIndex, sinceSeq],
-    { timeout: 60_000 },
-  );
+  const matches = ([want, since]) => {
+    const d = document.body.dataset;
+    return (
+      Number(d.scenario ?? "-2") === want && Number(d.worldSeq ?? "0") > since
+    );
+  };
+  await page.waitForFunction(matches, [scenarioIndex, sinceSeq], { timeout: 60_000 });
+
   // 組み直しが連続することがあるので、`seq` が止まるまで見届ける
   let previous = -1;
   for (let i = 0; i < 20; i++) {
@@ -74,15 +74,24 @@ const waitForWorld = async (scenarioIndex, sinceSeq) => {
     if (seq === previous) break;
     previous = seq;
   }
+
+  // 目当てのワールドが載っていることと兵数を**同じ評価の中で**読む。
   // `data-scenario` は `ready` を受けた時点で立つが、HUD の兵数が新しい
-  // ワールドのものになるのは次の描画フレームで最初のスナップショットが
-  // 届いてから。その隙間では「兵士 0」を読んでしまう。
-  await page.waitForFunction(
-    () => /兵士 [1-9]/.test(document.getElementById("hud")?.textContent ?? ""),
-    undefined,
+  // ワールドのものになるのは次の描画フレームからで、その隙間では
+  // 「兵士 0」を通る。2 回に分けて読むと、その隙間を挟んでしまう。
+  const handle = await page.waitForFunction(
+    ([want, since]) => {
+      const d = document.body.dataset;
+      if (Number(d.scenario ?? "-2") !== want) return false;
+      if (Number(d.worldSeq ?? "0") <= since) return false;
+      const m = /兵士 (\d+)/.exec(document.getElementById("hud")?.textContent ?? "");
+      const n = m ? Number(m[1]) : 0;
+      return n > 0 ? n : false;
+    },
+    [scenarioIndex, sinceSeq],
     { timeout: 60_000 },
   );
-  return await soldiers();
+  return await handle.jsonValue();
 };
 
 // 1. URL からプリセットを指定して起動できる

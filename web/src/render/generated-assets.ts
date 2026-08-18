@@ -12,6 +12,8 @@
  * 既存 PNG を Canvas へ読み込む際のマスク処理である。
  */
 
+import { TerrainTile, TILE_COLORS } from "./terrain-tile";
+
 export interface TerrainAtlas {
   width: number;
   height: number;
@@ -32,7 +34,14 @@ function loadImage(url: string): Promise<HTMLImageElement> {
 
 /**
  * 地形タイルアトラスが見つからないときの手続き生成フォールバック。
- * 4x4 のタイルそれぞれを、地表らしき単色で塗り分けるだけの最小限のもの。
+ *
+ * 16 枚のタイルを、それぞれの基準色（`TILE_COLORS`）で塗り分ける。
+ * ミニマップと同じ色を引くので、アトラスが無くても地図の読み方は変わらない
+ * ——草地は緑、水は青、耕地は黄土色のまま。ここで別の色表を持つと、
+ * アトラスの有無で水と森が入れ替わって見える。
+ *
+ * 単色のままだと 2 m タイルが一様でのっぺりするので、タイル内に決定論的な
+ * 微弱な明暗を入れて地面らしい粒状感だけ足す。
  */
 function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
   const cols = 4;
@@ -44,28 +53,34 @@ function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
   canvas.height = height;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("地形アトラス用 Canvas を作成できません");
-  const colors = [
-    "#5b7a4a",
-    "#7fa15c",
-    "#8f9a5a",
-    "#6b6247",
-    "#9c8b6a",
-    "#8a8a8a",
-    "#3d5a80",
-    "#c9b896",
-  ];
+
+  const image = ctx.createImageData(width, height);
   for (let ty = 0; ty < rows; ty++) {
     for (let tx = 0; tx < cols; tx++) {
-      ctx.fillStyle = colors[(ty * cols + tx) % colors.length]!;
-      ctx.fillRect(tx * tileSize, ty * tileSize, tileSize, tileSize);
+      const tile = ty * cols + tx;
+      const [r, g, b] = TILE_COLORS[tile] ?? TILE_COLORS[TerrainTile.GRASS]!;
+      for (let py = 0; py < tileSize; py++) {
+        for (let px = 0; px < tileSize; px++) {
+          // 座標から決まる ±6% の明暗。乱数を使わないので毎回同じ絵になる
+          const n = ((px * 7 + py * 13 + tile * 31) % 16) / 16 - 0.5;
+          const k = 1 + n * 0.12;
+          const o = ((ty * tileSize + py) * width + tx * tileSize + px) * 4;
+          image.data[o] = Math.min(255, Math.round(r * k));
+          image.data[o + 1] = Math.min(255, Math.round(g * k));
+          image.data[o + 2] = Math.min(255, Math.round(b * k));
+          image.data[o + 3] = 255;
+        }
+      }
     }
   }
+  ctx.putImageData(image, 0, 0);
+
   return {
     width,
     height,
     tileWidth: tileSize,
     tileHeight: tileSize,
-    pixels: ctx.getImageData(0, 0, width, height).data,
+    pixels: image.data,
   };
 }
 

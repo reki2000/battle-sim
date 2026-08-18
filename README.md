@@ -271,6 +271,33 @@ npm run smoke
 npm run smoke:scenario
 ```
 
+## 単一 HTML として配る
+
+シミュレータ全体を 1 枚の HTML（約 550 KB）にまとめられる。**サーバーは要らず、
+ファイルをダブルクリックして開けば動く。**
+
+```bash
+cd web
+npm run build:single      # → web/dist/battle-sim.html
+npm run smoke:single      # file:// で開いて実際に動くか確認する
+```
+
+中身は wasm も Worker も base64 で畳み込んである。成立させている条件は 2 つで、
+どちらも `file://` 特有の制約から来ている。
+
+- **Worker は classic（IIFE）**。`file://` のオリジンは `null` で、そこから
+  module worker を作ることはブラウザに拒否される。`vite.config.ts` の
+  `worker.format` を `"es"` に戻すと、サーバー越しでは動くのに単一 HTML だけが
+  無言で止まる。
+- **wasm は data URI**。`fetch()` も同じ理由で使えない。Worker を blob に畳むと
+  `import.meta.url` が `blob:` になり、そこからの相対パスで `.wasm` を取りに
+  行けなくなるので、どのみち畳むしかない。
+
+画像アセット（人物スプライトと地形アトラス、合計約 41 MB）は**入らない**。
+地形は `TILE_COLORS` から手続き生成したタイルへ、人物は図形へフォールバック
+する（`render/generated-assets.ts`）。シミュレーションと地形生成は完全に同じ
+ものが動くので、挙動を見るには十分だが、見た目は本番と違う。
+
 ## リポジトリ構成
 
 ```
@@ -290,7 +317,7 @@ web/
 │   ├── sim/        Worker、wasm ブリッジ、スナップショット・地形データの読み取り
 │   ├── render/     クォータービュー変換、WebGL2 地形、兵士、ミニマップ
 │   └── main.ts     エントリ
-└── tools/          ブラウザ疎通確認
+└── tools/          ブラウザ疎通確認、単一 HTML への畳み込み
 docs/spec/          仕様書
 data/               バランス調整用の数値（M3 以降）
 ├── scenarios/      会戦プリセットの可読な正本
