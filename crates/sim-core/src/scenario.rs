@@ -32,8 +32,7 @@ use crate::soldiers::{flags, Attrs, SoldierId};
 use crate::structures::StructureKind;
 use crate::World;
 use sim_math::{fx, fx_mul, Brad, Fx, Purpose, Rng, Vec2Fx, BRAD_HALF};
-use sim_terrain::shaping::{RampAxis, Stamp};
-use sim_terrain::{SeaEdge, Surface, Terrain, TerrainParams};
+use sim_terrain::Terrain;
 
 /// 軍（ルート）の階梯。
 const ECHELON_ARMY: u8 = 0;
@@ -277,9 +276,10 @@ pub struct ScenarioDef {
     pub historical_strength_ja: &'static str,
     /// 縮尺の説明（表示用）。
     pub scale_note_ja: &'static str,
-    pub terrain: TerrainParams,
-    /// 生成後に焼き込む地勢。
-    pub shaping: &'static [Stamp],
+    /// 会戦場の一辺（m）。地形フィクスチャの寸法と一致していなければならない。
+    pub size_m: u32,
+    /// このシナリオの地形のシード。表示とキャッシュキーに使う。
+    pub terrain_seed: u64,
     pub armies: &'static [ArmyDef],
 }
 
@@ -320,21 +320,29 @@ pub fn index_of(id: &str) -> Option<usize> {
 // 組み立て
 // ----------------------------------------------------------------------
 
-/// 地形を生成・整形し、両軍を配置したワールドを作る。
-pub fn build_world(def: &ScenarioDef) -> World {
-    let mut world = World::with_terrain(def.terrain.seed, generate_terrain(def));
+/// 与えられた地形の上に両軍を配置したワールドを作る。
+///
+/// **地形はここでは作らない。** 生成器は `web/src/terrain` にあり、
+/// シナリオ固有の地勢（森の縁・泥濘の耕地・緩い登り）もそちらで焼き込む。
+/// ブラウザではワーカーが生成したグリッドが、テストと `sim-headless` では
+/// [`load_terrain`] が読んだ固定地形がここへ渡ってくる。
+pub fn build_world(def: &ScenarioDef, terrain: Terrain) -> World {
+    let mut world = World::with_terrain(def.terrain_seed, terrain);
     deploy(&mut world, def);
     world
 }
 
-/// シナリオの地形を生成し、シナリオ固有の地勢を焼き込む。
+/// シナリオの固定地形（`data/terrain/<id>.bin`）を読む。
 ///
-/// 地形キャッシュ（M9）はこの結果のグリッドを保存する。復元側は
-/// [`World::with_terrain`] + [`deploy`] を呼べば同じワールドになる。
-pub fn generate_terrain(def: &ScenarioDef) -> Terrain {
-    let mut terrain = sim_terrain::generate(&def.terrain);
-    sim_terrain::shaping::apply(&mut terrain, def.shaping);
-    terrain
+/// ブラウザはこれを使わない——生成器をその場で回した結果を受け取る。
+/// ファイルを読める環境（テスト・`sim-headless`）だけの経路。
+pub fn load_terrain(def: &ScenarioDef) -> Result<Terrain, String> {
+    sim_terrain::fixture::load_scenario(def.id)
+}
+
+/// 固定地形を読み、両軍を配置したワールドを作る。
+pub fn build_world_from_fixture(def: &ScenarioDef) -> Result<World, String> {
+    Ok(build_world(def, load_terrain(def)?))
 }
 
 /// 既に地形を持つワールドへ、両軍・指揮系統・築城を配置する。
@@ -621,86 +629,10 @@ pub const AGINCOURT_1415: ScenarioDef = ScenarioDef {
     summary_ja: "森に挟まれた泥濘の耕地。数で劣る英軍が杭列と長弓で待ち構える。",
     historical_strength_ja: "史実の推定兵力: 英 約6,000〜9,000 / 仏 約12,000〜15,000",
     scale_note_ja: "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/4 に縮尺してある",
-    terrain: TerrainParams {
-        seed: 0x4A17_C0FF_1415_0001,
-        size_m: AG_SIZE_M as u32,
-        cell_m: 2,
-        // 起伏はほぼ無い平野。高低差は下の HeightRamp で与える。
-        relief: 0,
-        // 会戦場そのものは下の整形で塗り替わる。ここは周囲の林の量。
-        forest_cover: 300,
-        // 秋の長雨。会戦場の外も水を含んでいる。
-        marsh_bias: 250,
-        thermal_iterations: 6,
-        // 会戦場を横切る川は無い（テルヌワーズ川は地図の外）。
-        river_density: 0,
-        road_count: 1,
-        sea_edge: SeaEdge::None,
-        sea_level_cm: 0,
-    },
-    shaping: AGINCOURT_SHAPING,
+    size_m: AG_SIZE_M as u32,
+    terrain_seed: 0x4A17_C0FF_1415_0001,
     armies: AGINCOURT_ARMIES,
 };
-
-/// アジンクールの地勢。
-///
-/// 適用順に意味がある。耕地を敷いてから泥濘の帯を重ね、最後に森を置くことで、
-/// 森の縁が耕地に侵食されない。
-const AGINCOURT_SHAPING: &[Stamp] = &[
-    // まず会戦場の水を抜く。手続き生成が窪地に作った湖が両軍の展開地に
-    // かかっていると、そこだけ騎兵が動けず、隊列が押し合いで自壊する。
-    Stamp::Drain {
-        surface: Surface::Farmland,
-        x_m: 380,
-        y_m: 150,
-        w_m: 440,
-        h_m: 950,
-    },
-    // 会戦場は刈り取りの済んだ耕地。
-    Stamp::SurfaceRect {
-        surface: Surface::Farmland,
-        x_m: 380,
-        y_m: 150,
-        w_m: 440,
-        h_m: 950,
-    },
-    // 両軍の間と仏軍の展開地は、前夜からの雨と数千の足で捏ねられた泥。
-    // `Surface::Mud` は移動を鈍らせ、疲労を大きく増やす（仕様 06 章 2 節）。
-    Stamp::SurfaceRect {
-        surface: Surface::Mud,
-        x_m: 430,
-        y_m: 400,
-        w_m: 340,
-        h_m: 360,
-    },
-    // 西のアジャンクール村の森。南（英軍側）へ行くほど東へ張り出す。
-    Stamp::SurfaceBelt {
-        surface: Surface::DenseForest,
-        ax_m: 300,
-        ay_m: 1200,
-        bx_m: 400,
-        by_m: 0,
-        half_width_m: 130,
-    },
-    // 東のトラムクール村の森。こちらは南へ行くほど西へ張り出す。
-    // 2 つ合わせて、会戦場は北の 340 m から英軍正面の 210 m まで狭まる。
-    Stamp::SurfaceBelt {
-        surface: Surface::DenseForest,
-        ax_m: 900,
-        ay_m: 1200,
-        bx_m: 800,
-        by_m: 0,
-        half_width_m: 130,
-    },
-    // 英軍の立つ南側がわずかに高い。仏軍は緩い登りを泥の中で進むことになる。
-    Stamp::HeightRamp {
-        axis: RampAxis::Y,
-        from_m: 350,
-        to_m: 750,
-        from_cm: 500,
-        to_cm: 0,
-    },
-];
 
 const AGINCOURT_ARMIES: &[ArmyDef] = &[
     ArmyDef {
@@ -974,7 +906,7 @@ const BB_CENTER_X: i32 = 600;
 /// `requires_front_row = false`（後列も突ける）かつ間合い 5 m なので、
 /// 騎兵の忌避判定（`cavalry` の `spear_wall`）を強く働かせる。
 ///
-/// 小川そのものは `Surface::Marsh` で近似している。地形整形は水深グリッドを
+/// 小川そのものは `Ground::Marsh` で近似している。地形整形は水深グリッドを
 /// 書かないため（`sim_terrain::shaping` 参照）、開けた水面ではなく
 /// 「騎兵が入れない（`cavalry_mult` 0）・移動 35%・疲労 2.2 倍」の湿地として
 /// 表現する。
@@ -988,86 +920,10 @@ pub const BANNOCKBURN_1314: ScenarioDef = ScenarioDef {
     historical_strength_ja:
         "史実の推定兵力: スコットランド 約6,000〜7,000 / イングランド 約15,000〜20,000",
     scale_note_ja: "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/6 に縮尺してある",
-    terrain: TerrainParams {
-        seed: 0x8A11_0CB0_1314_0001,
-        size_m: BB_SIZE_M as u32,
-        cell_m: 2,
-        relief: 0,
-        // 周囲はニューパークの森。
-        forest_cover: 350,
-        // 6 月とはいえカースは水を含んでいる。
-        marsh_bias: 400,
-        thermal_iterations: 6,
-        river_density: 0,
-        road_count: 1,
-        sea_edge: SeaEdge::None,
-        sea_level_cm: 0,
-    },
-    shaping: BANNOCKBURN_SHAPING,
+    size_m: BB_SIZE_M as u32,
+    terrain_seed: 0x8A11_0CB0_1314_0001,
     armies: BANNOCKBURN_ARMIES,
 };
-
-/// バノックバーンの地勢。カース（低湿地）を敷き、その左右から小川の湿地で
-/// 挟み込み、南のスコットランド側を高くする。
-const BANNOCKBURN_SHAPING: &[Stamp] = &[
-    // 会戦場の水を抜く。低湿地そのものは下の `Marsh` で表現するので、
-    // ここで消すのは手続き生成が作った湖（騎兵が完全に止まる）。
-    Stamp::Drain {
-        surface: Surface::Meadow,
-        x_m: 330,
-        y_m: 280,
-        w_m: 540,
-        h_m: 800,
-    },
-    // スコットランド側は森を出た先の牧草地。
-    Stamp::SurfaceRect {
-        surface: Surface::Meadow,
-        x_m: 330,
-        y_m: 300,
-        w_m: 540,
-        h_m: 360,
-    },
-    // イングランド軍が夜を明かしたカース。踏めば沈む軟らかい地面で、
-    // 騎兵は速度 4 割・歩兵は疲労 1.9 倍になる。
-    //
-    // ここを `Marsh` にはしない。湿地は騎兵の速度倍率が 0——つまり馬が
-    // 1 mm も動けない——ので、部隊が固まったまま押し合って圧死する。
-    // 「動けるが最悪の足場」は `Mud` が担う。湿地は下の 2 本の小川、
-    // すなわち**入ったら終わりの縁**にだけ使う。
-    Stamp::SurfaceRect {
-        surface: Surface::Mud,
-        x_m: 380,
-        y_m: 660,
-        w_m: 440,
-        h_m: 400,
-    },
-    // 西のバノック川。北へ行くほど内側へ食い込み、退路を狭める。
-    Stamp::SurfaceBelt {
-        surface: Surface::Marsh,
-        ax_m: 330,
-        ay_m: 620,
-        bx_m: 450,
-        by_m: 1100,
-        half_width_m: 110,
-    },
-    // 東のペルストリーム川。
-    Stamp::SurfaceBelt {
-        surface: Surface::Marsh,
-        ax_m: 870,
-        ay_m: 620,
-        bx_m: 750,
-        by_m: 1100,
-        half_width_m: 110,
-    },
-    // 南（スコットランド側）が高い。降りてくる側にモメンタムが乗る。
-    Stamp::HeightRamp {
-        axis: RampAxis::Y,
-        from_m: 400,
-        to_m: 800,
-        from_cm: 700,
-        to_cm: 0,
-    },
-];
 
 const BANNOCKBURN_ARMIES: &[ArmyDef] = &[
     ArmyDef {
@@ -1367,67 +1223,10 @@ pub const CRECY_1346: ScenarioDef = ScenarioDef {
     summary_ja: "開けた緩斜面。上に立つ英軍の長弓が、順に到着する仏軍を迎え撃つ。",
     historical_strength_ja: "史実の推定兵力: 英 約14,000 / 仏 約25,000〜30,000",
     scale_note_ja: "ブラウザで回せるよう、兵数と会戦場の幅をおよそ 1/8 に縮尺してある",
-    terrain: TerrainParams {
-        seed: 0xC5EC_1346_0000_0001,
-        size_m: CR_SIZE_M as u32,
-        cell_m: 2,
-        relief: 0,
-        forest_cover: 250,
-        marsh_bias: 120,
-        thermal_iterations: 6,
-        river_density: 0,
-        road_count: 1,
-        sea_edge: SeaEdge::None,
-        sea_level_cm: 0,
-    },
-    shaping: CRECY_SHAPING,
+    size_m: CR_SIZE_M as u32,
+    terrain_seed: 0xC5EC_1346_0000_0001,
     armies: CRECY_ARMIES,
 };
-
-/// クレシーの地勢。開けた耕地と、南（英軍側）へ登る緩斜面。挟む森は西側だけ
-/// （クレシーの森）で、東は開いたまま——アジンクールとの対比になる。
-const CRECY_SHAPING: &[Stamp] = &[
-    // 会戦場の水を抜いてから耕地を敷く（`Stamp::Drain` の注記を参照）。
-    Stamp::Drain {
-        surface: Surface::Farmland,
-        x_m: 350,
-        y_m: 200,
-        w_m: 700,
-        h_m: 960,
-    },
-    Stamp::SurfaceRect {
-        surface: Surface::Farmland,
-        x_m: 350,
-        y_m: 200,
-        w_m: 700,
-        h_m: 960,
-    },
-    // 8 月の刈り入れ後。踏み固められてはいるが泥濘ではない。
-    Stamp::SurfaceRect {
-        surface: Surface::Meadow,
-        x_m: 420,
-        y_m: 480,
-        w_m: 560,
-        h_m: 240,
-    },
-    // 西のクレシーの森。英軍の右翼を守る。
-    Stamp::SurfaceBelt {
-        surface: Surface::DenseForest,
-        ax_m: 300,
-        ay_m: 1400,
-        bx_m: 340,
-        by_m: 0,
-        half_width_m: 120,
-    },
-    // 斜面。英軍の立つ南が 9 m 高い。登る側は疲れ、下る側の射撃は届く。
-    Stamp::HeightRamp {
-        axis: RampAxis::Y,
-        from_m: 300,
-        to_m: 900,
-        from_cm: 900,
-        to_cm: 0,
-    },
-];
 
 const CRECY_ARMIES: &[ArmyDef] = &[
     ArmyDef {
@@ -1675,10 +1474,18 @@ const CRECY_FRENCH_CONTINGENTS: &[ContingentDef] = &[
 mod tests {
     use super::*;
     use crate::organization::CommandState;
-    use sim_terrain::SURFACE_EFFECTS;
+    use sim_terrain::{compose_effect, Ground, Overlay, Vegetation};
+
+    /// 固定地形（`data/terrain/*.bin`）を読んでワールドを組み立てる。
+    ///
+    /// 地形の生成は `web/src/terrain` にあり Rust からは呼べないので、
+    /// シナリオのテストは生成器が書き出したフィクスチャを正本として読む。
+    fn world(def: &ScenarioDef) -> World {
+        build_world_from_fixture(def).unwrap_or_else(|e| panic!("{}: {e}", def.id))
+    }
 
     fn agincourt() -> World {
-        build_world(&AGINCOURT_1415)
+        world(&AGINCOURT_1415)
     }
 
     #[test]
@@ -1710,7 +1517,7 @@ mod tests {
                         cont.name_ja,
                         cont.commander.archetype
                     );
-                    let size = def.terrain.size_m as i32;
+                    let size = def.size_m as i32;
                     assert!(
                         cont.front_x_m > 0
                             && cont.front_x_m < size
@@ -1728,7 +1535,7 @@ mod tests {
     #[test]
     fn deploys_the_declared_number_of_soldiers_into_a_two_level_command_tree() {
         for def in SCENARIOS {
-            let w = build_world(def);
+            let w = world(def);
             assert_eq!(w.soldiers.len() as u32, def.soldier_count(), "{}", def.id);
 
             let roots: Vec<_> = w
@@ -1759,7 +1566,7 @@ mod tests {
     #[test]
     fn soldiers_start_on_their_formation_slots() {
         for def in SCENARIOS {
-            let mut w = build_world(def);
+            let mut w = world(def);
             let before: Vec<Vec2Fx> = (0..w.soldiers.len()).map(|i| w.soldiers.pos(i)).collect();
             w.tick();
             // 陣形スロットの上に生成しているので、開始直後に隊列を組み直す動き
@@ -1814,23 +1621,28 @@ mod tests {
     fn the_field_is_muddy_between_the_lines_and_wooded_on_both_flanks() {
         let w = agincourt();
         let t = &w.terrain;
-        let surface_at = |x: i32, y: i32| t.surface_at(fx(x), fx(y));
+        let cell = |x: i32, y: i32| {
+            let (cx, cy) = t.world_to_cell(fx(x), fx(y));
+            t.idx(cx, cy)
+        };
+        let ground_at = |x: i32, y: i32| t.ground_at_index(cell(x, y));
+        let veg_at = |x: i32, y: i32| t.vegetation_at_index(cell(x, y));
 
         // 両軍の間は泥。移動が鈍り、疲労が大きい。
         let mid_y = (AG_ENGLISH_FRONT_Y + AG_FRENCH_FRONT_Y) / 2;
-        assert_eq!(surface_at(AG_CENTER_X, mid_y), Surface::Mud);
-        let mud = &SURFACE_EFFECTS[Surface::Mud as usize];
-        let farmland = &SURFACE_EFFECTS[Surface::Farmland as usize];
+        assert_eq!(ground_at(AG_CENTER_X, mid_y), Ground::Mud);
+        let mud = compose_effect(Ground::Mud, Vegetation::None, 0, Overlay::None);
+        let farmland = compose_effect(Ground::Soil, Vegetation::Farmland, 0, Overlay::None);
         assert!(mud.move_mult < farmland.move_mult);
         assert!(mud.fatigue_mult > farmland.fatigue_mult);
 
         // 両翼は深い森で、会戦場は英軍正面へ向かって狭まる。
-        assert_eq!(surface_at(380, mid_y), Surface::DenseForest);
-        assert_eq!(surface_at(820, mid_y), Surface::DenseForest);
+        assert_eq!(veg_at(380, mid_y), Vegetation::Dense);
+        assert_eq!(veg_at(820, mid_y), Vegetation::Dense);
         let width_at = |y: i32| {
             let mut count = 0;
             for x in 300..900 {
-                if surface_at(x, y) != Surface::DenseForest {
+                if veg_at(x, y) != Vegetation::Dense {
                     count += 1;
                 }
             }
@@ -1910,8 +1722,8 @@ mod tests {
     #[test]
     fn the_same_scenario_always_produces_the_same_world() {
         for def in SCENARIOS {
-            let mut a = build_world(def);
-            let mut b = build_world(def);
+            let mut a = world(def);
+            let mut b = world(def);
             assert_eq!(a.terrain.hash(), b.terrain.hash(), "{}", def.id);
             assert_eq!(a.state_hash(), b.state_hash(), "{}", def.id);
             for _ in 0..120 {
@@ -1930,26 +1742,27 @@ mod tests {
     #[test]
     fn every_soldier_starts_on_ground_they_can_stand_on() {
         for def in SCENARIOS {
-            let w = build_world(def);
+            let w = world(def);
             for i in 0..w.soldiers.len() {
                 let pos = w.soldiers.pos(i);
                 let (cx, cy) = w.terrain.world_to_cell(pos.x, pos.y);
                 let idx = w.terrain.idx(cx, cy);
-                let surface = Surface::from_u8(w.terrain.surface[idx]);
+                let ground = w.terrain.ground_at_index(idx);
+                let veg = w.terrain.vegetation_at_index(idx);
                 assert!(
                     w.terrain.passability[idx] > 0,
-                    "{}: 兵士 {i} が通行不能な {surface:?} の上にいる",
+                    "{}: 兵士 {i} が通行不能な {ground:?}/{veg:?} の上にいる",
                     def.id
                 );
                 assert_eq!(
                     w.terrain.water[idx], 0,
-                    "{}: 兵士 {i} が水域（{surface:?}）の上にいる",
+                    "{}: 兵士 {i} が水域（{ground:?}）の上にいる",
                     def.id
                 );
                 assert!(
-                    SURFACE_EFFECTS[surface as usize].cavalry_mult > 0
+                    w.terrain.effect_at_index(idx).cavalry_mult > 0
                         || w.soldiers.hot.flags[i] & flags::MOUNTED == 0,
-                    "{}: 騎兵 {i} が馬の入れない {surface:?} の上にいる",
+                    "{}: 騎兵 {i} が馬の入れない {ground:?}/{veg:?} の上にいる",
                     def.id
                 );
             }
@@ -1963,7 +1776,7 @@ mod tests {
         let mut seen_terrain = Vec::new();
         let mut seen_id = Vec::new();
         for def in SCENARIOS {
-            let w = build_world(def);
+            let w = world(def);
             assert!(!seen_id.contains(&def.id), "id が重複している: {}", def.id);
             seen_id.push(def.id);
             let hash = w.terrain.hash();
@@ -1980,34 +1793,34 @@ mod tests {
     /// 北へ行くほど狭まる。
     #[test]
     fn bannockburn_pins_the_english_in_a_carse_hemmed_by_impassable_marsh() {
-        let w = build_world(&BANNOCKBURN_1314);
-        let surface_at = |x: i32, y: i32| w.terrain.surface_at(fx(x), fx(y));
+        let w = world(&BANNOCKBURN_1314);
+        let ground_at = |x: i32, y: i32| {
+            let (cx, cy) = w.terrain.world_to_cell(fx(x), fx(y));
+            w.terrain.ground_at_index(w.terrain.idx(cx, cy))
+        };
 
         // 立っているのは軟らかい泥。動けるが、遅く、疲れる。
         assert_eq!(
-            surface_at(BB_CENTER_X, BB_ENGLISH_FRONT_Y + 40),
-            Surface::Mud,
+            ground_at(BB_CENTER_X, BB_ENGLISH_FRONT_Y + 40),
+            Ground::Mud,
             "イングランド軍がカースに立っていない"
         );
-        let mud = &SURFACE_EFFECTS[Surface::Mud as usize];
+        let mud = compose_effect(Ground::Mud, Vegetation::None, 0, Overlay::None);
         assert!(mud.cavalry_mult > 0 && mud.cavalry_mult < 500);
         assert!(mud.fatigue_mult > 1500);
         // 左右と背後の小川は湿地。馬は 1 mm も入れない。
-        assert_eq!(surface_at(400, 900), Surface::Marsh);
-        assert_eq!(surface_at(800, 900), Surface::Marsh);
-        let marsh = &SURFACE_EFFECTS[Surface::Marsh as usize];
+        assert_eq!(ground_at(400, 900), Ground::Marsh);
+        assert_eq!(ground_at(800, 900), Ground::Marsh);
+        let marsh = compose_effect(Ground::Marsh, Vegetation::None, 0, Overlay::None);
         assert_eq!(marsh.cavalry_mult, 0);
         assert!(marsh.fatigue_mult > 2000);
         // スコットランド側は乾いた牧草地。
-        assert_eq!(
-            surface_at(BB_CENTER_X, BB_SCOTS_FRONT_Y - 40),
-            Surface::Meadow
-        );
+        assert_eq!(ground_at(BB_CENTER_X, BB_SCOTS_FRONT_Y - 40), Ground::Grass);
 
         // 退路（北）は小川に挟まれて狭まっていく。
         let open_width_at = |y: i32| {
             (300..900)
-                .filter(|&x| surface_at(x, y) != Surface::Marsh)
+                .filter(|&x| ground_at(x, y) != Ground::Marsh)
                 .count()
         };
         let _ = open_width_at(0);
@@ -2028,7 +1841,7 @@ mod tests {
     /// 長弓兵の前には騎兵を通さない落とし穴がある。
     #[test]
     fn crecy_gives_the_longbows_range_and_height_over_the_crossbows() {
-        let w = build_world(&CRECY_1346);
+        let w = world(&CRECY_1346);
 
         let english_h = w.terrain.height_at(fx(CR_CENTER_X), fx(CR_ENGLISH_FRONT_Y));
         let genoese_h = w.terrain.height_at(fx(CR_CENTER_X), fx(CR_GENOESE_FRONT_Y));

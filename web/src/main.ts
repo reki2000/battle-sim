@@ -145,9 +145,11 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
       dim: terrain.dim,
       cellM: terrain.cellM,
       sizeM: terrain.sizeM,
-      surface: new Uint8Array(terrain.surface),
       height: new Int16Array(terrain.height),
-      water: new Uint8Array(terrain.water),
+      ground: new Uint8Array(terrain.ground),
+      vegetation: new Uint8Array(terrain.vegetation),
+      overlay: new Uint8Array(terrain.overlay),
+      water: new Uint16Array(terrain.water),
       waterKind: new Uint8Array(terrain.waterKind),
       cliff: new Uint8Array(terrain.cliff),
     };

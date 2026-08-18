@@ -9,11 +9,15 @@ export interface TerrainPayload {
   dim: number;
   cellM: number;
   sizeM: number;
-  /** Uint8Array（地表タイプ）の中身 */
-  surface: ArrayBuffer;
   /** Int16Array（標高 cm）の中身 */
   height: ArrayBuffer;
-  /** Uint8Array（水深、10 cm 単位）の中身 */
+  /** Uint8Array（Ground）の中身 */
+  ground: ArrayBuffer;
+  /** Uint8Array（Vegetation）の中身 */
+  vegetation: ArrayBuffer;
+  /** Uint8Array（Overlay）の中身 */
+  overlay: ArrayBuffer;
+  /** Uint16Array（水深 cm、0 = 陸地）の中身 */
   water: ArrayBuffer;
   /** Uint8Array（WaterKind）の中身 */
   waterKind: ArrayBuffer;

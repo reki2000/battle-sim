@@ -31,6 +31,18 @@ jobs:
       - name: 浮動小数点の混入チェック
         run: ./tools/check_no_float.sh
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 地形効果テーブルが JS と Rust で一致しているか
+        run: node tools/check_terrain_effects.mjs
+
+      - name: 地形フィクスチャが生成器の出力と一致しているか
+        run: |
+          npm --prefix web ci
+          node tools/gen_terrain_fixtures.mjs --check
+
       - name: テスト
         run: cargo test --workspace
 

@@ -1728,14 +1728,7 @@ mod tests {
     use crate::soldiers::Attrs;
 
     fn flat_terrain(size_m: u32) -> Terrain {
-        sim_terrain::generate(&sim_terrain::TerrainParams {
-            seed: 1,
-            size_m,
-            cell_m: 4,
-            relief: 0,
-            thermal_iterations: 0,
-            ..Default::default()
-        })
+        sim_terrain::Terrain::flat(size_m / 4, 4, 1)
     }
 
     fn soldiers_at(positions: &[(i32, i32)]) -> Soldiers {

@@ -12,7 +12,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use sim_math::{fx, Fx, Vec2Fx, FX_SHIFT};
-use sim_terrain::{Terrain, SURFACE_EFFECTS};
+use sim_terrain::Terrain;
 
 /// Fx をメートル単位の整数に変換する（切り捨て）。
 #[inline]
@@ -71,8 +71,7 @@ fn cell_cost(terrain: &Terrain, cx: i32, cy: i32) -> Option<u32> {
                 continue;
             }
             passable += 1;
-            let surface = terrain.surface[idx];
-            let mult = SURFACE_EFFECTS[surface as usize].move_mult as u32;
+            let mult = terrain.effect_at_index(idx).move_mult as u32;
             best_mult = best_mult.max(mult);
         }
     }
@@ -236,17 +235,8 @@ fn simplify(cells: &[i32], dim: i32, exact_goal: Vec2Fx) -> Vec<Vec2Fx> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sim_terrain::TerrainParams;
-
     fn flat_terrain(size_m: u32) -> Terrain {
-        sim_terrain::generate(&TerrainParams {
-            seed: 42,
-            size_m,
-            cell_m: 4,
-            relief: 0,
-            thermal_iterations: 0,
-            ..Default::default()
-        })
+        Terrain::flat(size_m / 4, 4, 42)
     }
 
     #[test]

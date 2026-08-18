@@ -12,20 +12,26 @@
  */
 
 /** キャッシュの中身が変わったら上げる（`sim-core::SIM_VERSION` とは独立）。 */
-const TERRAIN_CACHE_VERSION = 1;
+const TERRAIN_CACHE_VERSION = 2;
 const DB_NAME = "battle-sim";
 const STORE_NAME = "terrain";
 const DB_VERSION = 1;
 
+/**
+ * 保存するのは生成器の出力そのもの。通行コストと崖は入れない——効果テーブルの
+ * 正本は Rust 側にあり、そちらが読み込み時に計算し直す。ここに焼き込むと、
+ * 効果値を直したときに古いキャッシュだけが取り残される。
+ */
 export interface CachedTerrain {
   dim: number;
   cellM: number;
   height: Int16Array;
-  surface: Uint8Array;
-  passability: Uint8Array;
-  water: Uint8Array;
+  ground: Uint8Array;
+  vegetation: Uint8Array;
+  overlay: Uint8Array;
+  water: Uint16Array;
   waterKind: Uint8Array;
-  cliff: Uint8Array;
+  moisture: Uint8Array;
   battleSitesFlat: number[];
 }
 
