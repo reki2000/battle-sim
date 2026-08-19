@@ -42,7 +42,7 @@ void main() {
 `;
 
 const FRAG_SRC = `#version 300 es
-precision mediump float;
+precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 uniform sampler2D u_tex;
@@ -64,8 +64,14 @@ void main() {
   float tileX = mod(surface, 4.0);
   float tileY = floor(surface / 4.0);
   vec2 localUv = fract(v_uv * u_mapSize);
+  // アトラスは 16 タイルを隙間なく詰めているので（生成側のパディング無し）、
+  // タイルの端ぎりぎりを額面どおり [0.5, tileSize-0.5] まで使うと、ほんの
+  // わずかな数値誤差でも隣のタイル（まったく無関係な地質の色）を拾ってしまい、
+  // 地形が縞・市松状に割れて見える。実際にそう見えていた。中心寄りの範囲
+  // だけを使う安全マージンを取り、隣接タイルへ絶対にはみ出さないようにする。
+  float margin = 8.0;
   vec2 atlasPx = vec2(tileX, tileY) * u_atlasTileSize
-    + localUv * (u_atlasTileSize - vec2(1.0)) + vec2(0.5);
+    + margin + localUv * (u_atlasTileSize - vec2(2.0 * margin));
   vec3 color = texture(u_atlasTex, atlasPx / u_atlasSize).rgb;
   float shade = texture(u_tex, cellUv).a * 1.5;
   outColor = vec4(color * shade, 1.0);
