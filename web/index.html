@@ -2,7 +2,15 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- maximum-scale/user-scalable=no でブラウザ自身のピンチズームを止める。
+         付けないと、スマホでの二本指ピンチがカメラのズームではなく
+         ページ全体の拡大に吸われてしまう（実機で報告あり）。ピンチ操作は
+         main.ts の pointerdown/pointermove ハンドラでカメラのズームに
+         変換する。 -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
     <title>battle-sim</title>
     <!-- favicon の 404 を防ぐ。正式なアイコンは M8 で差し替える -->
     <link rel="icon" href="data:," />
@@ -26,6 +34,10 @@
         top: 0;
         left: 0;
         cursor: grab;
+        /* ブラウザのタッチジェスチャ（ピンチズーム・パン・ダブルタップ拡大）を
+           奪わせない。奪われるとポインタイベントがゲーム側へ届かず、
+           main.ts の二本指ピンチ処理が動かない。 */
+        touch-action: none;
       }
       #overlay-view {
         pointer-events: none;

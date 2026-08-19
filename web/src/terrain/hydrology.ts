@@ -1,20 +1,22 @@
 /**
  * 水系の生成。仕様 `docs/spec/03-terrain.md` 2.3 節（段階 6〜8）。
  *
- * 3 段階からなる。
+ * 河川は生成しない（見た目が不自然なため廃止済み）。ここでやるのは
+ * 湖の確定だけだが、そのために 2 段階を踏む。
  *
  * 1. **優先度フラッド**（bucket 版）: 境界セルから内側に向かって処理し、
  *    窪地を「埋めた高さ」に引き上げる。同時に各セルの流出先（`flowTo`）を
- *    記録する。これにより後段の D8 判定（平坦な湖面での方向の曖昧さ）を
- *    避けられる。処理順そのものがトポロジカル順になるため、流量集積も
- *    追加のソートなしに求まる。
- * 2. **流量集積**: 優先度フラッドの処理順を逆にたどるだけで、
- *    上流から下流への合算が O(n) で求まる。
- * 3. **河川・湖の分類**: 流量が閾値を超えたセルを河川に、埋めた窪地を湖にする。
+ *    記録する。処理順そのものがトポロジカル順になる。
+ * 2. **湖の分類**: 埋めた窪地（`filledCm` が元の標高より高いセル）を
+ *    湖にする。
  *
  * 木構造（各セルは高々 1 つの `flowTo` を持つ）は境界セルを根とする森なので、
- * すべてのセルは必ず境界（地図端）に到達する。これが仕様の受け入れ条件
- * 「河川が海または地図外に到達している」を構造的に保証する。
+ * すべてのセルは必ず境界（地図端）に到達する。この排水の保証は湖の形が
+ * 有限に確定するために必要で、河川を作らなくなった後も変わらず要る。
+ *
+ * 流量集積（`accumulation`）は河川生成をやめた今は使っていないが、
+ * 優先度フラッドの副産物として計算コストがほぼゼロなので残してある
+ * （呼び出し側の互換性・将来の再利用のため）。
  *
  * 標高は cm の整数で扱う。優先度フラッドは高さをバケット添字にするので、
  * ここを浮動小数にすると計算量が跳ね上がる。
@@ -127,7 +129,6 @@ export interface WaterClassification {
   /** 水深（cm）。0 なら陸地 */
   depthCm: Uint16Array;
   kind: Uint8Array;
-  riverCells: number;
   lakeCells: number;
 }
 
@@ -151,30 +152,23 @@ const MAX_LAKE_CELLS = 6000;
  * 展開地の 2 割が騎兵の通れない面になってしまう。窪みが水を湛えるには
  * 相応の深さが要る、として切る。
  */
-const LAKE_MIN_DEPTH_CM = 30;
+const LAKE_MIN_DEPTH_CM = 50;
 
 /**
  * 湖として残す最小のセル数。
  *
- * 深さで切ってもなお、1〜2 セルの点のような窪みが多数残る。面積の下限を
+ * 深さで切ってもなお、数セルの点のような窪みが多数残る。面積の下限を
  * 置くことで、地図に散る「水たまり」を消し、湖と呼べる大きさのものだけを
- * 残す。8 セル = 32 m²。
+ * 残す。50 セル = 200 m²（一辺 14 m 程度）。
  */
-const MIN_LAKE_CELLS = 8;
+const MIN_LAKE_CELLS = 50;
 
 /**
- * 流量集積から河川と湖を分類する。
+ * 埋めた窪地（`filledCm` が元の標高より高いセル）を湖に分類する。
  *
- * - 湖: `filledCm` が元の標高より高い（＝優先度フラッドが窪地を埋めた）セル。
- * - 河川: 湖でないセルのうち、流量が閾値を超えたもの。水深は流量の
- *   平方根に比例させる（仕様 03 章 2.3 節）。
+ * 河川は生成しない（不自然な見た目のため廃止済み）。
  */
-export function classifyWater(
-  dim: number,
-  heightCm: Int16Array,
-  flow: FlowField,
-  riverThreshold: number,
-): WaterClassification {
+export function classifyWater(dim: number, heightCm: Int16Array, flow: FlowField): WaterClassification {
   const n = dim * dim;
   const lakeDepthCm = new Int32Array(n);
   for (let i = 0; i < n; i++) {
@@ -226,7 +220,6 @@ export function classifyWater(
 
   const depthCm = new Uint16Array(n);
   const kind = new Uint8Array(n);
-  let riverCells = 0;
   let lakeCells = 0;
 
   for (let i = 0; i < n; i++) {
@@ -234,19 +227,10 @@ export function classifyWater(
       depthCm[i] = Math.min(65535, lakeDepthCm[i]!);
       kind[i] = WaterKind.LAKE;
       lakeCells++;
-      continue;
-    }
-    const acc = flow.accumulation[i]!;
-    if (riverThreshold > 0 && acc >= riverThreshold) {
-      // 深さは流量の平方根に比例
-      const d = 20 + Math.floor(Math.sqrt(Math.floor(acc / Math.max(1, riverThreshold)))) * 15;
-      depthCm[i] = Math.min(800, d);
-      kind[i] = WaterKind.RIVER;
-      riverCells++;
     }
   }
 
-  return { depthCm, kind, riverCells, lakeCells };
+  return { depthCm, kind, lakeCells };
 }
 
 /** すべてのセルが境界（地図端）まで到達できるか検証する。 */

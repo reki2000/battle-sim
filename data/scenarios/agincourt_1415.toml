@@ -30,7 +30,6 @@ relief = 0                # 起伏のない平野。高低差は下の height_ra
 forest_cover = 300        # 会戦場の外に散る林の量（会戦場は下の整形で塗り替わる）
 marsh_bias = 250          # 秋の長雨
 thermal_iterations = 6
-river_density = 0         # 会戦場を横切る川は無い（テルヌワーズ川は地図の外）
 road_count = 1
 sea = "none"
 

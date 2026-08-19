@@ -9,12 +9,11 @@
  *   ├─ 4. 海岸ランプ      指定した辺へ向けて標高を海面下まで落とす
  *   ├─ 5. 熱浸食          安息角を超える斜面を崩す
  *   ├─ 6. 窪地の処理      優先度フラッドで湖を確定、残りは排水
- *   ├─ 7. 流向・流量      D8 フロー方向 → 流量集積
- *   ├─ 8. 河川・湖        流量が閾値超のセルを河川化、深さを流量から決める
- *   ├─ 9. 海              海面より低い海岸帯のセルを海にする
- *   ├─10. 湿度            河川・湖・海からの距離とノイズから湿度場を作る
- *   ├─11. 地質・植生      標高・傾斜・湿度から 2 軸を独立に割り当てる
- *   └─12. 崖              隣接セル間の高度差が閾値超のエッジをマークする
+ *   ├─ 7. 流向          D8 フロー方向（境界までの排水を保証する）
+ *   ├─ 8. 海              海面より低い海岸帯のセルを海にする
+ *   ├─ 9. 湿度            湖・海からの距離とノイズから湿度場を作る
+ *   ├─10. 地質・植生      標高・傾斜・湿度から 2 軸を独立に割り当てる
+ *   └─11. 崖              隣接セル間の高度差が閾値超のエッジをマークする
  * ```
  *
  * 生成は f64 で行う。決定論はここでは保証されず、**出力の整数グリッドを
@@ -46,7 +45,7 @@ const HEIGHT_MAX_CM = 32767;
 export interface GenerationResult extends Omit<TerrainGrids, "battleSites"> {
   /** 隣接 4 セルとの最大高低差（cm）。通行コストと地表判定が使う */
   slopeCm: Uint16Array;
-  /** 流量集積。河川の太さの目安（描画とデバッグ用） */
+  /** 流量集積（デバッグ用。河川は生成しないため描画では使っていない） */
   flow: Uint32Array;
 }
 
@@ -57,7 +56,6 @@ export const DEFAULT_PARAMS: TerrainParams = {
   relief: 450,
   baseHeightM: 8,
   thermalIterations: 6,
-  riverDensity: 500,
   roadCount: 2,
   seaEdge: "none",
   seaLevelCm: 0,
@@ -80,7 +78,7 @@ export function generateFields(paramsIn: Partial<TerrainParams>): GenerationResu
   thermalErosion(height, dim, cellM, p.thermalIterations);
 
   const flowField = floodAndFlow(dim, height);
-  const water = classifyWater(dim, height, flowField, riverThreshold(n, p.riverDensity));
+  const water = classifyWater(dim, height, flowField);
   const depth = water.depthCm;
   const kind = water.kind;
   applySea(height, depth, kind, dim, p);
@@ -121,15 +119,6 @@ export function generateFields(paramsIn: Partial<TerrainParams>): GenerationResu
     slopeCm,
     flow: flowField.accumulation,
   };
-}
-
-/** 河川になる流量の閾値。`riverDensity` が 0 なら河川を作らない。 */
-function riverThreshold(n: number, riverDensity: number): number {
-  if (riverDensity <= 0) return 0;
-  const maxThreshold = Math.max(200, Math.floor(n / 4));
-  const minThreshold = 20;
-  const span = maxThreshold - minThreshold;
-  return maxThreshold - Math.min(span, Math.floor((span * riverDensity) / 1000));
 }
 
 /**
@@ -490,7 +479,8 @@ function classifyCover(
       const xm = (x + 0.5) * cellM;
 
       if (depth[i]! > 0) {
-        // 湖と河川はどちらも淡水の河床。区別は `waterKind` が持つ
+        // 河川は生成しないので、ここに来る淡水はすべて湖。`Ground.RIVER_BED`
+        // という名前のまま流用している（`WaterKind.RIVER` ごと削っていない）
         ground[i] = kind[i] === WaterKind.SEA ? Ground.SEA_BED : Ground.RIVER_BED;
         vegetation[i] = Vegetation.NONE;
         continue;
