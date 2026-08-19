@@ -37,7 +37,11 @@ for (const [tag, src] of scripts) {
   // `</script>` がコード中に現れると HTML パーサがそこで閉じてしまう。
   // JS としては同じ意味の文字列に割って逃がす。
   const safe = code.replace(/<\/script>/gi, "<\\/script>");
-  out = out.replace(tag, `<script type="module">\n${safe}\n</script>`);
+  // 置換後の文字列に `$&` などが現れることがある（圧縮後の識別子 `$` の直後に
+  // `&&` が来るなど、ただの偶然）。`replace(str, str)` は第二引数を特殊パターン
+  // として解釈するため、そのまま渡すと元の script タグが JS の中に literal に
+  // 再挿入されてしまう。関数を渡して特殊パターン展開を止める。
+  out = out.replace(tag, () => `<script type="module">\n${safe}\n</script>`);
 }
 
 const leftovers = [...out.matchAll(/(?:src|href)="(\.?\/[^"]+)"/g)]

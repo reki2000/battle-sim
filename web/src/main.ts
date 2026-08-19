@@ -81,6 +81,12 @@ let dpr = 1;
 let prevFollowed: number | null = null;
 
 let terrainData: TerrainData | null = null;
+/**
+ * 地形読み込み直後は兵士がまだ配置されていないので、カメラを軍勢へ寄せる
+ * には最初のスナップショットを待つしかない（`?soldiers=N` やプリセットで
+ * 陣形の規模も位置も変わるため、地形サイズからの固定倍率では合わない）。
+ */
+let pendingInitialCameraFit = false;
 let lastSnapshotAt = performance.now();
 let simTick = 0;
 let soldierCount = 0;
@@ -188,9 +194,12 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     }
 
     cam.worldSizeM = terrain.sizeM;
+    // 地図中央を仮の注視点にしておく（対称デモは実際にここへ配置される）。
+    // 兵士が届き次第、最初のスナップショットで軍勢へ寄せ直す。
     cam.centerX = terrain.sizeM / 2;
     cam.centerY = terrain.sizeM / 2;
     cam.setViewWidthM(600);
+    pendingInitialCameraFit = true;
 
     // スナップショット・統計はこの World インスタンスに紐づくので、
     // init/リプレイ読み込みのどちらでも一度リセットする。
@@ -289,7 +298,8 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     } else if (msg.reason === "init") {
       // 会戦プリセットは両軍・指揮系統・築城までワーカー側で配置済み。
       // ここから命令は出さない——動き出すのは指揮官 AI の判断による。
-      cam.setViewWidthM(msg.terrain.sizeM * 0.6);
+      // カメラは（上で立てた pendingInitialCameraFit により）最初の
+      // スナップショットで軍勢へ寄る。
       setRunning(true);
     } else {
       // リプレイは worker 側で既に running=true にしている。
@@ -313,6 +323,10 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     simTick = msg.tick;
     soldierCount = msg.count;
     lastSnapshotAt = performance.now();
+    if (pendingInitialCameraFit && soldierCount > 0) {
+      pendingInitialCameraFit = false;
+      fitCameraToArmy();
+    }
     if (msg.stats) {
       lastStats = parseStats(msg.stats);
       orderPanel.update(lastStats.nodes);
@@ -441,6 +455,31 @@ function setRunning(v: boolean): void {
 function setSpeed(v: number): void {
   speed = v;
   send({ type: "setSpeed", speed: v });
+}
+
+/**
+ * 起動直後、最初のスナップショットが届いた時点で兵士の分布範囲へカメラを
+ * 寄せる。対称デモ（数十m四方）でもプリセット会戦（陣形が広い）でも、
+ * 「まず軍勢が見える」状態から始めたい。500m を超えて広く見せる意味は薄い
+ * ので上限に、逆にごく小さい陣形で寄りすぎないよう下限にクランプする。
+ */
+function fitCameraToArmy(): void {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < snapshot.count; i++) {
+    const x = snapshot.x(i);
+    const y = snapshot.y(i);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  cam.centerX = (minX + maxX) / 2;
+  cam.centerY = (minY + maxY) / 2;
+  const spanM = Math.max(maxX - minX, maxY - minY);
+  cam.setViewWidthM(Math.min(500, Math.max(150, spanM * 1.4)));
 }
 
 // ── 描画ループ ──────────────────────────────────────────

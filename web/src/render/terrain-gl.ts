@@ -201,11 +201,18 @@ export class TerrainGlRenderer {
         const c = TILE_COLORS[tile]!;
         surfacePx[oy * outDim + ox] = tile;
 
-        const xn = Math.min(data.dim - 1, x + stride);
-        const yn = Math.min(data.dim - 1, y + stride);
-        const hx = data.height[y * data.dim + xn]! - data.height[i]!;
-        const hy = data.height[yn * data.dim + x]! - data.height[i]!;
-        let shade = Math.max(0.45, Math.min(1.5, 1 + (-(hx + hy) / cellCm) * 0.7));
+        // 水面は平らなので、湖底・川底の標高勾配をそのまま陰影に使うと
+        // 水が地形のように凹凸して見える（水中の地形はヒルシェードから除く）。
+        let shade: number;
+        if (data.water[i]! > 0) {
+          shade = 1;
+        } else {
+          const xn = Math.min(data.dim - 1, x + stride);
+          const yn = Math.min(data.dim - 1, y + stride);
+          const hx = data.height[y * data.dim + xn]! - data.height[i]!;
+          const hy = data.height[yn * data.dim + x]! - data.height[i]!;
+          shade = Math.max(0.45, Math.min(1.5, 1 + (-(hx + hy) / cellCm) * 0.7));
+        }
 
         // 崖セルは暗く縁取って位置を示す（本物の側面ジオメトリはまだない。
         // モジュール先頭のコメント参照）。
