@@ -257,6 +257,10 @@ name = "sim-math"
 version = "0.1.0"
 
 [[package]]
+name = "sim-render"
+version = "0.1.0"
+
+[[package]]
 name = "sim-terrain"
 version = "0.1.0"
 dependencies = [
@@ -269,6 +273,7 @@ version = "0.1.0"
 dependencies = [
  "sim-core",
  "sim-math",
+ "sim-render",
  "sim-terrain",
  "wasm-bindgen",
  "wasm-bindgen-test",

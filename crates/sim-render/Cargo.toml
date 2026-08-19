@@ -1,0 +1,9 @@
+[package]
+name = "sim-render"
+description = "状態保持型の人物モーションと描画ポリゴン生成"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

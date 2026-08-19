@@ -4,6 +4,7 @@ members = [
     "crates/sim-math",
     "crates/sim-terrain",
     "crates/sim-core",
+    "crates/sim-render",
     "crates/sim-wasm",
     "crates/sim-headless",
 ]
@@ -19,6 +20,7 @@ repository = "https://github.com/reki2000/battle-sim"
 sim-math = { path = "crates/sim-math" }
 sim-terrain = { path = "crates/sim-terrain" }
 sim-core = { path = "crates/sim-core" }
+sim-render = { path = "crates/sim-render" }
 
 [profile.release]
 opt-level = 3

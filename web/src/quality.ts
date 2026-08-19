@@ -10,19 +10,14 @@ export type Quality = "low" | "medium" | "high";
 export interface QualitySettings {
   /** デバイスピクセル比の上限。高いほど鮮明だがフィルレートを食う。 */
   dprCap: number;
-  /** 会戦・戦域 LOD で間引く目標インスタンス数（`render/soldiers.ts`）。 */
-  thinTargetInstances: number;
   /** ミニマップで間引く目標点数（`render/minimap.ts`）。 */
   thinTargetMinimapDots: number;
-  /** true なら等身大スプライトを描かず、常に点/矩形表現に落とす
-   * （テクスチャサンプリングとアニメーション計算を丸ごと省く）。 */
-  forceDotsOnly: boolean;
 }
 
 const PRESETS: Record<Quality, QualitySettings> = {
-  low: { dprCap: 1, thinTargetInstances: 2000, thinTargetMinimapDots: 1500, forceDotsOnly: true },
-  medium: { dprCap: 1.5, thinTargetInstances: 6000, thinTargetMinimapDots: 4000, forceDotsOnly: false },
-  high: { dprCap: 2, thinTargetInstances: 15000, thinTargetMinimapDots: 8000, forceDotsOnly: false },
+  low: { dprCap: 1, thinTargetMinimapDots: 1500 },
+  medium: { dprCap: 1.5, thinTargetMinimapDots: 4000 },
+  high: { dprCap: 2, thinTargetMinimapDots: 8000 },
 };
 
 const STORAGE_KEY = "battle-sim.quality";

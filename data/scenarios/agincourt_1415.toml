@@ -86,7 +86,7 @@ battle_plan = "DefendHighGround"
   [[army.contingent]]
   name_ja = "左翼 長弓隊"
   commander = { name_ja = "トマス・アーピンガム卿", archetype = "veteran_mercenary" }
-  troop_type = 2            # longbowmen（data/visual-profiles/medieval_western.toml）
+  troop_type = 2            # longbowmen（人物ポリゴンの兵科別外観index）
   quality = "professional"
   loadout = "longbowmen"
   count = 700

@@ -2,7 +2,7 @@
  * エントリポイント。
  *
  * 地形と兵士はそれぞれ WebGL2 キャンバス、UI とミニマップは透明な Canvas2D
- * キャンバスへ描く。兵士は M2 のインスタンス描画で 1 ドローコールにまとめる。
+ * キャンバスへ描く。兵士はRust/Wasm生成の三角形列を1ドローコールで描く。
  */
 
 import { Camera } from "./render/iso";
@@ -96,6 +96,7 @@ let fps = 0;
 let fpsAccum = 0;
 let fpsFrames = 0;
 let fpsLast = performance.now();
+let previousFrameAt = performance.now();
 /** 描画中に読み続けているスナップショットバッファ。次が来たら返す。 */
 let heldBuffer: ArrayBuffer | null = null;
 /** 指揮ツリー・戦闘統計。間引いて届くので、届いた最新のものを保持する。 */
@@ -155,6 +156,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
 
   if (msg.type === "ready") {
     snapshot.setStride(msg.soldierStride);
+    soldierRenderer.setSnapshotStride(msg.soldierStride);
     // いま画面に載っているワールドの素性を DOM に出す。疎通確認（web/tools）が
     // 「切り替えが本当に終わったか」を、兵数や tick の見かけの落ち着きから
     // 推測せずに判定できるようにするため。地形の生成がワーカーへ移ってから
@@ -163,7 +165,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
     document.body.dataset.scenario = String(msg.scenario ?? -1);
     document.body.dataset.worldSeq = String(Number(document.body.dataset.worldSeq ?? 0) + 1);
     try {
-      await Promise.all([terrainGl.loadAssets(), soldierRenderer.loadAssets()]);
+      await Promise.all([terrainGl.loadAssets(), soldierRenderer.initialize()]);
     } catch (error) {
       // アセットが一時的に取得できない場合もシミュレーション自体は起動し、
       // レンダラ側の単色・図形フォールバックで状態を確認できるようにする。
@@ -320,6 +322,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
 
     snapshot.bind(msg.buffer);
     interp.push(snapshot);
+    soldierRenderer.applySnapshot(msg.buffer, msg.tick);
     simTick = msg.tick;
     soldierCount = msg.count;
     lastSnapshotAt = performance.now();
@@ -561,6 +564,8 @@ window.addEventListener("resize", resize);
 resize();
 
 function frame(now: number): void {
+  const wallDt = Math.min(0.1, Math.max(0, (now - previousFrameAt) / 1000));
+  previousFrameAt = now;
   // FPS
   fpsAccum += now - fpsLast;
   fpsLast = now;
@@ -592,10 +597,8 @@ function frame(now: number): void {
   overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 
   if (terrainData) {
-    const td = terrainData;
-    soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, now / 1000, (x, y) =>
-      terrainGl.heightAt(td, x, y),
-    );
+    const simulationDt = running ? wallDt * speed : 0;
+    soldierRenderer.draw(overlayCtx, cam, snapshot, interp, alpha, simulationDt);
   }
 
   if (terrainData) {
@@ -624,7 +627,7 @@ function frame(now: number): void {
   hud.textContent =
     `build ${__BUILD_ID__}\n` +
     `tick ${simTick}  ${running ? `▶ ${speed}x` : "⏸"}\n` +
-    `兵士 ${soldierCount}（描画 ${soldierRenderer.drawn}）\n` +
+    `兵士 ${soldierCount}（画面内 ${soldierRenderer.visible} / 描画 ${soldierRenderer.drawn} / カリング ${soldierRenderer.culled}）\n` +
     `視野 ${cam.viewWidthM.toFixed(0)} m  ${cam.pxPerM.toFixed(2)} px/m  LOD ${lodNames[cam.lod]}\n` +
     `${fps.toFixed(0)} fps` +
     (lastStats

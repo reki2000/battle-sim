@@ -14,8 +14,109 @@ use sim_core::soldiers::Attrs;
 use sim_core::structures::StructureKind;
 use sim_core::World as CoreWorld;
 use sim_math::{fx, fx_from_mm, Vec2Fx};
+use sim_render::ArmyRenderer as CoreArmyRenderer;
 use sim_terrain::{BattleSiteCandidate, Terrain, TerrainGrids};
 use wasm_bindgen::prelude::*;
+
+/// 状態保持型の人物ポリゴン描画エンジン。
+///
+/// 位置の正本は [`World`] が出力する描画スナップショットであり、この型は
+/// ルート移動を行わない。モーション位相、クロスフェード、体格、騎乗姿勢、
+/// カリング、LOD、最終三角形列だけを内部に保持・生成する。
+#[wasm_bindgen]
+pub struct ArmyRenderer {
+    inner: CoreArmyRenderer,
+}
+
+impl Default for ArmyRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[wasm_bindgen]
+impl ArmyRenderer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> ArmyRenderer {
+        ArmyRenderer {
+            inner: CoreArmyRenderer::new(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = apiMajor)]
+    pub fn api_major() -> u32 {
+        sim_render::API_MAJOR
+    }
+
+    #[wasm_bindgen(js_name = apiMinor)]
+    pub fn api_minor() -> u32 {
+        sim_render::API_MINOR
+    }
+
+    /// 20 Hz の兵士スナップショットを一括適用する。同一 tick・同一内容は無視する。
+    #[wasm_bindgen(js_name = applySnapshot)]
+    pub fn apply_snapshot(&mut self, bytes: &[u8], stride: u32, tick: u32) -> Result<(), JsValue> {
+        self.inner
+            .apply_snapshot(bytes, stride as usize, tick)
+            .map_err(JsValue::from_str)
+    }
+
+    /// クォータービューのカメラを更新する。変更時だけ呼べばよい。
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = setCamera)]
+    pub fn set_camera(
+        &mut self,
+        center_x: f32,
+        center_y: f32,
+        px_per_m: f32,
+        width: f32,
+        height: f32,
+        world_size: f32,
+    ) {
+        self.inner
+            .set_camera(center_x, center_y, px_per_m, width, height, world_size);
+    }
+
+    /// モーションを `dt` 秒進め、補間率 `alpha` と LOD から三角形列を生成する。
+    pub fn step(&mut self, dt: f32, alpha: f32, lod: u8) {
+        self.inner.step(dt, alpha, lod);
+    }
+
+    #[wasm_bindgen(js_name = verticesPtr)]
+    pub fn vertices_ptr(&self) -> *const f32 {
+        self.inner.vertices().as_ptr()
+    }
+
+    #[wasm_bindgen(js_name = verticesFloatLen)]
+    pub fn vertices_float_len(&self) -> u32 {
+        self.inner.vertices().len() as u32
+    }
+
+    #[wasm_bindgen(js_name = vertexCount)]
+    pub fn vertex_count(&self) -> u32 {
+        (self.inner.vertices().len() / sim_render::VERTEX_FLOATS) as u32
+    }
+
+    #[wasm_bindgen(js_name = agentCount)]
+    pub fn agent_count(&self) -> u32 {
+        self.inner.agent_count()
+    }
+
+    #[wasm_bindgen(js_name = visibleCount)]
+    pub fn visible_count(&self) -> u32 {
+        self.inner.visible_count()
+    }
+
+    #[wasm_bindgen(js_name = drawnCount)]
+    pub fn drawn_count(&self) -> u32 {
+        self.inner.drawn_count()
+    }
+
+    #[wasm_bindgen(js_name = culledCount)]
+    pub fn culled_count(&self) -> u32 {
+        self.inner.culled_count()
+    }
+}
 
 /// wasm 側のワールドハンドル。
 #[wasm_bindgen]

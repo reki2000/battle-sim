@@ -191,7 +191,7 @@ pub struct Soldiers {
     // コールド: 生成時に決まる
     pub attrs: Vec<Attrs>,
     pub faction: Vec<u8>,
-    /// `data/visual-profiles/*.toml` の troop_type_index。
+    /// 人物ポリゴンの兵科別配色・装備種別index。
     pub troop_type: Vec<u16>,
 }
 

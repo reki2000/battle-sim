@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 sim-core.workspace = true
 sim-math.workspace = true
+sim-render.workspace = true
 sim-terrain.workspace = true
 wasm-bindgen = "0.2"
 

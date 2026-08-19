@@ -7,7 +7,7 @@
 │                                                                          │
 │  ┌────────────┐   ┌─────────────────┐   ┌──────────────────────────┐   │
 │  │  UI (HTML) │   │ SVG オーバーレイ │   │  WebGL2 レンダラ          │   │
-│  │  React/lit │   │ 部隊枠・命令矢印 │   │  地形 + 兵士インスタンス  │   │
+│  │  UI        │   │ 部隊枠・命令矢印 │   │ 地形 + 人物ポリゴン      │   │
 │  └─────┬──────┘   └────────┬────────┘   └────────────┬─────────────┘   │
 │        │                   │                          │                 │
 │        └───────────────────┴──────────┬───────────────┘                 │
@@ -42,7 +42,8 @@ Cargo workspace。依存の向きは常に下向き（循環なし）。
 | `sim-data` | TOML スキーマ定義とロード。装備・陣形・アーキタイプ・シナリオ | `serde` | ビルド時に検証、実行時は事前パース済みバイナリでも可 |
 | `sim-terrain` | 地形生成パイプライン。高度・浸食・水系・植生・崖・道路 | `sim-math` | 生成は決定論的。結果は `TerrainGrids` |
 | `sim-core` | ワールド状態、エンティティ、全システム、指揮ツリー、AI | `sim-math`, `sim-data`, `sim-terrain` | ここに全ロジックが入る。wasm 非依存で、ネイティブでもテスト可能 |
-| `sim-wasm` | `wasm-bindgen` 境界。JS に公開する API とメモリビュー | `sim-core` | 薄いラッパのみ。ロジックを置かない |
+| `sim-render` | 状態保持型の人物モーション、体格、騎乗、カリング、全LODのポリゴン生成 | なし | Rustのみ。シミュレーション位置は変更しない |
+| `sim-wasm` | `wasm-bindgen` 境界。JS に公開する API とメモリビュー | `sim-core`, `sim-render` | 薄いラッパのみ。ロジックを置かない |
 | `sim-headless` | CLI。シナリオを走らせて統計を出す。ベンチとリグレッションテスト用 | `sim-core` | CI がこれで性能とバランスを回帰チェックする |
 
 **`sim-core` を wasm 非依存に保つ**のが要。ブラウザなしで数千回のバッチ実行ができるため、
@@ -78,16 +79,22 @@ loop {
 描画に必要なのは全状態のごく一部なので、専用の SoA スナップショットを吐く。
 
 ```rust
-// 兵士 1 体あたり 16 バイト
+// 兵士 1 体あたり 20 バイト
 struct RenderSoldier {
     x: f32,        // メートル（描画専用に固定小数点から変換）
     y: f32,
-    z_facing: u32, // z を i16(cm) と facing を u8 にパック + flags u8
-    packed: u32,   // unit_id u16 | sprite_id u8 | state u8
+    z_cm: i16,
+    facing: u16,
+    unit_id: u16,
+    troop_type: u16,
+    state: u8,
+    flags: u8,
+    faction: u8,
+    padding: u8,
 }
 ```
 
-50,000 体で 800 KB / フレーム。
+50,000 体で 1 MB / スナップショット。
 
 - **SharedArrayBuffer が使える場合**（COOP/COEP ヘッダを配信できる場合）:
   ダブルバッファをリング状に持ち、`Atomics` で「今読んでよいバッファの index」だけを
@@ -96,9 +103,9 @@ struct RenderSoldier {
   2 枚を Worker とメイン間でピンポンする（毎回の確保を避ける）。30 fps 更新で 24 MB/s、
   実測上問題ない範囲。
 
-描画は 60 fps、スナップショットは 20 Hz（sim tick と同期）なので、レンダラは
-2 つの連続スナップショット間を**位置と向きについて線形補間**する。補間はレンダラ内で
-完結し、シミュレーションには一切戻さない。
+描画は60 fps、スナップショットは20 Hz（sim tickと同期）なので、`sim-render`は
+2つの連続スナップショット間を位置と向きについて補間する。モーション位相と
+クロスフェードも描画エンジン内で完結し、シミュレーションには一切戻さない。
 
 ### 3.3 将来のマルチスレッド化
 
@@ -147,6 +154,16 @@ impl World {
     pub fn command_tree(&self) -> JsValue;               // 指揮ツリー全体（変化時のみ）
     pub fn pick(&self, x: f32, y: f32, radius: f32) -> Uint32Array;  // 矩形/円内の兵士 ID
 }
+
+#[wasm_bindgen]
+impl ArmyRenderer {
+    pub fn apply_snapshot(&mut self, bytes: &[u8], stride: u32, tick: u32);
+    pub fn set_camera(&mut self, center_x: f32, center_y: f32, px_per_m: f32,
+                      width: f32, height: f32, world_size: f32);
+    pub fn step(&mut self, dt: f32, alpha: f32, lod: u8);
+    pub fn vertices_ptr(&self) -> *const f32;
+    pub fn vertices_float_len(&self) -> u32;
+}
 ```
 
 JS 側は `new Uint8Array(wasm.memory.buffer, ptr, len)` でビューを作る。
@@ -179,7 +196,7 @@ web/
 │   │   ├── iso.ts           クォータービューの座標変換とカメラ
 │   │   ├── gl.ts            WebGL2 コンテキスト・シェーダ管理
 │   │   ├── terrain.ts       タイルマップのチャンク描画
-│   │   ├── soldiers.ts      兵士のインスタンス描画
+│   │   ├── soldiers.ts      Wasm生成ポリゴンをWebGL2へ転送
 │   │   ├── effects.ts       矢の軌跡・血・砂塵
 │   │   └── lod.ts           ズームレベルと LOD の決定
 │   ├── ui/
@@ -188,20 +205,17 @@ web/
 │   │   ├── orders.ts        命令入力の UI
 │   │   ├── timeline.ts      時間制御とリプレイスクラブ
 │   │   └── minimap.ts       ミニマップ
-│   └── assets/
-│       └── generated/       ビルド時生成のタイルアトラス・スプライトアトラス
 └── tools/
-    └── genart/              アトラス生成スクリプト（Node、ビルド前に実行）
+    └── *.mjs                スモークテスト・単一HTML梱包
 ```
 
 ## 6. ビルドパイプライン
 
 ```
 1. cargo test --workspace                    ネイティブでロジックテスト
-2. node web/tools/genart/build.mjs           タイル・スプライトアトラスを生成
-3. wasm-pack build crates/sim-wasm           wasm + JS グルーを web/src/wasm/ に出力
+2. wasm-pack build crates/sim-wasm           wasm + JS グルーを web/src/wasm/ に出力
    --target web --out-dir ../../web/src/wasm
-4. npm run build (Vite)                      バンドル
+3. npm run build (Vite)                      バンドル
 ```
 
 wasm はリリースビルドで `opt-level = "s"` + `lto = true` + `wasm-opt -Oz`。

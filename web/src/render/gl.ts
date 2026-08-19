@@ -1,8 +1,8 @@
 /**
  * WebGL2 のコンテキスト管理とシェーダのコンパイル・リンク。
  *
- * 仕様 08 章 3〜4 節。地形と兵士はどちらも「1 枚のテクスチャ／1 回の
- * インスタンス描画」を GPU に投げる構成にする。ここには汎用のヘルパだけを置き、
+ * 仕様 08 章 3〜4 節。地形と人物ポリゴンをそれぞれ専用WebGL2キャンバスへ
+ * 描く。ここには汎用のヘルパだけを置き、
  * 具体的な頂点レイアウトは呼び出し側（terrain.ts, soldiers.ts）が持つ。
  */
 
@@ -14,9 +14,8 @@ export function createContext(
     alpha: options.alpha ?? false,
     antialias: false,
     depth: true,
-    // 地形は 1 枚のクアッドなので深度は使わないが、M2 で兵士のインスタンス
-    // 描画を同じコンテキストに乗せるときに深度バッファ（x+y をエンコードした
-    // もの、仕様 08 章 1.1 節）を使う。今のうちに有効化しておく。
+    // 人物ポリゴンは深度バッファ（x+y+z をエンコードしたもの、仕様08章1.1節）
+    // を使う。
     stencil: false,
     preserveDrawingBuffer: false,
     powerPreference: "high-performance",

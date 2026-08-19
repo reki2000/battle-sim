@@ -223,7 +223,7 @@ pub struct CommanderDef {
 pub struct ContingentDef {
     pub name_ja: &'static str,
     pub commander: CommanderDef,
-    /// 視覚プロファイル（`data/visual-profiles/*.toml`）の兵科 index。
+    /// 人物ポリゴンの兵科別配色・装備種別index。
     pub troop_type: u16,
     pub quality: Quality,
     pub loadout: Loadout,
