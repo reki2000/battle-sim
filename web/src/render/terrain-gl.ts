@@ -60,20 +60,31 @@ void main() {
 
   vec2 cell = floor(v_uv * u_mapSize);
   vec2 cellUv = (cell + vec2(0.5)) / u_mapSize;
-  float surface = texture(u_surfaceTex, cellUv).r * 255.0 + 0.5;
+  // 四捨五入して整数のタイル番号に丸めるつもりで "+ 0.5" していたが、
+  // floor() を忘れていたため surface は 6.5 のような半端な値のままだった。
+  // これを mod/floor で tileX/tileY に分解すると tileX も 2.5 のような
+  // 半端な値になり、アトラス上で隣り合う 2 タイル（無関係な地質）の境界を
+  // またいでサンプリングしてしまう。ちょうど 2 セルごとに周期的に踏む
+  // ため、実機でもここのローカルでも「グリッドが規則的に 2 色に割れる」
+  // 形で見えていた——floor() を足して整数に丸めれば直る。
+  float surface = floor(texture(u_surfaceTex, cellUv).r * 255.0 + 0.5);
   float tileX = mod(surface, 4.0);
   float tileY = floor(surface / 4.0);
   vec2 localUv = fract(v_uv * u_mapSize);
   // アトラスは 16 タイルを隙間なく詰めているので（生成側のパディング無し）、
   // タイルの端ぎりぎりを額面どおり [0.5, tileSize-0.5] まで使うと、ほんの
-  // わずかな数値誤差でも隣のタイル（まったく無関係な地質の色）を拾ってしまい、
-  // 地形が縞・市松状に割れて見える。実際にそう見えていた。中心寄りの範囲
-  // だけを使う安全マージンを取り、隣接タイルへ絶対にはみ出さないようにする。
+  // わずかな数値誤差でも隣のタイル（まったく無関係な地質の色）を拾ってしまう。
+  // 中心寄りの範囲だけを使う安全マージンを取り、隣接タイルへ絶対に
+  // はみ出さないようにする（上の丸めさえ直せば理論上は不要なはずだが、
+  // 保険として残す）。
   float margin = 8.0;
   vec2 atlasPx = vec2(tileX, tileY) * u_atlasTileSize
     + margin + localUv * (u_atlasTileSize - vec2(2.0 * margin));
   vec3 color = texture(u_atlasTex, atlasPx / u_atlasSize).rgb;
-  float shade = texture(u_tex, cellUv).a * 1.5;
+  // 陰影は cellUv（セル中心固定）で拾うと、セル内はどこでも同じ値になり、
+  // セルの境界で色がはっきり切り替わる見た目になる。連続な v_uv で拾って
+  // GL の LINEAR 補間に任せ、隣接セルの陰影となめらかに繋がるようにする。
+  float shade = texture(u_tex, v_uv).a * 1.5;
   outColor = vec4(color * shade, 1.0);
 }
 `;
@@ -136,7 +147,9 @@ export class TerrainGlRenderer {
     this.texture = tex;
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    // MAG も LINEAR。陰影は 1 セル 1 テクセルなので、NEAREST だとセル境界で
+    // 陰影がパキッと切り替わる（フラグメントシェーダ側のコメント参照）。
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
@@ -225,7 +238,11 @@ export class TerrainGlRenderer {
           const yn = Math.min(data.dim - 1, y + stride);
           const hx = data.height[y * data.dim + xn]! - data.height[i]!;
           const hy = data.height[yn * data.dim + x]! - data.height[i]!;
-          shade = Math.max(0.45, Math.min(1.5, 1 + (-(hx + hy) / cellCm) * 0.7));
+          // 係数は元々 0.7 だったが、緩やかな丘陵（relief 既定値）でも
+          // 隣接セル間で数十 cm の高低差はノイズとして普通に出るため、
+          // それだけで陰影が大きく振れて地形が縞・市松状に見えていた。
+          // 0.25 まで下げて、勾配への感度を抑える。
+          shade = Math.max(0.45, Math.min(1.5, 1 + (-(hx + hy) / cellCm) * 0.25));
         }
 
         // 崖セルは暗く縁取って位置を示す（本物の側面ジオメトリはまだない。
