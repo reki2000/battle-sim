@@ -50,6 +50,20 @@ const scenarioPanelEl = document.getElementById("scenario-panel") as HTMLDivElem
 const battleReportEl = document.getElementById("battle-report") as HTMLDivElement;
 
 /**
+ * 初期化はこのファイルのトップレベルで進む（WebGL2 コンテキスト生成、
+ * ワーカー起動など）。ここで投げた例外を誰も捕まえないと、HUD が
+ * HTML 側の初期値「起動中…」のまま画面は黒一色で固まり、原因は
+ * devtools を開かないと分からない。せめてエラーメッセージだけは
+ * HUD に出す。
+ */
+function showFatalError(err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  hud.textContent = `初期化に失敗しました: ${message}`;
+}
+window.addEventListener("error", (e) => showFatalError(e.error ?? e.message));
+window.addEventListener("unhandledrejection", (e) => showFatalError(e.reason));
+
+/**
  * 会戦プリセットを選んでいないときの起動設定（従来の対称デモ配置）。
  * `?soldiers=N` による規模の上書きもこちらだけに効く。
  */
