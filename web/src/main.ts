@@ -342,23 +342,80 @@ let lastPointer = { x: 0, y: 0 };
 let pointerDownPos = { x: 0, y: 0 };
 const viewStack = document.getElementById("view-stack") as HTMLDivElement;
 
-viewStack.addEventListener("pointerdown", (e) => {
-  dragging = true;
-  lastPointer = { x: e.clientX, y: e.clientY };
-  pointerDownPos = { x: e.clientX, y: e.clientY };
-  viewStack.setPointerCapture(e.pointerId);
-});
+/**
+ * 同時に触れている指（ポインタ）。1 本ならドラッグでパン、2 本になったら
+ * ピンチに切り替える。`touch-action: none`（index.html）でブラウザ自身の
+ * ピンチズームを止めた上で、ここでカメラのズーム・パンへ変換する。
+ */
+const activePointers = new Map<number, { x: number; y: number }>();
+let pinchDist = 0;
+let pinchMid = { x: 0, y: 0 };
 
-viewStack.addEventListener("pointerup", (e) => {
-  dragging = false;
-  viewStack.releasePointerCapture(e.pointerId);
-  const moved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
-  if (moved < CLICK_MOVE_THRESHOLD) {
-    handleViewClick(e);
+function pinchBasisFrom(points: { x: number; y: number }[]): void {
+  const [a, b] = points;
+  pinchDist = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+  pinchMid = { x: (a!.x + b!.x) / 2, y: (a!.y + b!.y) / 2 };
+}
+
+viewStack.addEventListener("pointerdown", (e) => {
+  viewStack.setPointerCapture(e.pointerId);
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (activePointers.size === 1) {
+    dragging = true;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    pointerDownPos = { x: e.clientX, y: e.clientY };
+  } else if (activePointers.size === 2) {
+    // 2 本目が触れた瞬間にピンチへ切り替える。1 本目の「クリック判定」は
+    // もう成立させない（pointerup 側で dragging を見て判断する）。
+    dragging = false;
+    pinchBasisFrom([...activePointers.values()]);
   }
 });
 
+viewStack.addEventListener("pointerup", (e) => {
+  viewStack.releasePointerCapture(e.pointerId);
+  const wasSingleDrag = activePointers.size === 1 && dragging;
+  activePointers.delete(e.pointerId);
+  if (wasSingleDrag) {
+    const moved = Math.hypot(e.clientX - pointerDownPos.x, e.clientY - pointerDownPos.y);
+    if (moved < CLICK_MOVE_THRESHOLD) {
+      handleViewClick(e);
+    }
+  }
+  dragging = false;
+  if (activePointers.size === 2) {
+    pinchBasisFrom([...activePointers.values()]);
+  } else if (activePointers.size === 1) {
+    // 1 本だけ離れてもう 1 本が残っていれば、そのままパンへ引き継ぐ
+    // （ジャンプしないよう、いま残っている位置を基準に取り直す）。
+    const [p] = [...activePointers.values()];
+    dragging = true;
+    lastPointer = { x: p!.x, y: p!.y };
+  }
+});
+
+viewStack.addEventListener("pointercancel", (e) => {
+  viewStack.releasePointerCapture(e.pointerId);
+  activePointers.delete(e.pointerId);
+  dragging = false;
+});
+
 viewStack.addEventListener("pointermove", (e) => {
+  if (!activePointers.has(e.pointerId)) return;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (activePointers.size >= 2) {
+    const rect = viewStack.getBoundingClientRect();
+    const prevDist = pinchDist;
+    const prevMid = pinchMid;
+    pinchBasisFrom([...activePointers.values()]);
+    if (prevDist > 0 && pinchDist > 0) {
+      cam.zoomAt(pinchMid.x - rect.left, pinchMid.y - rect.top, Math.log2(pinchDist / prevDist));
+      cam.panByScreen(pinchMid.x - prevMid.x, pinchMid.y - prevMid.y);
+    }
+    return;
+  }
+
   if (!dragging) return;
   cam.panByScreen(e.clientX - lastPointer.x, e.clientY - lastPointer.y);
   lastPointer = { x: e.clientX, y: e.clientY };
