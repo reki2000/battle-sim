@@ -1,6 +1,18 @@
 import { defineConfig } from "vite";
 
+// ビルドごとに変わる短い識別子。単体 HTML は配布のたびに送り直すファイル名が
+// 同じになりがちで、「これは最新のファイルか」を見た目だけでは判別できない
+// （実際に配布先で「バージョン番号がないのでわからない」という声があった）。
+// HUD に出す（main.ts）ための、ビルド時刻ベースの値をここで注入する。
+const BUILD_ID = new Date()
+  .toISOString()
+  .replace("T", " ")
+  .replace(/:\d{2}\.\d{3}Z$/, "");
+
 export default defineConfig({
+  define: {
+    __BUILD_ID__: JSON.stringify(BUILD_ID),
+  },
   server: {
     // SharedArrayBuffer を使う場合（仕様 01 章 3.2 / 11 章 4 節）は
     // これらのヘッダが必要になる。M9 のマルチスレッド化で有効にする。

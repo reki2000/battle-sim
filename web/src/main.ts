@@ -565,6 +565,7 @@ function frame(now: number): void {
 
   const lodNames = ["至近", "戦術", "部隊", "会戦", "戦域"];
   hud.textContent =
+    `build ${__BUILD_ID__}\n` +
     `tick ${simTick}  ${running ? `▶ ${speed}x` : "⏸"}\n` +
     `兵士 ${soldierCount}（描画 ${soldierRenderer.drawn}）\n` +
     `視野 ${cam.viewWidthM.toFixed(0)} m  ${cam.pxPerM.toFixed(2)} px/m  LOD ${lodNames[cam.lod]}\n` +
