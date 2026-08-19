@@ -156,12 +156,15 @@ export class TerrainGlRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.bindTexture(gl.TEXTURE_2D, this.atlasTexture);
-    // ミップマップ必須。アトラスのタイルは 1 セル（2 m）に対して 64 px と
-    // 高解像度で、縮小して見るズーム（会戦・戦域 LOD）では 1 タイルが数 px
-    // にしかならない。ミップマップなしの LINEAR は高周波なタイル模様を
-    // そのまま間引くので縞状のエイリアシング（モアレ）が出る——水面のように
-    // 単色に近い面ほど目立つ。`gl.LINEAR_MIPMAP_LINEAR` で正しく縮小する。
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    // ミップマップは使わない。`gl.generateMipmap` は 16 タイルを敷き詰めた
+    // アトラス全体を 1 枚の画像として単純に縮小するので、タイルの内部境界を
+    // またいで色を混ぜてしまう（隣り合うタイルは互いに無関係な地質の色）。
+    // 縮小ズームでこの「汚染された」縮小レベルが選ばれ、地形が縞・市松状に
+    // 割れて見えていた。ミップマップ無しなら常にレベル 0 だけを見るので、
+    // フラグメントシェーダ側のタイル内マージン（`atlasPx` 参照）だけで
+    // 隣接タイルへのはみ出しを防げる。代償はごく僅かな遠景エイリアシングで、
+    // 水は単色・陸は弱いディザなので実害はない。
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   }
 
@@ -180,7 +183,6 @@ export class TerrainGlRenderer {
       gl.UNSIGNED_BYTE,
       this.atlas.pixels,
     );
-    gl.generateMipmap(gl.TEXTURE_2D);
   }
 
   /**
