@@ -150,7 +150,12 @@ export class TerrainGlRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.bindTexture(gl.TEXTURE_2D, this.atlasTexture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    // ミップマップ必須。アトラスのタイルは 1 セル（2 m）に対して 64 px と
+    // 高解像度で、縮小して見るズーム（会戦・戦域 LOD）では 1 タイルが数 px
+    // にしかならない。ミップマップなしの LINEAR は高周波なタイル模様を
+    // そのまま間引くので縞状のエイリアシング（モアレ）が出る——水面のように
+    // 単色に近い面ほど目立つ。`gl.LINEAR_MIPMAP_LINEAR` で正しく縮小する。
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   }
 
@@ -169,6 +174,7 @@ export class TerrainGlRenderer {
       gl.UNSIGNED_BYTE,
       this.atlas.pixels,
     );
+    gl.generateMipmap(gl.TEXTURE_2D);
   }
 
   /**

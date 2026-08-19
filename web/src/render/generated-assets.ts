@@ -33,6 +33,21 @@ function loadImage(url: string): Promise<HTMLImageElement> {
 }
 
 /**
+ * 座標から決定論的な疑似乱数を作る（0..1）。`Math.random` は使わない
+ * （同じ入力で毎回同じ絵になる必要がある。下記 `proceduralTerrainAtlas` 参照）。
+ *
+ * 単純な線形結合（`(px*a + py*b) % n`）だと周期がそのまま画面に縞模様として
+ * 出てしまう（水面のような広い単色面で特に目立つ）。ビット拡散を挟んで
+ * 粒状のディザに見えるようにする。
+ */
+function hash2(x: number, y: number, salt: number): number {
+  let h = (x * 374761393 + y * 668265263 + salt * 2246822519) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+
+/**
  * 地形タイルアトラスが見つからないときの手続き生成フォールバック。
  *
  * 16 枚のタイルを、それぞれの基準色（`TILE_COLORS`）で塗り分ける。
@@ -42,7 +57,19 @@ function loadImage(url: string): Promise<HTMLImageElement> {
  *
  * 単色のままだと 2 m タイルが一様でのっぺりするので、タイル内に決定論的な
  * 微弱な明暗を入れて地面らしい粒状感だけ足す。
+ *
+ * ただし水面は除く。1 セル＝1 タイルとして同じ 64×64 画像をそのまま並べて
+ * 貼るので、湖のように何十セルも連続する場所では「同じ粒状パターンの
+ * 繰り返し」がそのまま縞・モザイクとして見えてしまう（陸は地質や標高陰影が
+ * セルごとに変わるので目立たないが、水面は単色に近く継ぎ目が丸見えになる）。
+ * 水は最初から質感の主張が無いほうが自然なので、水タイルだけは単色にする。
  */
+const WATER_TILES = new Set<number>([
+  TerrainTile.DEEP_WATER,
+  TerrainTile.SHALLOW_WATER,
+  TerrainTile.FORD,
+]);
+
 function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
   const cols = 4;
   const rows = 4;
@@ -59,10 +86,12 @@ function proceduralTerrainAtlas(tileSize = 64): TerrainAtlas {
     for (let tx = 0; tx < cols; tx++) {
       const tile = ty * cols + tx;
       const [r, g, b] = TILE_COLORS[tile] ?? TILE_COLORS[TerrainTile.GRASS]!;
+      const isWater = WATER_TILES.has(tile);
       for (let py = 0; py < tileSize; py++) {
         for (let px = 0; px < tileSize; px++) {
-          // 座標から決まる ±6% の明暗。乱数を使わないので毎回同じ絵になる
-          const n = ((px * 7 + py * 13 + tile * 31) % 16) / 16 - 0.5;
+          // 座標から決まる ±6% の明暗（粒状のディザ、縞にはならない）。
+          // 水タイルは繰り返しが目立つので単色のまま（上のコメント参照）
+          const n = isWater ? 0 : hash2(px, py, tile) - 0.5;
           const k = 1 + n * 0.12;
           const o = ((ty * tileSize + py) * width + tx * tileSize + px) * 4;
           image.data[o] = Math.min(255, Math.round(r * k));
