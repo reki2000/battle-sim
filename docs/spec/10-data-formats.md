@@ -26,7 +26,7 @@ data/
 │   └── generic_medieval.toml
 └── scenarios/
     ├── open_field.toml
-    ├── river_crossing.toml
+    ├── lake_shore.toml
     └── hill_defense.toml
 ```
 
@@ -382,7 +382,6 @@ seed = "0x4A17_C0FF"
 size_m = 4000
 relief = 0.25
 sea = "none"
-river_density = 0.2
 forest_cover = 0.45
 marsh_bias = 0.35
 road_count = 1

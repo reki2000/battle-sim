@@ -61,7 +61,13 @@ export const Overlay = {
 export type OverlayId = (typeof Overlay)[keyof typeof Overlay];
 export const OVERLAY_COUNT = 3;
 
-/** 水域の種別。水深（cm）と対になるメタデータ。 */
+/**
+ * 水域の種別。水深（cm）と対になるメタデータ。
+ *
+ * `RIVER` は生成器がもう使わない（河川生成は廃止済み）。番号を詰めると
+ * `SEA` の値がずれて Rust 側の定義やシリアライズ済み地形データと不整合に
+ * なるため、欠番のまま残してある。
+ */
 export const WaterKind = {
   NONE: 0,
   LAKE: 1,
@@ -85,7 +91,7 @@ export const CliffBits = {
 /** 崖として扱う隣接セル間の高低差（cm）。仕様 03 章 2.5 節。 */
 export const CLIFF_THRESHOLD_CM = 250;
 
-/** 渡渉可能な最大水深（cm）。これ以下の河川セルが渡渉点になる。 */
+/** 渡渉可能な最大水深（cm）。これ以下の水域セルが渡渉点になる。 */
 export const FORD_MAX_DEPTH_CM = 40;
 /** 浅瀬の上限水深（cm）。これを超えると徒歩でも渡れない。 */
 export const SHALLOW_MAX_DEPTH_CM = 150;
@@ -107,8 +113,6 @@ export interface TerrainParams {
   baseHeightM: number;
   /** 熱浸食の反復回数 */
   thermalIterations: number;
-  /** 河川の密度。0 = なし、1000 = 網目状 */
-  riverDensity: number;
   /** 敷設する道路の本数 */
   roadCount: number;
   /** 海の有無と位置 */

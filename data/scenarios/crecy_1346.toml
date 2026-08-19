@@ -25,7 +25,6 @@ relief = 0
 forest_cover = 250
 marsh_bias = 120
 thermal_iterations = 6
-river_density = 0
 road_count = 1
 sea = "none"
 
