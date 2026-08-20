@@ -433,12 +433,15 @@ function handleViewClick(e: PointerEvent): void {
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
   const world = cam.screenToWorld(sx, sy);
-  if (orderPanel.handleMapClick(world.x, world.y)) return;
-  selectNearestSoldier(world.x, world.y);
+  const soldierId = nearestSoldier(world.x, world.y);
+  const picked =
+    soldierId === null ? null : { id: soldierId, faction: snapshot.faction(soldierId) };
+  if (orderPanel.handleMapClick(world.x, world.y, picked)) return;
+  if (soldierId !== null) send({ type: "querySoldier", id: soldierId });
 }
 
-function selectNearestSoldier(xM: number, yM: number): void {
-  if (snapshot.count === 0) return;
+function nearestSoldier(xM: number, yM: number): number | null {
+  if (snapshot.count === 0) return null;
   const thresholdM = SOLDIER_PICK_RADIUS_PX / cam.pxPerM;
   let bestI = -1;
   let bestD = thresholdM * thresholdM;
@@ -451,8 +454,7 @@ function selectNearestSoldier(xM: number, yM: number): void {
       bestI = i;
     }
   }
-  if (bestI < 0) return;
-  send({ type: "querySoldier", id: bestI });
+  return bestI < 0 ? null : bestI;
 }
 
 viewStack.addEventListener(

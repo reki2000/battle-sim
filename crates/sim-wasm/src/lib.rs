@@ -647,6 +647,72 @@ impl World {
             .is_some()
     }
 
+    /// 特定の敵兵（通常は指揮官）を、行動不能になるまで追跡する。
+    #[wasm_bindgen(js_name = issueHuntPerson)]
+    pub fn issue_hunt_person(&mut self, node: u32, target_soldier: u32) -> bool {
+        let Some(command_node) = self.inner.command.node(node) else {
+            return false;
+        };
+        let Some(target) = self.inner.soldiers.index_if_present(target_soldier) else {
+            return false;
+        };
+        if !self.inner.soldiers.is_alive(target)
+            || self.inner.soldiers.faction[target] == command_node.faction
+        {
+            return false;
+        }
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::HuntPerson {
+                    target: target_soldier,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定した円形区域へ進出し、区域内に分散して占拠する。
+    #[wasm_bindgen(js_name = issueOccupyArea)]
+    pub fn issue_occupy_area(&mut self, node: u32, x_m: i32, y_m: i32, radius_m: u16) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::OccupyArea {
+                    center: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    radius_m: radius_m.clamp(1, 200),
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定した区域を守り、各持ち場から迎撃半径内の敵へ個別に反応する。
+    #[wasm_bindgen(js_name = issueGuardArea)]
+    pub fn issue_guard_area(
+        &mut self,
+        node: u32,
+        x_m: i32,
+        y_m: i32,
+        radius_m: u16,
+        intercept_radius_m: u16,
+    ) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::GuardArea {
+                    center: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    radius_m: radius_m.clamp(1, 200),
+                    intercept_radius_m: intercept_radius_m.clamp(1, 50),
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
     #[wasm_bindgen(js_name = messengerCount)]
     pub fn messenger_count(&self) -> u32 {
         self.inner.command.messengers.len() as u32
@@ -1216,6 +1282,10 @@ mod tests {
         assert!(w.issue_withdraw(friendly, 90, 90, true));
         assert!(w.issue_shoot_at(friendly, enemy, 1));
         assert!(w.issue_reserve(friendly, 80, 80));
+        assert!(w.issue_hunt_person(friendly, 16));
+        assert!(w.issue_occupy_area(friendly, 120, 100, 25));
+        assert!(w.issue_guard_area(friendly, 100, 120, 20, 14));
+        assert!(!w.issue_hunt_person(friendly, 0));
         // 存在しないノードへは出せない。
         assert!(!w.issue_attack(999, enemy, 0));
 

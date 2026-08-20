@@ -292,6 +292,21 @@ pub enum Intent {
         target: NodeId,
         mode: ShootMode,
     },
+    /// 特定の兵士（通常は指揮官）を追跡し、行動不能になるまで捕捉する。
+    HuntPerson {
+        target: SoldierId,
+    },
+    /// 円形の区域へ進出し、兵士を区域内へ分散させて占拠する。
+    OccupyArea {
+        center: Vec2Fx,
+        radius_m: u16,
+    },
+    /// 円形の区域を守り、`intercept_radius_m` 内へ入った敵を局所迎撃する。
+    GuardArea {
+        center: Vec2Fx,
+        radius_m: u16,
+        intercept_radius_m: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,6 +496,111 @@ fn objective_hash(o: Objective) -> u64 {
     }
 }
 
+/// 葉ノードの現在任務を決定論検証へ含める。局所兵士 AI は Hold / Reserve / Attack
+/// などで迎撃半径を変えるため、命令 ID だけでなく解釈後の Intent 自体が状態である。
+fn intent_hash(intent: Intent) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    match intent {
+        Intent::MoveTo {
+            pos,
+            facing,
+            speed,
+            formation,
+        } => {
+            mix(0);
+            mix(pos.x as u32 as u64);
+            mix(pos.y as u32 as u64);
+            mix(facing as u64);
+            mix(speed as u64);
+            mix(formation as u64);
+        }
+        Intent::Hold {
+            pos,
+            facing,
+            allow_pursuit,
+        } => {
+            mix(1);
+            mix(pos.x as u32 as u64);
+            mix(pos.y as u32 as u64);
+            mix(facing as u64);
+            mix(allow_pursuit as u64);
+        }
+        Intent::Attack { target, approach } => {
+            mix(2);
+            mix(target as u64);
+            mix(approach as u64);
+        }
+        Intent::Charge { target } => {
+            mix(3);
+            mix(target as u64);
+        }
+        Intent::Flank { target, side } => {
+            mix(4);
+            mix(target as u64);
+            mix(side as u64);
+        }
+        Intent::Envelop { target } => {
+            mix(5);
+            mix(target as u64);
+        }
+        Intent::Screen { protect, side } => {
+            mix(6);
+            mix(protect as u64);
+            mix(side as u64);
+        }
+        Intent::Reserve { rally_pos } => {
+            mix(7);
+            mix(rally_pos.x as u32 as u64);
+            mix(rally_pos.y as u32 as u64);
+        }
+        Intent::Withdraw { to, fighting } => {
+            mix(8);
+            mix(to.x as u32 as u64);
+            mix(to.y as u32 as u64);
+            mix(fighting as u64);
+        }
+        Intent::Pursue {
+            target,
+            max_distance_m,
+        } => {
+            mix(9);
+            mix(target as u64);
+            mix(max_distance_m as u64);
+        }
+        Intent::ShootAt { target, mode } => {
+            mix(10);
+            mix(target as u64);
+            mix(mode as u64);
+        }
+        Intent::HuntPerson { target } => {
+            mix(11);
+            mix(target as u64);
+        }
+        Intent::OccupyArea { center, radius_m } => {
+            mix(12);
+            mix(center.x as u32 as u64);
+            mix(center.y as u32 as u64);
+            mix(radius_m as u64);
+        }
+        Intent::GuardArea {
+            center,
+            radius_m,
+            intercept_radius_m,
+        } => {
+            mix(13);
+            mix(center.x as u32 as u64);
+            mix(center.y as u32 as u64);
+            mix(radius_m as u64);
+            mix(intercept_radius_m as u64);
+        }
+    }
+    h
+}
+
 /// 軍全体の会戦プラン。仕様 05 章 6 節。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BattlePlan {
@@ -536,6 +656,7 @@ pub struct Unit {
     pub soldiers: Vec<SoldierId>,
     pub troop_type: u16,
     pub formation: FormationId,
+    /// 経路上を連続的に進む現在の隊列アンカー。最終目的地は `path_final`。
     pub formation_origin: Vec2Fx,
     pub formation_facing: Brad,
     pub ranks: u16,
@@ -543,8 +664,7 @@ pub struct Unit {
     pub rank_spacing: Fx,
     pub banner: Option<u16>,
     pub formation_change: Option<FormationChange>,
-    /// 残りの経路ウェイポイント（次に目指す点が先頭）。`formation_origin` が
-    /// 現在の目標であり、ここには「その先」の点だけが入る（仕様 12 章 M2）。
+    /// 残りの経路ウェイポイント（アンカーが次に目指す点が先頭）。
     pub path: Vec<Vec2Fx>,
     /// 経路探索の最終目的地。到達判定や再計算の要否に使う。
     pub path_final: Vec2Fx,
@@ -555,6 +675,29 @@ pub struct Unit {
 /// 側面攻撃の目標を、敵部隊の重心から横へずらす距離（m）。真正面へ向かわせると
 /// 側面へ回り込まずに正面衝突するので、いったん敵の横を目指させる。
 const FLANK_OFFSET_M: i32 = 60;
+
+/// 隊列アンカーの基準速度（mm/s）。兵士自身の移動速度より少し遅くし、
+/// 前の隊列目標へ追いつく余裕を残す。
+const FORMATION_ANCHOR_SPEED_MM_PER_S: i32 = 1_200;
+const ADVANCE_ANCHOR_SPEED_MM_PER_S: i32 = 1_800;
+const FOOT_CHARGE_ANCHOR_SPEED_MM_PER_S: i32 = 2_400;
+const MOUNTED_CHARGE_ANCHOR_SPEED_MM_PER_S: i32 = 6_500;
+/// 重心がアンカーから離れすぎたとき、アンカーを減速・停止する距離。
+const ANCHOR_SLOW_LAG_MM: i32 = 8_000;
+const ANCHOR_STOP_LAG_MM: i32 = 15_000;
+/// 同じ移動目標を細かく再発令されても経路を引き直さない距離。
+const REPATH_DISTANCE_MM: i32 = 4_000;
+/// 区域内の配置を一方向の格子にせず、各兵士を円盤へ分散させる角度。
+/// 137.5 度に近い brad 値で、隣り合うスロットが同じ方向へ並ばない。
+const AREA_SPIRAL_STEP_BRAD: u16 = 25_031;
+
+/// 歩行中に保つ最低間隔。停止して整列したあとは Unit 固有の元の間隔へ戻す。
+const MARCH_FILE_SPACING_MIN_MM: i32 = 900;
+const MARCH_RANK_SPACING_MIN_MM: i32 = 1_100;
+
+/// 戦列の穴は一度に全段を詰めず、一定間隔で直後の一人だけが前へ出る。
+const VACANCY_FILL_INTERVAL_TICKS: u32 = 10;
+const MAX_VACANCY_FILLS_PER_INTERVAL: usize = 8;
 
 /// 前後列の交代を検討する間隔（tick）。20 Hz なので 40 tick = 2 秒。
 const ROTATION_INTERVAL_TICKS: u32 = 40;
@@ -955,7 +1098,38 @@ impl CommandTree {
             self.deliver(index, soldiers, terrain, tick);
         }
         self.update_stats(soldiers);
+        self.tick_dynamic_objectives(soldiers, terrain);
         self.tick_pursuit(soldiers, terrain);
+    }
+
+    /// 人物追跡は、発令時の位置ではなく対象の現在位置を低頻度の再経路探索で追う。
+    /// 対象が行動不能になれば任務を完了し、その場で隊列アンカーを止める。
+    fn tick_dynamic_objectives(&mut self, soldiers: &Soldiers, terrain: &Terrain) {
+        let mut updates = Vec::new();
+        let mut completed = Vec::new();
+        for node in &self.nodes {
+            let Some(Intent::HuntPerson { target }) = node.objective else {
+                continue;
+            };
+            if soldiers.is_active_id(target) {
+                updates.push((node.id, soldiers.pos(target as usize)));
+            } else {
+                completed.push(node.id);
+            }
+        }
+        for (node, destination) in updates {
+            self.set_movement_target(node, destination, soldiers, terrain);
+        }
+        for node_id in completed {
+            let Some(node) = self.node_mut(node_id) else {
+                continue;
+            };
+            node.objective = None;
+            if let Some(unit) = node.unit.as_mut() {
+                unit.path.clear();
+                unit.path_final = unit.formation_origin;
+            }
+        }
     }
 
     /// 追撃の紐を確認し、上限距離（規律が低いほど超過を許す）を超えた部隊を
@@ -1114,12 +1288,15 @@ impl CommandTree {
     ) {
         let mut requested_formation = None;
         let mut route: Option<Vec2Fx> = None;
-        // ノードを可変借用する前に、他ノード（Charge/Pursue の対象）の重心と
-        // この部隊の現在地を読んでおく。
+        // ノードを可変借用する前に、他ノード（Charge/Pursue の対象）の重心、
+        // 追跡対象の現在位置、この部隊の現在地を読んでおく。
         let target_centroid = match intent {
             Intent::Charge { target }
             | Intent::Pursue { target, .. }
             | Intent::Attack { target, .. } => self.node(target).map(|n| n.stats.centroid),
+            Intent::HuntPerson { target } => soldiers
+                .is_active_id(target)
+                .then(|| soldiers.pos(target as usize)),
             // 側面攻撃は敵の重心そのものではなく、その横を目標にする。
             Intent::Flank { target, side } => self.node(target).map(|n| {
                 let (sin, cos) = (
@@ -1142,6 +1319,9 @@ impl CommandTree {
             let Some(unit) = node.unit.as_mut() else {
                 return;
             };
+            if !matches!(intent, Intent::Pursue { .. }) {
+                unit.pursuit_leash = None;
+            }
             match intent {
                 Intent::MoveTo {
                     pos,
@@ -1159,6 +1339,9 @@ impl CommandTree {
                 }
                 Intent::Reserve { rally_pos } | Intent::Withdraw { to: rally_pos, .. } => {
                     route = Some(rally_pos);
+                }
+                Intent::OccupyArea { center, .. } | Intent::GuardArea { center, .. } => {
+                    route = Some(center);
                 }
                 Intent::Charge { .. } => {
                     unit.pursuit_leash = None;
@@ -1191,6 +1374,24 @@ impl CommandTree {
                         route = Some(destination);
                     }
                 }
+                Intent::HuntPerson { .. } => {
+                    if let Some(destination) = target_centroid {
+                        route = Some(destination);
+                    }
+                    for &id in &unit.soldiers {
+                        let Some(i) = soldiers.index_if_present(id) else {
+                            continue;
+                        };
+                        if soldiers.is_active_id(id)
+                            && matches!(
+                                soldiers.hot.state[i],
+                                State::Idle | State::Marching | State::Repositioning
+                            )
+                        {
+                            soldiers.hot.state[i] = State::Advancing;
+                        }
+                    }
+                }
                 Intent::Pursue { max_distance_m, .. } => {
                     if let Some(centroid) = target_centroid {
                         route = Some(centroid);
@@ -1219,9 +1420,12 @@ impl CommandTree {
         }
     }
 
-    /// 部隊の移動目標を設定する。粗い A* で経路を求め、経路の最初のウェイポイントを
-    /// `formation_origin`（陣形が追従する即時目標）に、残りを `unit.path` に積む。
-    /// 経路が見つからない場合は直線移動にフォールバックする。
+    /// 部隊の移動目標を設定する。
+    ///
+    /// `formation_origin` はその場から連続的に動く「現在の隊列アンカー」として残し、
+    /// `path_final` に最終目的地、`path` にそこまでのウェイポイントを入れる。
+    /// 目的地を直接 `formation_origin` へ代入すると、全兵士のスロットが同じ tick に
+    /// 遠方へ飛び、一斉に同じ方向へ歩き出すため。
     fn set_movement_target(
         &mut self,
         node_id: NodeId,
@@ -1229,8 +1433,21 @@ impl CommandTree {
         soldiers: &Soldiers,
         terrain: &Terrain,
     ) {
-        let start = self.unit_origin(node_id, soldiers);
-        let mut waypoints =
+        let start = self
+            .node(node_id)
+            .and_then(|node| node.unit.as_ref())
+            .map(|unit| unit.formation_origin)
+            .unwrap_or_else(|| self.unit_origin(node_id, soldiers));
+        if let Some(unit) = self.node(node_id).and_then(|node| node.unit.as_ref()) {
+            let threshold = fx_from_mm(REPATH_DISTANCE_MM);
+            if dist(unit.path_final, destination) <= threshold
+                && (!unit.path.is_empty()
+                    || dist(unit.formation_origin, destination) <= pathing::arrival_radius())
+            {
+                return;
+            }
+        }
+        let waypoints =
             pathing::find_path(terrain, start, destination).unwrap_or_else(|| vec![destination]);
         let Some(node) = self.node_mut(node_id) else {
             return;
@@ -1238,12 +1455,6 @@ impl CommandTree {
         let Some(unit) = node.unit.as_mut() else {
             return;
         };
-        let first = if waypoints.is_empty() {
-            destination
-        } else {
-            waypoints.remove(0)
-        };
-        unit.formation_origin = first;
         unit.path = waypoints;
         unit.path_final = destination;
     }
@@ -1499,6 +1710,14 @@ impl CommandTree {
     pub fn formation_goals(&mut self, soldiers: &mut Soldiers, goals: &mut [Vec2Fx], tick: u32) {
         for index in 0..self.nodes.len() {
             let mut formation_changed = false;
+            let centroid = self.nodes[index].stats.centroid;
+            let area_mission = match self.nodes[index].objective {
+                Some(Intent::OccupyArea { center, radius_m })
+                | Some(Intent::GuardArea {
+                    center, radius_m, ..
+                }) => Some((center, radius_m)),
+                _ => None,
+            };
             {
                 let Some(unit) = self.nodes[index].unit.as_mut() else {
                     continue;
@@ -1510,52 +1729,58 @@ impl CommandTree {
                         formation_changed = true;
                     }
                 }
-                // 経路上の現在のウェイポイントに近づいたら、次のウェイポイントへ進む。
-                // 重心は前ティックの `update_stats` の結果なので 1 tick 遅れるが、
-                // 隊列が長いユニットでは十分な精度。
-                if !unit.path.is_empty() {
-                    let centroid = self
-                        .nodes
-                        .get(index)
-                        .map(|n| n.stats.centroid)
-                        .unwrap_or(Vec2Fx::ZERO);
-                    let unit = self.nodes[index].unit.as_mut().unwrap();
-                    if dist(centroid, unit.formation_origin) <= pathing::arrival_radius() {
-                        unit.formation_origin = unit.path.remove(0);
-                    }
-                }
-                let unit = self.nodes[index].unit.as_mut().unwrap();
+                let moving = advance_formation_anchor(unit, centroid, soldiers);
                 let transitioning = unit.formation_change.is_some();
-                let alive = unit
-                    .soldiers
-                    .iter()
-                    .filter(|&&id| soldiers.is_active_id(id))
-                    .count() as u32;
-                if alive == 0 {
+                if !unit.soldiers.iter().any(|&id| soldiers.is_active_id(id)) {
                     continue;
                 }
                 let ranks = unit.ranks.max(1) as u32;
-                let files = alive.div_ceil(ranks).max(1);
+                // 死者を除いて詰め直すと、その後ろの全員の目標が同時に変わる。
+                // 元のスロット数を維持し、穴は `fill_front_vacancies` が局所的に埋める。
+                let slot_count = unit.soldiers.len() as u32;
+                let files = slot_count.div_ceil(ranks).max(1);
+                let file_spacing = if moving {
+                    unit.file_spacing.max(fx_from_mm(MARCH_FILE_SPACING_MIN_MM))
+                } else {
+                    unit.file_spacing
+                };
+                let rank_spacing = if moving {
+                    unit.rank_spacing.max(fx_from_mm(MARCH_RANK_SPACING_MIN_MM))
+                } else {
+                    unit.rank_spacing
+                };
                 let (sin, cos) = (
                     sim_math::sin_fx(unit.formation_facing),
                     sim_math::cos_fx(unit.formation_facing),
                 );
-                let mut alive_slot = 0u32;
-                for &id in &unit.soldiers {
+                // 区域へ到着した後だけ円盤配置へ展開する。行軍中まで区域の全幅へ
+                // 広がると、狭路を通れず、隊列アンカーから大きく遅れてしまう。
+                let deployed_area = area_mission.filter(|&(center, _)| {
+                    !moving
+                        && unit.path.is_empty()
+                        && dist(unit.formation_origin, center) <= pathing::arrival_radius()
+                });
+                for (stable_slot, &id) in unit.soldiers.iter().enumerate() {
                     let i = id as usize;
                     if i >= goals.len() || !soldiers.is_active_id(id) {
                         continue;
                     }
-                    let file = alive_slot % files;
-                    let rank = alive_slot / files;
-                    let local_x = (file as Fx * unit.file_spacing)
-                        - ((files.saturating_sub(1) as Fx * unit.file_spacing) / 2);
-                    let local_y = rank as Fx * unit.rank_spacing;
-                    let rotated = Vec2Fx::new(
-                        fx_mul(local_x, cos) - fx_mul(local_y, sin),
-                        fx_mul(local_x, sin) + fx_mul(local_y, cos),
-                    );
-                    goals[i] = unit.formation_origin.add(rotated);
+                    let stable_slot = stable_slot as u32;
+                    soldiers.slot[i] = stable_slot.min(u16::MAX as u32) as u16;
+                    let file = stable_slot % files;
+                    let rank = stable_slot / files;
+                    let local_x = (file as Fx * file_spacing)
+                        - ((files.saturating_sub(1) as Fx * file_spacing) / 2);
+                    let local_y = rank as Fx * rank_spacing;
+                    let offset = if let Some((_, radius_m)) = deployed_area {
+                        area_slot_offset(stable_slot, slot_count, radius_m, unit.formation_facing)
+                    } else {
+                        Vec2Fx::new(
+                            fx_mul(local_x, cos) - fx_mul(local_y, sin),
+                            fx_mul(local_x, sin) + fx_mul(local_y, cos),
+                        )
+                    };
+                    goals[i] = unit.formation_origin.add(offset);
                     if transitioning {
                         if soldiers.hot.state[i] == State::Idle {
                             soldiers.hot.state[i] = State::Repositioning;
@@ -1564,11 +1789,12 @@ impl CommandTree {
                         if soldiers.hot.state[i] == State::Repositioning {
                             soldiers.hot.state[i] = State::Marching;
                         }
-                        if soldiers.hot.state[i] == State::Idle && soldiers.pos(i) != goals[i] {
+                        if soldiers.hot.state[i] == State::Idle
+                            && dist(soldiers.pos(i), goals[i]) > fx_from_mm(300)
+                        {
                             soldiers.hot.state[i] = State::Marching;
                         }
                     }
-                    alive_slot += 1;
                 }
                 unit.ranks = ranks as u16;
             }
@@ -1579,6 +1805,46 @@ impl CommandTree {
                     order: None,
                     kind: CommandEventKind::FormationChanged,
                 });
+            }
+        }
+    }
+
+    /// 死傷者が空けたスロットへ、同じ file の直後にいる兵士を一段だけ前進させる。
+    ///
+    /// 一度に列全体を圧縮せず、穴が後方へ波のように伝わる。これにより「前が空いた
+    /// のでそこへ歩く」は起きるが、一人の死で部隊全員が一斉移動することはない。
+    pub fn fill_front_vacancies(&mut self, soldiers: &Soldiers, tick: u32) {
+        if tick % VACANCY_FILL_INTERVAL_TICKS != 0 {
+            return;
+        }
+        for node in &mut self.nodes {
+            let Some(unit) = node.unit.as_mut() else {
+                continue;
+            };
+            if unit.formation_change.is_some() || unit.soldiers.len() < 2 {
+                continue;
+            }
+            let ranks = unit.ranks.max(1) as usize;
+            let files = unit.soldiers.len().div_ceil(ranks).max(1);
+            let mut moved_from = vec![false; unit.soldiers.len()];
+            let mut filled = 0usize;
+            for gap in 0..unit.soldiers.len() {
+                if filled >= MAX_VACANCY_FILLS_PER_INTERVAL {
+                    break;
+                }
+                if moved_from[gap] {
+                    continue;
+                }
+                if soldiers.is_active_id(unit.soldiers[gap]) {
+                    continue;
+                }
+                let behind = gap + files;
+                if behind >= unit.soldiers.len() || !soldiers.is_active_id(unit.soldiers[behind]) {
+                    continue;
+                }
+                unit.soldiers.swap(gap, behind);
+                moved_from[behind] = true;
+                filled += 1;
             }
         }
     }
@@ -1693,11 +1959,18 @@ impl CommandTree {
             mix(node.commander as u64);
             mix(node.command_state as u64);
             mix(node.received_order.map_or(u64::MAX, |o| o.id as u64));
+            mix(node.objective.map_or(u64::MAX, intent_hash));
             if let Some(unit) = &node.unit {
                 mix(unit.formation as u64);
                 mix(unit.formation_origin.x as u32 as u64);
                 mix(unit.formation_origin.y as u32 as u64);
                 mix(unit.path.len() as u64);
+                mix(unit.path_final.x as u32 as u64);
+                mix(unit.path_final.y as u32 as u64);
+                for waypoint in &unit.path {
+                    mix(waypoint.x as u32 as u64);
+                    mix(waypoint.y as u32 as u64);
+                }
                 // スロットの並び（前後列の交代で変わる）も決定論の検証対象
                 for &id in &unit.soldiers {
                     mix(id as u64);
@@ -1720,6 +1993,81 @@ impl CommandTree {
         }
         h
     }
+}
+
+/// Unit の現在アンカーを経路上で 1 tick 分だけ進める。
+///
+/// 兵士の重心が遅れている場合はアンカーを減速し、目標スロットだけが部隊から
+/// 遠くへ逃げ続けるのを防ぐ。返り値は、この tick の開始時点で移動中だったか。
+fn advance_formation_anchor(unit: &mut Unit, centroid: Vec2Fx, soldiers: &Soldiers) -> bool {
+    if unit.path.is_empty() {
+        return false;
+    }
+    let moving = true;
+    let formation = formation_def(unit.formation);
+    let mut anchor_speed = FORMATION_ANCHOR_SPEED_MM_PER_S;
+    for &id in &unit.soldiers {
+        let Some(i) = soldiers.index_if_present(id) else {
+            continue;
+        };
+        match soldiers.hot.state[i] {
+            State::Charging if soldiers.hot.flags[i] & crate::soldiers::flags::MOUNTED != 0 => {
+                anchor_speed = anchor_speed.max(MOUNTED_CHARGE_ANCHOR_SPEED_MM_PER_S);
+            }
+            State::Charging => {
+                anchor_speed = anchor_speed.max(FOOT_CHARGE_ANCHOR_SPEED_MM_PER_S);
+            }
+            State::Advancing => {
+                anchor_speed = anchor_speed.max(ADVANCE_ANCHOR_SPEED_MM_PER_S);
+            }
+            _ => {}
+        }
+    }
+    let base_step = per_sec_to_per_tick(fx_from_mm(anchor_speed));
+    let mut remaining = sim_math::fx_scale_permille(base_step, formation.move_mult as i32);
+    let lag = dist(centroid, unit.formation_origin);
+    if lag >= fx_from_mm(ANCHOR_STOP_LAG_MM) {
+        remaining = 0;
+    } else if lag >= fx_from_mm(ANCHOR_SLOW_LAG_MM) {
+        remaining /= 2;
+    }
+
+    while remaining > 0 && !unit.path.is_empty() {
+        let waypoint = unit.path[0];
+        let delta = waypoint.sub(unit.formation_origin);
+        let distance = delta.len();
+        if distance <= remaining {
+            unit.formation_origin = waypoint;
+            unit.path.remove(0);
+            remaining -= distance;
+        } else {
+            unit.formation_origin = unit
+                .formation_origin
+                .add(delta.normalized().scale(remaining));
+            remaining = 0;
+        }
+    }
+    moving
+}
+
+/// 安定スロットを、決定論的な螺旋で円形区域へ割り当てる。
+///
+/// 半径は `sqrt(slot / (count - 1))` で増やすため、中心付近に過密にならず
+/// 円盤全体をほぼ均等に使う。角度は黄金角に近い値でずらし、全員が同じ列・
+/// 同じ方向へ動き出す見た目も避ける。
+fn area_slot_offset(stable_slot: u32, slot_count: u32, radius_m: u16, facing: Brad) -> Vec2Fx {
+    if stable_slot == 0 || slot_count <= 1 || radius_m == 0 {
+        return Vec2Fx::ZERO;
+    }
+    let ratio_million =
+        (stable_slot as u64).saturating_mul(1_000_000) / (slot_count.saturating_sub(1) as u64);
+    let radial_permille = sim_math::isqrt64(ratio_million) as i32;
+    let radius = sim_math::fx_scale_permille(fx(radius_m as i32), radial_permille);
+    let angle = facing.wrapping_add((stable_slot as u16).wrapping_mul(AREA_SPIRAL_STEP_BRAD));
+    Vec2Fx::new(
+        fx_mul(radius, sim_math::sin_fx(angle)),
+        fx_mul(radius, sim_math::cos_fx(angle)),
+    )
 }
 
 #[cfg(test)]
@@ -1917,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn formation_slots_are_deterministic_and_repack_after_death() {
+    fn formation_slots_stay_stable_after_death() {
         let mut soldiers = soldiers_at(&[(100, 100), (100, 101), (100, 102), (100, 103)]);
         let mut tree = CommandTree::new();
         let root = tree.add_node(None, 0, 0, 0, vec![], None);
@@ -1942,7 +2290,165 @@ mod tests {
         let before = goals[3];
         soldiers.hot.state[1] = State::Dead;
         tree.formation_goals(&mut soldiers, &mut goals, 1);
-        assert_ne!(before, goals[3]);
+        assert_eq!(before, goals[3]);
+        assert_eq!(soldiers.slot[3], 3);
+    }
+
+    #[test]
+    fn front_vacancy_is_filled_one_rank_per_interval() {
+        let mut soldiers = soldiers_at(&[
+            (100, 100),
+            (101, 100),
+            (100, 101),
+            (101, 101),
+            (100, 102),
+            (101, 102),
+        ]);
+        let mut tree = CommandTree::new();
+        let root = tree.add_node(None, 0, 0, 0, vec![], None);
+        let mut unit = leaf_unit((0..6).collect(), Vec2Fx::new(fx(100), fx(100)));
+        unit.ranks = 3;
+        let leaf = tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
+        soldiers.hot.state[0] = State::Dead;
+
+        tree.fill_front_vacancies(&soldiers, VACANCY_FILL_INTERVAL_TICKS);
+        let order = &tree.node(leaf).unwrap().unit.as_ref().unwrap().soldiers;
+        assert_eq!(order, &[2, 1, 0, 3, 4, 5]);
+
+        tree.fill_front_vacancies(&soldiers, VACANCY_FILL_INTERVAL_TICKS * 2);
+        let order = &tree.node(leaf).unwrap().unit.as_ref().unwrap().soldiers;
+        assert_eq!(order, &[2, 1, 4, 3, 0, 5]);
+    }
+
+    #[test]
+    fn movement_target_advances_anchor_gradually() {
+        let mut soldiers = soldiers_at(&[(50, 200)]);
+        let terrain = flat_terrain(400);
+        let mut tree = CommandTree::new();
+        let root = tree.add_node(None, 0, 0, 0, vec![], None);
+        let origin = Vec2Fx::new(fx(50), fx(200));
+        let leaf = tree.add_node(
+            Some(root),
+            1,
+            0,
+            0,
+            vec![],
+            Some(leaf_unit(vec![0], origin)),
+        );
+        let destination = Vec2Fx::new(fx(150), fx(200));
+        tree.set_movement_target(leaf, destination, &soldiers, &terrain);
+        tree.node_mut(leaf).unwrap().stats.centroid = origin;
+
+        let mut goals = vec![Vec2Fx::ZERO; 1];
+        tree.formation_goals(&mut soldiers, &mut goals, 0);
+        let unit = tree.node(leaf).unwrap().unit.as_ref().unwrap();
+        assert!(unit.formation_origin.x > origin.x);
+        assert!(unit.formation_origin.x < destination.x);
+        assert_eq!(unit.path_final, destination);
+    }
+
+    #[test]
+    fn marching_spacing_is_wider_than_formed_spacing() {
+        let mut soldiers = soldiers_at(&[(100, 100), (101, 100), (100, 101), (101, 101)]);
+        let mut tree = CommandTree::new();
+        let root = tree.add_node(None, 0, 0, 0, vec![], None);
+        let origin = Vec2Fx::new(fx(100), fx(100));
+        let mut unit = leaf_unit(vec![0, 1, 2, 3], origin);
+        unit.ranks = 2;
+        unit.file_spacing = fx_from_mm(800);
+        unit.rank_spacing = fx_from_mm(800);
+        unit.path = vec![Vec2Fx::new(fx(120), fx(100))];
+        unit.path_final = unit.path[0];
+        let leaf = tree.add_node(Some(root), 1, 0, 0, vec![], Some(unit));
+        tree.node_mut(leaf).unwrap().stats.centroid = origin;
+        let mut goals = vec![Vec2Fx::ZERO; 4];
+
+        tree.formation_goals(&mut soldiers, &mut goals, 0);
+        assert_eq!(dist(goals[0], goals[1]), fx_from_mm(900));
+        assert_eq!(dist(goals[0], goals[2]), fx_from_mm(1_100));
+
+        let unit = tree.node_mut(leaf).unwrap().unit.as_mut().unwrap();
+        unit.path.clear();
+        tree.formation_goals(&mut soldiers, &mut goals, 1);
+        assert_eq!(dist(goals[0], goals[1]), fx_from_mm(800));
+        assert_eq!(dist(goals[0], goals[2]), fx_from_mm(800));
+    }
+
+    #[test]
+    fn occupy_area_spreads_stable_slots_across_the_zone() {
+        let center = Vec2Fx::new(fx(100), fx(100));
+        let mut soldiers = soldiers_at(&[(100, 100); 9]);
+        let terrain = flat_terrain(400);
+        let mut tree = CommandTree::new();
+        let node = tree.add_node(
+            None,
+            0,
+            0,
+            0,
+            vec![],
+            Some(leaf_unit((0..9).collect(), center)),
+        );
+        tree.override_intent(
+            node,
+            Intent::OccupyArea {
+                center,
+                radius_m: 20,
+            },
+            &mut soldiers,
+            &terrain,
+            0,
+        );
+        let mut goals = vec![Vec2Fx::ZERO; soldiers.len()];
+        tree.formation_goals(&mut soldiers, &mut goals, 0);
+
+        assert_eq!(goals[0], center);
+        assert_ne!(goals[1], goals[2]);
+        assert!(goals
+            .iter()
+            .skip(1)
+            .all(|&goal| dist(center, goal) <= fx(20)));
+        assert!(goals.iter().skip(1).any(|&goal| goal.x < center.x));
+        assert!(goals.iter().skip(1).any(|&goal| goal.x > center.x));
+    }
+
+    #[test]
+    fn hunt_person_repaths_and_finishes_when_target_is_downed() {
+        let mut soldiers = soldiers_at(&[(50, 100), (100, 100)]);
+        soldiers.faction[1] = 1;
+        let terrain = flat_terrain(400);
+        let mut tree = CommandTree::new();
+        let node = tree.add_node(
+            None,
+            0,
+            0,
+            0,
+            vec![],
+            Some(leaf_unit(vec![0], soldiers.pos(0))),
+        );
+        tree.override_intent(
+            node,
+            Intent::HuntPerson { target: 1 },
+            &mut soldiers,
+            &terrain,
+            0,
+        );
+        assert_eq!(
+            tree.node(node).unwrap().unit.as_ref().unwrap().path_final,
+            Vec2Fx::new(fx(100), fx(100))
+        );
+
+        soldiers.set_pos(1, Vec2Fx::new(fx(130), fx(100)));
+        tree.tick(&mut soldiers, &terrain, 1);
+        assert_eq!(
+            tree.node(node).unwrap().unit.as_ref().unwrap().path_final,
+            Vec2Fx::new(fx(130), fx(100))
+        );
+
+        soldiers.hot.state[1] = State::Downed;
+        tree.tick(&mut soldiers, &terrain, 2);
+        let node = tree.node(node).unwrap();
+        assert!(node.objective.is_none());
+        assert!(node.unit.as_ref().unwrap().path.is_empty());
     }
 
     fn leaf_unit(soldiers: Vec<SoldierId>, origin: Vec2Fx) -> Unit {

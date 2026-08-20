@@ -105,6 +105,16 @@ export type OrderCommand =
   | { type: "issueShootAt"; node: number; targetNode: number; mode: number }
   | { type: "issueReserve"; node: number; xM: number; yM: number }
   | { type: "issuePursue"; node: number; targetNode: number; maxDistanceM: number }
+  | { type: "issueHuntPerson"; node: number; targetSoldier: number }
+  | { type: "issueOccupyArea"; node: number; xM: number; yM: number; radiusM: number }
+  | {
+      type: "issueGuardArea";
+      node: number;
+      xM: number;
+      yM: number;
+      radiusM: number;
+      interceptRadiusM: number;
+    }
   | {
       type: "queueBuildStructure";
       kind: number;

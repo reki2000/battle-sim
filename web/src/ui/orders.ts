@@ -21,7 +21,7 @@ import type { CommandNode } from "../render/command-overlay";
 import type { OrderCommand, ToWorker } from "../sim/protocol";
 import { t } from "../i18n";
 
-type PendingKind = "position" | "positionPair" | "targetNode";
+type PendingKind = "position" | "positionPair" | "targetNode" | "targetSoldier";
 
 interface PendingOrder {
   kind: PendingKind;
@@ -120,8 +120,12 @@ export class OrderPanel {
     this.renderHint();
   }
 
-  /** 地図（ワールド座標）クリック。位置指定待ちの命令があれば消化する。 */
-  handleMapClick(xM: number, yM: number): boolean {
+  /** 地図（ワールド座標）クリック。位置・人物指定待ちの命令があれば消化する。 */
+  handleMapClick(
+    xM: number,
+    yM: number,
+    soldier: { id: number; faction: number } | null = null,
+  ): boolean {
     if (!this.pending) return false;
     const own = this.nodeById(this.pending.node);
     if (this.pending.kind === "position") {
@@ -136,6 +140,14 @@ export class OrderPanel {
         this.clearPending();
       } else {
         this.renderHint();
+      }
+      return true;
+    }
+    if (this.pending.kind === "targetSoldier") {
+      // 空地や味方をクリックしても命令は確定せず、選択待ちを続ける。
+      if (soldier && soldier.faction !== own?.faction) {
+        this.dispatch(this.pending.make(soldier.id, own));
+        this.clearPending();
       }
       return true;
     }
@@ -187,6 +199,8 @@ export class OrderPanel {
     hint.textContent =
       this.pending.kind === "targetNode"
         ? t("pickTargetNode")
+        : this.pending.kind === "targetSoldier"
+          ? t("pickTargetSoldier")
         : this.pending.kind === "positionPair"
           ? `${t("pickPositionPair")} (${this.pointBuffer.length}/2)`
           : t("pickPosition");
@@ -334,6 +348,43 @@ export class OrderPanel {
         kind: "targetNode",
         node,
         make: (target) => ({ type: "issuePursue", node, targetNode: target as number, maxDistanceM: 60 }),
+      }),
+    );
+
+    btn("orderHuntPerson", () =>
+      this.startPending({
+        kind: "targetSoldier",
+        node,
+        make: (target) => ({ type: "issueHuntPerson", node, targetSoldier: target as number }),
+      }),
+    );
+
+    btn("orderOccupyArea", () =>
+      this.startPending({
+        kind: "position",
+        node,
+        make: (pts) => {
+          const p = (pts as { xM: number; yM: number }[])[0]!;
+          return { type: "issueOccupyArea", node, xM: p.xM, yM: p.yM, radiusM: 25 };
+        },
+      }),
+    );
+
+    btn("orderGuardArea", () =>
+      this.startPending({
+        kind: "position",
+        node,
+        make: (pts) => {
+          const p = (pts as { xM: number; yM: number }[])[0]!;
+          return {
+            type: "issueGuardArea",
+            node,
+            xM: p.xM,
+            yM: p.yM,
+            radiusM: 20,
+            interceptRadiusM: 14,
+          };
+        },
       }),
     );
 

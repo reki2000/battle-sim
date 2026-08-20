@@ -244,6 +244,21 @@ function applyCommand(
     case "issuePursue":
       world.issuePursue(msg.node, msg.targetNode, msg.maxDistanceM);
       break;
+    case "issueHuntPerson":
+      world.issueHuntPerson(msg.node, msg.targetSoldier);
+      break;
+    case "issueOccupyArea":
+      world.issueOccupyArea(msg.node, msg.xM, msg.yM, msg.radiusM);
+      break;
+    case "issueGuardArea":
+      world.issueGuardArea(
+        msg.node,
+        msg.xM,
+        msg.yM,
+        msg.radiusM,
+        msg.interceptRadiusM,
+      );
+      break;
     case "queueBuildStructure":
       world.queueBuildStructure(
         msg.kind,
@@ -289,6 +304,9 @@ const MUTATING_TYPES = new Set<ToWorker["type"]>([
   "issueShootAt",
   "issueReserve",
   "issuePursue",
+  "issueHuntPerson",
+  "issueOccupyArea",
+  "issueGuardArea",
   "queueBuildStructure",
   "setCommanderArchetype",
 ]);

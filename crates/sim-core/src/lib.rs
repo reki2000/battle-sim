@@ -20,6 +20,7 @@ pub mod organization;
 pub mod pathing;
 pub mod scenario;
 pub mod snapshot;
+pub mod soldier_ai;
 pub mod soldiers;
 pub mod spatial;
 pub mod structures;
@@ -32,6 +33,7 @@ use engineering::EngineeringSystem;
 use organization::CommandTree;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
 use sim_terrain::Terrain;
+use soldier_ai::SoldierAiSystem;
 use soldiers::{flags, Attrs, SoldierId, Soldiers, State};
 use spatial::{SpatialHash, MAX_NEIGHBORS};
 use structures::StructureSystem;
@@ -45,7 +47,8 @@ use structures::StructureSystem;
 /// でも結果が変わるので、それ以前の記録とは互換しない）。
 /// 兵士同士の当たり判定（歩容によるすり抜け・転倒）、死体の障害物化、
 /// 徒歩兵の助走突撃と移動疲労を入れたため 6 → 7。
-pub const SIM_VERSION: u32 = 7;
+/// 連続移動する隊列アンカー、安定スロット、兵士の局所迎撃判断を入れたため 7 → 8。
+pub const SIM_VERSION: u32 = 8;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -62,6 +65,11 @@ const STANDOFF_TOLERANCE_MM: i32 = 150;
 /// 間合いを詰める・取り直すときの足の速さ（mm/s）。摺り足で、走りはしない。
 const STANDOFF_STEP_MM_PER_S: i32 = 700;
 
+/// 歩行中に操舵段階で保とうとする味方との間隔。衝突判定の「通れる最小幅」
+/// とは別で、普段から人へぶつかって押し戻される動きを減らすための希望値。
+const MARCH_PREFERRED_CLEARANCE_MM: i32 = 900;
+const MARCH_SEPARATION_WEIGHT_MM: i32 = 650;
+
 /// シミュレーションのワールド。
 pub struct World {
     pub seed: u64,
@@ -77,6 +85,8 @@ pub struct World {
     pub cavalry: CavalrySystem,
     /// 徒歩兵の助走突撃・すり抜けの失敗による転倒・微視的な行動決定。
     pub charge: ChargeSystem,
+    /// 近隣の戦闘へ個人ごとのタイミングで反応する兵士 AI。
+    pub soldier_ai: SoldierAiSystem,
     /// 倒れた兵士が作る低い障害物（跨げるが時間がかかる）。
     pub corpses: CorpseField,
     /// M6 の野戦築城・地形改修の対象（杭列・堀・鹿砦・土塁・馬防柵・橋）。
@@ -124,6 +134,7 @@ impl World {
             combat: CombatSystem::default(),
             cavalry: CavalrySystem::default(),
             charge: ChargeSystem::default(),
+            soldier_ai: SoldierAiSystem::default(),
             corpses: CorpseField::default(),
             structures: StructureSystem::default(),
             engineering: EngineeringSystem::default(),
@@ -173,6 +184,7 @@ impl World {
         self.combat.register();
         self.cavalry.register();
         self.charge.register();
+        self.soldier_ai.register();
         self.engineering.register();
         if soldier_flags & flags::MOUNTED != 0 {
             self.combat.set_mounted(id, true);
@@ -406,6 +418,7 @@ impl World {
         );
         // 疲れた前列を後列と入れ替える。陣形スロットの並びを変えるので、
         // スロットから目標を配る `formation_goals` の直前に置く。
+        self.command.fill_front_vacancies(&self.soldiers, self.tick);
         self.command
             .rotate_tired_ranks(&self.soldiers, self.seed, self.tick);
         self.command
@@ -448,6 +461,15 @@ impl World {
             &mut self.structures,
             &mut self.terrain,
             &mut self.combat,
+            &mut self.goal,
+        );
+        // 部隊のスロットを基準にしながら、近くの敵へ反応した兵士だけが個別目標で
+        // 上書きする。徒歩突撃の助走判断はさらに局所的なので、この後に置く。
+        self.soldier_ai.tick(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &self.command,
             &mut self.goal,
         );
         // 兵士自身の判断（下がって助走をつける・離れた敵へ走り込む）は、
@@ -550,7 +572,10 @@ impl World {
                 // 到着した
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
-                if self.soldiers.hot.state[i] == State::Marching {
+                if matches!(
+                    self.soldiers.hot.state[i],
+                    State::Marching | State::Repositioning | State::Advancing
+                ) {
                     self.soldiers.hot.state[i] = State::Idle;
                 }
                 self.face_nearest_enemy_if_close(i);
@@ -558,7 +583,7 @@ impl World {
             }
 
             let desired_speed = self.desired_speed(i);
-            let dir = to_goal.normalized();
+            let dir = self.march_direction_with_separation(i, to_goal);
             let target = dir.scale(desired_speed);
 
             // 加速度で追従する
@@ -584,6 +609,57 @@ impl World {
             // 方向がずれる（衝突で横に押された等）と、白兵戦の弧判定を
             // 満たせないまま双方が固まってしまうため。
             self.face_nearest_enemy_if_close(i);
+        }
+    }
+
+    /// 目標方向に、近すぎる味方から離れる成分を足す。
+    ///
+    /// 物理衝突の押し戻しは「重なった後」の解決なので、それだけでは歩行者が常に
+    /// 肩をぶつけながら進む。こちらは重なる前の希望操舵で、密集陣形の最終位置は
+    /// 変えず、歩いている途中だけ空いた側へ少し進路を譲る。
+    fn march_direction_with_separation(&self, i: usize, to_goal: Vec2Fx) -> Vec2Fx {
+        let seek = to_goal.normalized();
+        if self.soldiers.hot.flags[i] & flags::MOUNTED != 0 {
+            return seek;
+        }
+        let pos = self.soldiers.pos(i);
+        let preferred = fx_from_mm(MARCH_PREFERRED_CLEARANCE_MM);
+        let preferred_sq = (preferred as i64) * (preferred as i64);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        let count = self.hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+        let mut separation = Vec2Fx::ZERO;
+        for &jid in &neighbors[..count] {
+            let j = jid as usize;
+            if j == i
+                || !self.soldiers.is_alive(j)
+                || self.soldiers.faction[j] != self.soldiers.faction[i]
+            {
+                continue;
+            }
+            let delta = pos.sub(self.soldiers.pos(j));
+            let d2 = delta.len_sq();
+            if d2 >= preferred_sq {
+                continue;
+            }
+            let (away, distance) = if d2 == 0 {
+                let angle = ((i as u32).wrapping_mul(2654435761) >> 16) as u16;
+                (
+                    Vec2Fx::new(sim_math::cos_fx(angle), sim_math::sin_fx(angle)),
+                    0,
+                )
+            } else {
+                let distance = sim_math::isqrt64(d2 as u64) as Fx;
+                (delta.scale(fx_div(FX_ONE, distance)), distance)
+            };
+            let weight = fx_div(preferred - distance, preferred);
+            separation = separation.add(away.scale(weight));
+        }
+        let separation_weight = fx_from_mm(MARCH_SEPARATION_WEIGHT_MM);
+        let combined = seek.add(separation.clamp_len(FX_ONE).scale(separation_weight));
+        if combined == Vec2Fx::ZERO {
+            seek
+        } else {
+            combined.normalized()
         }
     }
 
@@ -1010,6 +1086,7 @@ impl World {
         mix(self.combat.state_hash());
         mix(self.cavalry.state_hash());
         mix(self.charge.state_hash());
+        mix(self.soldier_ai.state_hash());
         mix(self.structures.state_hash());
         mix(self.engineering.state_hash());
         for i in 0..self.soldiers.len() {
@@ -1023,6 +1100,9 @@ impl World {
             mix(self.soldiers.hp[i] as u64);
             mix(self.soldiers.morale[i] as u64);
             mix(self.soldiers.fatigue[i] as u64);
+            mix(self.soldiers.target[i] as u64);
+            mix(self.soldiers.slot[i] as u64);
+            mix(self.soldiers.think_at[i] as u64);
         }
         h
     }

@@ -192,6 +192,9 @@ pub enum Intent {
     Reserve { rally_pos: Vec2Fx },     // 予備。投入命令を待つ
     Withdraw { to: Vec2Fx, fighting: bool },  // 戦闘退却か脱出か
     Pursue { target: NodeId, max_distance_m: u16 },
+    HuntPerson { target: SoldierId }, // 指揮官など特定個人を追跡
+    OccupyArea { center: Vec2Fx, radius_m: u16 },
+    GuardArea { center: Vec2Fx, radius_m: u16, intercept_radius_m: u16 },
     SeizeTerrain { area: AreaId },     // 高地・橋・渡渉点
     Feint { target: NodeId, break_at_range_m: u16 },  // 偽装退却
     ShootAt { target: NodeId, mode: ShootMode },      // Volley | AtWill | Hold
@@ -201,6 +204,12 @@ pub enum Intent {
 pub enum MoveSpeed { Cautious, Walk, Quick, Run }
 pub enum ApproachStyle { Deliberate, Aggressive, Cautious }
 ```
+
+`OccupyArea` / `GuardArea` は地点へ全員を重ねず、到着後に安定スロットを円盤状へ
+割り当てる。`GuardArea` の兵士は各持ち場を起点に `intercept_radius_m` 内の敵を
+個別に迎撃し、離れすぎれば持ち場へ戻る。`HuntPerson` は対象の移動に合わせて
+経路を更新するが、本人へ直接殺到する人数には上限を設け、残りは護衛や周辺の敵へ
+対応する。
 
 ### 3.2 伝達の物理
 
@@ -303,16 +312,19 @@ Unit の陣形は `formation_origin` と `formation_facing` から、各兵士�
 **目標位置（スロット）**を決定論的に計算する。
 
 ```
-rows = ceil(alive / files)
+files = ceil(slot_capacity / ranks)
 slot(i) -> (file, rank)
 local = ( (file - files/2) * file_spacing, rank * rank_spacing )
 world = origin + rotate(local, formation_facing)
 ```
 
-- スロット番号は生成時に固定。ただし**死者が出ると再割り当て**が起きる（`Repositioning`）。
-  前列が死ぬと後列が前に詰める。これが「厚みが持続力になる」の実装。
-- 再割り当ては瞬時ではなく、`discipline` に応じた遅延と、周囲の混雑で時間がかかる。
-  規律の低い部隊は穴が埋まらず、そこから崩れる。
+- スロット番号は生成時に固定し、死者を除いた全体再パックはしない。一人の死で
+  それ以降の全員が一斉に別位置へ向かうのを防ぐためである。
+- 前列に穴ができると、同じ file の直後にいる一人だけが一定間隔で前へ詰める。
+  空いたスロットは後方へ一段ずつ伝わり、瞬時に列全体を圧縮しない。これが
+  「厚みが持続力になる」と「個人が空きを見て進む」を両立させる。
+- 将来はこの局所再割り当ての遅延・成功率へ `discipline` と周囲の混雑を反映する。
+  規律の低い部隊は穴が埋まりにくく、そこから崩れる。
 - 兵科ごとにスロットの優先順位がある（重装が前、弓が後ろ）。
 
 ### 4.2 陣形変更
