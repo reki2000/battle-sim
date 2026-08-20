@@ -1231,9 +1231,8 @@ fn local_axis_right(facing: f32) -> Vec3 {
 
 fn effective_lod(requested: u8, visible: usize) -> u8 {
     match requested {
-        0 if visible > 3_000 => 2,
+        0 | 1 if visible > 3_000 => 2,
         0 if visible > 1_200 => 1,
-        1 if visible > 3_000 => 2,
         other => other,
     }
 }

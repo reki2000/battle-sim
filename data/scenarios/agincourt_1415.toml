@@ -33,7 +33,7 @@ thermal_iterations = 6
 road_count = 1
 sea = "none"
 
-# 生成後に焼き込む地勢（`sim_terrain::shaping`）。適用順に意味がある——
+# 生成後に焼き込む地勢（`web/src/terrain/shaping.ts`）。適用順に意味がある——
 # 耕地を敷き、泥濘の帯を重ね、最後に森を置く。
 [[terrain.shaping]]
 kind = "surface_rect"

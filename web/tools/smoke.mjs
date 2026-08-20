@@ -8,26 +8,21 @@
  *   npm run build && npm run preview &
  *   node tools/smoke.mjs
  */
-import { chromium } from "playwright";
-import { mkdirSync } from "node:fs";
+import {
+  collectPageErrors,
+  ensureSmokeOut,
+  launchBrowser,
+  smokeOut as OUT,
+  smokeUrl as URL,
+} from "./smoke-helpers.mjs";
 
-const URL = process.env.SMOKE_URL ?? "http://localhost:4173/";
-const OUT = process.env.SMOKE_OUT ?? "smoke-out";
-// CI（Playwright が自前で入れる）とサンドボックス（事前配置）の両方に対応する
-const EXEC = process.env.PLAYWRIGHT_CHROMIUM ?? undefined;
+ensureSmokeOut();
 
-mkdirSync(OUT, { recursive: true });
-
-const browser = await chromium.launch(EXEC ? { executablePath: EXEC } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
 const errors = [];
-page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
-page.on("console", (m) => {
-  if (m.type() === "error" && !m.text().includes("favicon")) {
-    errors.push(`console: ${m.text()}`);
-  }
-});
+collectPageErrors(page, errors);
 
 await page.goto(URL, { waitUntil: "networkidle" });
 await page.keyboard.press("3"); // 4x

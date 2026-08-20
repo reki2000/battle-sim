@@ -185,7 +185,7 @@ pub struct Armor {
     pub coverage_permille: u16,
     /// 0..=1000。防具の品質。
     pub quality_permille: u16,
-    /// 盾のブロック値。盾そのものは M5 以降で拡張する。
+    /// 盾による防御判定への加算値。
     pub shield_block: i16,
 }
 
@@ -1512,9 +1512,8 @@ fn type_factor(damage_type: DamageType, armor: ArmorClass) -> i32 {
         (DamageType::Pierce, ArmorClass::ClothLeather) => 900,
         (DamageType::Pierce, ArmorClass::Mail) => 650,
         (DamageType::Pierce, ArmorClass::Plate) => 300,
-        (DamageType::Blunt, ArmorClass::ClothLeather) => 700,
+        (DamageType::Blunt, ArmorClass::ClothLeather | ArmorClass::Plate) => 700,
         (DamageType::Blunt, ArmorClass::Mail) => 850,
-        (DamageType::Blunt, ArmorClass::Plate) => 700,
         (DamageType::Missile, ArmorClass::ClothLeather) => 900,
         (DamageType::Missile, ArmorClass::Mail) => 500,
         (DamageType::Missile, ArmorClass::Plate) => 250,

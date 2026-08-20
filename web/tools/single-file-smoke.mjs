@@ -12,14 +12,13 @@
  *   npm run build:single
  *   npm run smoke:single
  */
-import { chromium } from "playwright";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { launchBrowser } from "./smoke-helpers.mjs";
 
 const webRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const htmlPath = process.env.SINGLE_FILE ?? join(webRoot, "dist", "battle-sim.html");
-const EXEC = process.env.PLAYWRIGHT_CHROMIUM ?? undefined;
 
 if (!existsSync(htmlPath)) {
   console.error(`${htmlPath} がありません。先に npm run build:single を実行してください`);
@@ -38,7 +37,7 @@ if (external.length > 0) {
 }
 const sizeKb = Buffer.byteLength(html) / 1024;
 
-const browser = await chromium.launch(EXEC ? { executablePath: EXEC } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
 page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));

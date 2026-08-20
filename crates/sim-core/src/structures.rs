@@ -48,11 +48,9 @@ impl StructureKind {
     pub fn infantry_cohesion_mult_permille(self) -> u16 {
         use StructureKind::*;
         match self {
-            Stakes => 900,
+            Stakes | Rampart => 900,
             Ditch => 400, // 隊列維持 -60%
-            Abatis => 600,
-            Rampart => 900,
-            Palisade => 600,
+            Abatis | Palisade => 600,
             Pavise => 1000,
         }
     }
@@ -103,11 +101,10 @@ impl StructureKind {
     pub fn footprint_half_width_mm(self) -> i32 {
         use StructureKind::*;
         match self {
-            Stakes => 700,
+            Stakes | Palisade => 700,
             Ditch => 1_200,
             Abatis => 1_000,
             Rampart => 1_500,
-            Palisade => 700,
             Pavise => 600,
         }
     }

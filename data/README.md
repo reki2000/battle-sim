@@ -1,53 +1,51 @@
 # データファイル
 
-シミュレーションの数値はすべてここに置く。バランス調整に再コンパイルを要求しない
-（仕様 `docs/spec/00-overview.md` 非交渉事項 5）。
+`data/`は、バランス値と会戦プリセットをコードから分離するための領域です。
+最終的にはTOMLを検証・読込する`sim-data`を導入し、バランス調整に再コンパイルを
+要求しない構成を目指します。スキーマの目標は
+[データ形式仕様](../docs/spec/10-data-formats.md)、移行計画は[TODO](../TODO.md)を
+参照してください。
 
-スキーマは `docs/spec/10-data-formats.md` を参照。
+## 現在の扱い
 
-## 現状（M3）
+TOMLの実行時ローダーはまだありません。TOMLは人間が読む定義で、実行時にはRustや
+TypeScript側の写しを使います。値を変える場合は、下表の対応先も同時に更新してください。
 
-M3 では編成・陣形のプリセットを追加した。読み込み機構（`sim-data` クレート）は
-まだ未実装のため、シミュレーション実行時の既定値は Rust 側にも保持している。
-人物描画はRust/Wasmの状態保持型ポリゴンエンジンが担当する。`troop_type` は
-兵科別の配色・装備種別indexとしてスナップショットへ載せる。
+| データ | 現在の実行時の対応先 | 備考 |
+|---|---|---|
+| `formations.toml` | `crates/sim-core/src/organization.rs::formation_def` | 自動同期検査なし |
+| `factions/medieval_western.toml` | 指揮階層・兵科の参考定義 | 汎用ファクションローダーなし |
+| `scenarios/*.toml` | `crates/sim-core/src/scenario.rs`、`web/src/terrain/scenarios.ts` | 陣容と地形設定を手動同期 |
+| `terrain/*.bin` | `sim-terrain::fixture` | TypeScript生成器の固定出力。RustのテストとCLIが直接読む |
 
-| 仕様上のファイル | 現在の置き場所 |
-|---|---|
-| `terrain_surfaces.toml` | `crates/sim-terrain/src/lib.rs` の `SURFACE_EFFECTS` |
-| `qualities.toml` | `crates/sim-core/src/lib.rs` の `deploy_block` |
-| `formations.toml` | `crates/sim-core/src/organization.rs` の `formation_def` |
-| `factions/medieval_western.toml` | M3 のプリセットデータ |
-| `morale.toml` | `crates/sim-core/src/soldiers.rs` の初期士気 |
-| `scenarios/*.toml` | `crates/sim-core/src/scenario.rs` の会戦プリセット定数 |
+地形効果は`data/`ではなく`web/src/terrain/effects.ts`を編集元とし、
+`crates/sim-terrain/src/effects.rs`へ写しています。両者は
+`tools/check_terrain_effects.mjs`で検査します。
 
-M3（編成）で `sim-data` を追加し、以下を順に外へ出す。
+`terrain/*.bin`は次のコマンドで生成・検証します。生成器やシナリオ整形を変更した
+場合だけ再生成し、バイナリ差分をコミットしてください。
 
-```
-data/
-├── weapons.toml
-├── armor.toml
-├── shields.toml
-├── troop_types.toml
-├── formations.toml
-├── qualities.toml
-├── archetypes.toml
-├── ai_weights.toml
-├── morale.toml
-├── terrain_surfaces.toml
-├── engineer_tasks.toml
-├── factions/
-└── scenarios/
+```bash
+node tools/gen_terrain_fixtures.mjs
+node tools/gen_terrain_fixtures.mjs --check
 ```
 
-会戦プリセット（`scenarios/`）も同じ扱いで、TOML が人間の読む正本、実際に読まれる
-のは Rust 側の写し。数値を変えるときは両方を直す。解釈できる範囲は
-`docs/spec/10-data-formats.md` 10 節「実装済みの範囲」を参照。
+## まだコード内にあるデータ
+
+- 武器、防具、射撃、士気、騎兵、工兵のバランス値
+- 兵士品質と能力値分布
+- 指揮官アーキタイプとAI重み
+- 陣形の実行時定義
+- 会戦プリセットの陣容・指揮官・障害物
+
+これらは`sim-data`導入後に、単位と範囲を検証できるTOMLへ移します。移行中も固定小数点の
+決定論を保つため、倍率は1000分率、能力値は0〜255、長さ・時間・重量はフィールド名に
+`_mm`、`_ms`、`_g`などの単位を含めます。
 
 ## 規約
 
-- 倍率はすべて 1000 分率の整数（1000 = 等倍）。浮動小数点は書かない。
-- 長さは mm、時間は ms または s、重量は g。単位をフィールド名に含める
-  （`reach_mm`, `weight_g`, `reload_ms`）。
-- 能力値・性格は 0..=255。分布は `[平均, 標準偏差]` の 2 要素配列。
-- 追加した値は必ず仕様書の該当章の表にも反映する。
+- シミュレーションで読む数値に浮動小数点を使わない。
+- 倍率は1000分率（1000 = 等倍）。
+- 長さはmm、時間はmsまたはs、重量はgを基本とする。
+- 能力値・性格は0〜255。
+- データ追加時は、仕様書、実行時の写し、関連fixture・テストを同じ変更で更新する。

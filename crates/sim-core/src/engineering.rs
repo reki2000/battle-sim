@@ -12,9 +12,9 @@
 //!   `World::tick` 側で `command.formation_goals` の後に呼ぶ。
 //! - 天候・工具の倍率（仕様 1.2 節の `weather_mult` / `tool_mult`）は天候
 //!   システム・装備兵站がまだ存在しないため常に 1000‰ とする。
-//! - 攻城兵器の野戦運用（仕様 4 節）はこの PR には含めない。
-//! - 上位指揮官の `Objective` からのタスク自動生成（仕様 6 節の表）は M7 の
-//!   `Objective` が実装されてから配線する。ここでは `World` から明示的に
+//! - 攻城兵器の野戦運用（仕様 4 節）はまだ実装していない。
+//! - 上位指揮官の `Objective` からのタスク自動生成（仕様 6 節の表）は、
+//!   指揮官AIとまだ配線していない。ここでは `World` から明示的に
 //!   タスクを投入する API と、投入済みタスクへの単純なスコアリング割当て
 //!   （6 節の式から `tactical_value` を抜いたもの）を実装する。
 //! - パヴィス設置は `structures::StructureKind::Pavise` としてデータは
@@ -929,7 +929,7 @@ fn find_idle_engineer(
 }
 
 fn alloc_slot<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
-    if let Some(pos) = slots.iter().position(|s| s.is_none()) {
+    if let Some(pos) = slots.iter().position(Option::is_none) {
         slots[pos] = Some(value);
         pos as u32
     } else {

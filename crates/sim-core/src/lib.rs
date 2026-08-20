@@ -83,7 +83,7 @@ pub struct World {
     pub structures: StructureSystem,
     /// M6 の工兵：作業タスク・矢の補給・負傷者回収。
     pub engineering: EngineeringSystem,
-    /// 各兵士の目標位置。M2 で陣形スロットに置き換わる
+    /// 各兵士の現在の目標位置。陣形スロット、命令、局所行動がフェーズごとに更新する。
     goal: Vec<Vec2Fx>,
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
     push_x: Vec<Fx>,
@@ -190,8 +190,8 @@ impl World {
 
     /// 兵士の移動目標を設定する。
     ///
-    /// M3 以降は指揮系統から降りてくる命令が目標を決めるが、M0 では
-    /// テストとデモのために直接設定できるようにしておく。
+    /// 通常は指揮系統や局所行動が更新する。テストとサンドボックスでは、
+    /// 低水準の初期化手段として直接設定できる。
     pub fn set_goal(&mut self, id: SoldierId, goal: Vec2Fx) {
         let i = id as usize;
         if i < self.goal.len() {
@@ -508,9 +508,7 @@ impl World {
         }
     }
 
-    /// フェーズ 5（簡略版）: 目標に向かう操舵。
-    ///
-    /// M2 で陣形スロットへの seek + 分離 + 地形回避の合成に置き換わる。
+    /// フェーズ5: 陣形・命令・局所行動が決めた目標へ向かう操舵。
     fn steer(&mut self) {
         let n = self.soldiers.len();
         for i in 0..n {
@@ -1032,7 +1030,8 @@ impl World {
 
 /// テストとデモ用に、方陣を組んだ部隊を配置する。
 ///
-/// M3 で陣形システムに置き換わる。そのとき引数はシナリオ定義に置き換わる。
+/// これは兵士を追加する低水準ヘルパーで、指揮ツリーと陣形は別途構築する。
+/// 史実プリセットは[`scenario`]の定義から配置する。
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_block(
     world: &mut World,

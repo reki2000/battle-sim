@@ -152,8 +152,7 @@ impl Loadout {
         match self {
             Loadout::FootMenAtArms => Weapon::sword(),
             Loadout::PollaxeMenAtArms => Weapon::mace(),
-            Loadout::DismountedLancers => Weapon::spear(),
-            Loadout::Spearmen => Weapon::spear(),
+            Loadout::DismountedLancers | Loadout::Spearmen => Weapon::spear(),
             Loadout::Pikemen => Weapon::pike(),
             Loadout::Longbowmen => Weapon::longbow(),
             Loadout::Crossbowmen => Weapon::crossbow(),

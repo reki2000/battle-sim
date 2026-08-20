@@ -197,11 +197,11 @@ pub fn work_mult_permille(ground: Ground, vegetation: Vegetation, depth_cm: u16)
 mod tests {
     use super::*;
 
-    /// 移行前の統合 `Surface` 16 種の効果値が、新しい 4 軸の合成から
+    /// 4軸化した時点で固定した代表16ケースの効果値が、現在の合成から
     /// **そのまま再現される**ことを確かめる。ここが崩れると、同じ地形で
     /// 兵の動きだけが変わってしまう。
     #[test]
-    fn composition_reproduces_the_legacy_surface_table() {
+    fn composition_matches_the_reference_surface_cases() {
         let cases: &[(&str, Ground, Vegetation, u16, Overlay, TerrainEffect)] = &[
             (
                 "Grass",
@@ -336,7 +336,7 @@ mod tests {
             assert_eq!(
                 compose_effect(*g, *v, *depth, *o),
                 *expected,
-                "{name} の効果が移行前と違う"
+                "{name} の効果が基準値と違う"
             );
         }
     }

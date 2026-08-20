@@ -201,8 +201,8 @@ pub struct BattleSiteCandidate {
 /// 生成器から受け取る素のグリッド一式。
 ///
 /// 導出グリッド（傾斜・通行コスト）は含まない——[`Terrain::from_grids`] が
-/// 効果テーブルから計算する。効果値の正本はこちら側にあるので、
-/// 生成器が計算した通行コストを信用してはいけない。
+/// 効果テーブルから計算する。実行時の判定は Rust 側のテーブルを使うため、
+/// 生成器が計算した通行コストをそのまま信用してはいけない。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerrainGrids {
     pub dim: u32,

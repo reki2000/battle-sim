@@ -1,4 +1,5 @@
-# M3 中世プリセット。倍率は 1000 分率。
+# 中世の陣形プリセット。倍率は 1000 分率。
+# 実行時ローダーはまだ無いため、organization::formation_def と手動同期する。
 
 [[formation]]
 id = "line"

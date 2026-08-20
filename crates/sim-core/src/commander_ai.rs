@@ -620,8 +620,7 @@ fn choose_objective(
     );
     let switch_margin = (255 - attrs.flexibility as i32) * 2;
     let should_switch = match (node.strategic_objective, current_score) {
-        (None, _) => true,
-        (Some(_), None) => true,
+        (None, _) | (Some(_), None) => true,
         (Some(_), Some(cur)) => target_gone || best.score > cur + switch_margin,
     };
     if !should_switch {
@@ -947,8 +946,7 @@ fn choose_battle_plan(
     });
     let switch_margin = (255 - node.commander_attrs.flexibility as i32) * 2;
     let should_switch = match (node.battle_plan, current_score) {
-        (None, _) => true,
-        (Some(_), None) => true,
+        (None, _) | (Some(_), None) => true,
         (Some(_), Some(cur)) => best.score > cur + switch_margin,
     };
     if !should_switch {

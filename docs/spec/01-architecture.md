@@ -1,5 +1,9 @@
 # 01. システムアーキテクチャ
 
+> この文書は目標アーキテクチャを示す。`sim-data`、SharedArrayBuffer、wasm threads
+> など未実装の要素も含む。現在の構成は[README](../../README.md)、移行計画は
+> [TODO](../../TODO.md)を参照すること。
+
 ## 1. 全体構成
 
 ```

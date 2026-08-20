@@ -1,31 +1,27 @@
 /**
- * M8（UI と体験）の疎通確認。
+ * UI と操作体験の疎通確認。
  *
  * 憑依 → 命令発行（伝令の可視化）、兵士の選択 → 追従、観戦モード、
  * リプレイの保存・読み込み → hash 一致、をヘッドレスブラウザで一通り操作する。
  *
  *   npm run build && npm run preview &
- *   node tools/m8-smoke.mjs
+ *   npm run smoke:ui
  */
-import { chromium } from "playwright";
-import { mkdirSync } from "node:fs";
+import {
+  collectPageErrors,
+  ensureSmokeOut,
+  launchBrowser,
+  smokeOut as OUT,
+  smokeUrl as URL,
+} from "./smoke-helpers.mjs";
 
-const URL = process.env.SMOKE_URL ?? "http://localhost:4173/";
-const OUT = process.env.SMOKE_OUT ?? "smoke-out";
-const EXEC = process.env.PLAYWRIGHT_CHROMIUM ?? undefined;
+ensureSmokeOut();
 
-mkdirSync(OUT, { recursive: true });
-
-const browser = await chromium.launch(EXEC ? { executablePath: EXEC } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 
 const errors = [];
-page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
-page.on("console", (m) => {
-  if (m.type() === "error" && !m.text().includes("favicon")) {
-    errors.push(`console: ${m.text()}`);
-  }
-});
+collectPageErrors(page, errors);
 
 function fail(msg) {
   errors.push(msg);
@@ -110,4 +106,4 @@ if (errors.length) {
   console.error("\nNG:\n" + errors.join("\n"));
   process.exit(1);
 }
-console.log("\nOK: M8 の憑依・追従・観戦・リプレイが一通り動作");
+console.log("\nOK: 憑依・追従・観戦・リプレイが一通り動作");

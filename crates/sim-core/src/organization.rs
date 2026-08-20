@@ -440,8 +440,8 @@ pub struct TerrainNote {
 
 /// 指揮官が「自分が知っていることだけ」で判断するための情報源。仕様 05 章 5.1 節。
 ///
-/// `own_forces` と `terrain_notes` はこの PR では埋めない（本文冒頭のスコープ
-/// 注記を参照）。自軍の戦力は `NodeStats` から直接読める前提で扱う。
+/// `own_forces` と `terrain_notes` は現行実装では埋めない。自軍の戦力は
+/// `NodeStats`から直接読める前提で扱う。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Blackboard {
     pub own_forces: Vec<KnownForce>,
@@ -450,7 +450,7 @@ pub struct Blackboard {
     pub last_updated: u32,
 }
 
-/// 戦況評価。仕様 05 章 5.2 節。`critical_points` は本 PR のスコープ外（本文参照）。
+/// 戦況評価。仕様05章5.2節。`critical_points`はまだ未実装。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SituationAssessment {
     /// 自軍 ÷ 敵軍を 1000 分率で表す（1000 = 互角）。

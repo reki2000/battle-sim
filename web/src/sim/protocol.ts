@@ -85,7 +85,7 @@ export interface ScenarioInfo {
 
 /**
  * 憑依 UI から発行できる命令。仕様 05 章 4 節 / 08 章 9 節「命令 UI 全種」。
- * 「条件付き」命令は仕様側にもまだ具体的な構造がなく、この PR のスコープ外
+ * 「条件付き」命令は仕様側にもまだ具体的な構造がなく、現行実装の対象外
  * （`web/src/ui/orders.ts` 冒頭のスコープ注記を参照）。
  */
 export type OrderCommand =

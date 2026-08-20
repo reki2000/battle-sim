@@ -9,27 +9,24 @@
  *   npm run build && npx vite preview --port 4173 &
  *   node tools/scenario-smoke.mjs
  */
-import { chromium } from "playwright";
-import { mkdirSync } from "node:fs";
+import {
+  collectPageErrors,
+  ensureSmokeOut,
+  launchBrowser,
+  smokeOut as OUT,
+  smokeUrl as URL,
+} from "./smoke-helpers.mjs";
 
-const URL = process.env.SMOKE_URL ?? "http://localhost:4173/";
-const OUT = process.env.SMOKE_OUT ?? "smoke-out";
-const EXEC = process.env.PLAYWRIGHT_CHROMIUM ?? undefined;
 /** 起動時に URL から指定するプリセット（`?scenario=` の経路も確認する）。 */
 const FIRST = process.env.SMOKE_SCENARIO ?? "agincourt_1415";
 
-mkdirSync(OUT, { recursive: true });
+ensureSmokeOut();
 
-const browser = await chromium.launch(EXEC ? { executablePath: EXEC } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
 const errors = [];
-page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
-page.on("console", (m) => {
-  if (m.type() === "error" && !m.text().includes("favicon")) {
-    errors.push(`console: ${m.text()}`);
-  }
-});
+collectPageErrors(page, errors);
 
 const hud = async () => (await page.textContent("#hud")) ?? "";
 const tick = async () => Number(/tick (\d+)/.exec(await hud())?.[1] ?? -1);

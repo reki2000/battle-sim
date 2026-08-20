@@ -12,6 +12,9 @@
     "wasm": "wasm-pack build ../crates/sim-wasm --target web --out-dir ../../web/src/wasm --out-name sim",
     "smoke": "node tools/smoke.mjs",
     "smoke:scenario": "node tools/scenario-smoke.mjs",
+    "smoke:ui": "node tools/ui-smoke.mjs",
+    "smoke:performance": "node tools/performance-smoke.mjs",
+    "smoke:cache": "node tools/terrain-cache-smoke.mjs",
     "smoke:single": "node tools/single-file-smoke.mjs"
   },
   "devDependencies": {

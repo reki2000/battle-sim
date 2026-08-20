@@ -348,11 +348,9 @@ mod tests {
     }
 
     /// 助走を積ませて実際に助走距離ぶんモメンタムを持たせる。
-    fn spin_up_momentum(cavalry: &mut CavalrySystem, soldiers: &mut Soldiers, i: usize) {
+    fn spin_up_momentum(cavalry: &mut CavalrySystem, soldiers: &Soldiers, i: usize) {
         cavalry.ensure_len(soldiers.len());
         cavalry.charge_run_mm[i] = CHARGE_FULL_DISTANCE_MM;
-        let _ = i;
-        let _ = soldiers;
     }
 
     #[test]
@@ -389,7 +387,7 @@ mod tests {
                 combat.set_loadout(1 + k as u32, Weapon::pike(), Armor::mail());
             }
             let mut cavalry = CavalrySystem::default();
-            spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+            spin_up_momentum(&mut cavalry, &soldiers, rider as usize);
             set_charging(&mut soldiers, rider as usize, 400);
 
             let mut hash = SpatialHash::default();
@@ -448,7 +446,7 @@ mod tests {
             structures.set_completion(stakes, 1000);
 
             let mut cavalry = CavalrySystem::default();
-            spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+            spin_up_momentum(&mut cavalry, &soldiers, rider as usize);
             set_charging(&mut soldiers, rider as usize, 400);
 
             let mut hash = SpatialHash::default();
@@ -502,7 +500,7 @@ mod tests {
         let hp_before = structures.get(stakes).unwrap().hp;
 
         let mut cavalry = CavalrySystem::default();
-        spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+        spin_up_momentum(&mut cavalry, &soldiers, rider as usize);
         set_charging(&mut soldiers, rider as usize, 400);
 
         let mut hash = SpatialHash::default();
@@ -532,7 +530,7 @@ mod tests {
                 // このテストでは「踏み抜いたときに実害が出るか」だけを見たいので、
                 // 再突撃させて次の機会を待つ。
                 set_charging(&mut soldiers, rider as usize, 400);
-                spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+                spin_up_momentum(&mut cavalry, &soldiers, rider as usize);
             }
         }
         assert!(breached, "杭を踏み抜いても馬にも杭にも実害が出ていない");
@@ -570,7 +568,7 @@ mod tests {
         combat.register();
 
         let mut cavalry = CavalrySystem::default();
-        spin_up_momentum(&mut cavalry, &mut soldiers, rider as usize);
+        spin_up_momentum(&mut cavalry, &soldiers, rider as usize);
         set_charging(&mut soldiers, rider as usize, 400);
 
         let mut hash = SpatialHash::default();

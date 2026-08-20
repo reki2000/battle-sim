@@ -10,7 +10,6 @@
 
 use sim_core::organization::{ApproachStyle, Intent, MoveSpeed, Priority, ShootMode, Side, Unit};
 use sim_core::snapshot::RenderSnapshot;
-use sim_core::soldiers::Attrs;
 use sim_core::structures::StructureKind;
 use sim_core::World as CoreWorld;
 use sim_math::{fx, fx_from_mm, Vec2Fx};
@@ -267,7 +266,7 @@ impl World {
         (self.inner.state_hash() >> 32) as u32
     }
 
-    // ── 配置（M3 でシナリオ読み込みに置き換わる） ──────────
+    // ── サンドボックス配置 ──────────────────────────────
 
     /// 方陣を組んだ部隊を配置する。
     #[wasm_bindgen(js_name = deployBlock)]
@@ -297,35 +296,10 @@ impl World {
         );
     }
 
-    /// 1 体だけ追加する（デバッグ用）。
-    #[wasm_bindgen(js_name = spawnOne)]
-    pub fn spawn_one(&mut self, x_m: i32, y_m: i32, faction: u8, unit_id: u16) -> u32 {
-        self.inner.spawn(
-            Vec2Fx::new(fx(x_m), fx(y_m)),
-            0,
-            unit_id,
-            faction,
-            Attrs::default(),
-            0,
-        )
-    }
-
-    /// 騎乗した兵士を 1 体追加する（M5、デバッグ用）。
-    #[wasm_bindgen(js_name = spawnCavalryOne)]
-    pub fn spawn_cavalry_one(&mut self, x_m: i32, y_m: i32, faction: u8, unit_id: u16) -> u32 {
-        self.inner.spawn(
-            Vec2Fx::new(fx(x_m), fx(y_m)),
-            0,
-            unit_id,
-            faction,
-            Attrs::default(),
-            sim_core::soldiers::flags::MOUNTED,
-        )
-    }
-
     /// ある陣営の全兵士に移動目標を与える。
     ///
-    /// M3 で指揮系統を通す命令 API（`pushOrder`）に置き換わる。
+    /// 指揮ツリーを組む前のサンドボックス配置と、既存リプレイの再生にだけ使う。
+    /// 通常の UI 命令は `issueMoveTo` を通して指揮系統へ投入する。
     #[wasm_bindgen(js_name = setFactionGoal)]
     pub fn set_faction_goal(&mut self, faction: u8, x_m: i32, y_m: i32) {
         let goal = Vec2Fx::new(fx(x_m), fx(y_m));
@@ -1144,17 +1118,20 @@ mod tests {
                 ]
             })
             .collect();
+        let Terrain {
+            dim,
+            cell_m,
+            height,
+            ground,
+            vegetation,
+            overlay,
+            water,
+            water_kind,
+            moisture,
+            ..
+        } = t;
         World::from_scenario_terrain(
-            index,
-            t.dim,
-            t.cell_m,
-            t.height.clone(),
-            t.ground.clone(),
-            t.vegetation.clone(),
-            t.overlay.clone(),
-            t.water.clone(),
-            t.water_kind.clone(),
-            t.moisture.clone(),
+            index, dim, cell_m, height, ground, vegetation, overlay, water, water_kind, moisture,
             sites,
         )
     }

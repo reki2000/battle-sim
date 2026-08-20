@@ -1,5 +1,5 @@
 /**
- * M9 の性能確認。50,000 体シナリオ（`?soldiers=50000`）を全ズーム域で
+ * 50,000 体シナリオ（`?soldiers=50000`）の性能疎通確認。全ズーム域で
  * 開き、エラーなく描け、tick が進み続けることを確認する。
  *
  * この環境（ヘッドレス・ソフトウェアレンダリング Chromium）の fps 絶対値は
@@ -8,17 +8,19 @@
  * 3 MB 以下であること」で行う。
  *
  *   npm run build && npm run preview &
- *   node tools/m9-perf.mjs
+ *   npm run smoke:performance
  */
-import { chromium } from "playwright";
-import { mkdirSync, statSync, readdirSync } from "node:fs";
+import { statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import {
+  collectPageErrors,
+  ensureSmokeOut,
+  launchBrowser,
+  smokeOut as OUT,
+  smokeUrl as URL,
+} from "./smoke-helpers.mjs";
 
-const URL = process.env.SMOKE_URL ?? "http://localhost:4173/";
-const OUT = process.env.SMOKE_OUT ?? "smoke-out";
-const EXEC = process.env.PLAYWRIGHT_CHROMIUM ?? undefined;
-
-mkdirSync(OUT, { recursive: true });
+ensureSmokeOut();
 
 // ── 初期ロードサイズ（M9 受け入れ条件: 3 MB 以下） ─────────────
 //
@@ -44,15 +46,10 @@ if (distBytes > 3 * 1024 * 1024) {
   errors.push(`初期ロードが 3 MB を超えている: ${(distBytes / 1024 / 1024).toFixed(2)} MB`);
 }
 
-const browser = await chromium.launch(EXEC ? { executablePath: EXEC } : {});
+const browser = await launchBrowser();
 const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
-page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
-page.on("console", (m) => {
-  if (m.type() === "error" && !m.text().includes("favicon")) {
-    errors.push(`console: ${m.text()}`);
-  }
-});
+collectPageErrors(page, errors);
 
 await page.goto(`${URL}?soldiers=50000`, { waitUntil: "networkidle" });
 await page.keyboard.press("3"); // 4x
@@ -86,7 +83,7 @@ for (const [key, name] of views) {
   }
   const hud = (await page.textContent("#hud")) ?? "";
   console.log(`${name.padEnd(6)} ${hud.replace(/\n/g, " | ")}`);
-  await page.screenshot({ path: `${OUT}/m9-${name}.png` });
+  await page.screenshot({ path: `${OUT}/performance-${name}.png` });
 
   const tick = Number(/tick (\d+)/.exec(hud)?.[1] ?? -1);
   if (tick <= lastTick) {
@@ -94,10 +91,11 @@ for (const [key, name] of views) {
   }
   lastTick = tick;
 
-  const soldierMatch = /兵士 (\d+)（描画 (\d+)）/.exec(hud);
+  const soldierMatch =
+    /兵士 (\d+)（画面内 (\d+) \/ 描画 (\d+) \/ カリング (\d+)）/.exec(hud);
   if (soldierMatch) {
-    const [, total, drawn] = soldierMatch;
-    console.log(`  兵士 ${total} 体中 ${drawn} 体を描画`);
+    const [, total, visible, drawn, culled] = soldierMatch;
+    console.log(`  兵士 ${total} 体中、画面内 ${visible} / 描画 ${drawn} / カリング ${culled}`);
   }
 }
 
