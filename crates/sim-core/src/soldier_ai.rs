@@ -46,17 +46,23 @@ pub struct SoldierAiStats {
     pub disengages: u32,
 }
 
-/// per-soldier の局所判断状態。認識用索引と負荷配列は導出キャッシュなので、
-/// 決定論ハッシュには行動・対象・継続期限だけを含める。
+/// per-soldier の局所判断状態。認識用索引・任務ポリシー・負荷配列は導出キャッシュ。
+/// 行動・対象・継続期限に加え、受理済み陣形目標と次回更新 tick は決定論ハッシュへ
+/// 含める。
 #[derive(Debug, Default)]
 pub struct SoldierAiSystem {
     action: Vec<IndividualAction>,
     focus: Vec<SoldierId>,
     commit_until: Vec<u32>,
+    /// 指揮系統から最後に受理した陣形目標。隊長の目標が毎 tick 動いても、
+    /// 兵士は自分の反応周期でここへ取り込むため、全員が同時に歩き出さない。
+    accepted_formation_goal: Vec<Vec2Fx>,
+    next_formation_sample: Vec<u32>,
     awareness: Option<CoarseIndex>,
     reaction_radius_mm: Vec<i32>,
     disengage_radius_mm: Vec<i32>,
     ordered_focus: Vec<SoldierId>,
+    commanded: Vec<bool>,
     target_load: Vec<u16>,
     pub stats: SoldierAiStats,
 }
@@ -66,10 +72,13 @@ impl SoldierAiSystem {
         self.action.push(IndividualAction::FollowOrder);
         self.focus.push(NO_ID);
         self.commit_until.push(0);
+        self.accepted_formation_goal.push(Vec2Fx::ZERO);
+        self.next_formation_sample.push(u32::MAX);
         self.reaction_radius_mm.push(DEFAULT_REACTION_RADIUS_MM);
         self.disengage_radius_mm
             .push(DEFAULT_REACTION_RADIUS_MM + DISENGAGE_MARGIN_MM);
         self.ordered_focus.push(NO_ID);
+        self.commanded.push(false);
         self.target_load.push(0);
     }
 
@@ -81,7 +90,10 @@ impl SoldierAiSystem {
             .resize(len, DEFAULT_REACTION_RADIUS_MM);
         self.disengage_radius_mm
             .resize(len, DEFAULT_REACTION_RADIUS_MM + DISENGAGE_MARGIN_MM);
+        self.accepted_formation_goal.resize(len, Vec2Fx::ZERO);
+        self.next_formation_sample.resize(len, u32::MAX);
         self.ordered_focus.resize(len, NO_ID);
+        self.commanded.resize(len, false);
         self.target_load.resize(len, 0);
     }
 
@@ -113,6 +125,7 @@ impl SoldierAiSystem {
         let n = soldiers.len().min(goals.len());
         self.ensure_len(n);
         self.assign_mission_policy(command, n);
+        self.latch_formation_goals(tick, soldiers, goals, n);
 
         if self.awareness.is_none() || tick % AWARENESS_REBUILD_TICKS == 0 {
             self.awareness = Some(CoarseIndex::build(AWARENESS_CELL_M, soldiers));
@@ -266,6 +279,7 @@ impl SoldierAiSystem {
         self.reaction_radius_mm[..n].fill(DEFAULT_REACTION_RADIUS_MM);
         self.disengage_radius_mm[..n].fill(DEFAULT_REACTION_RADIUS_MM + DISENGAGE_MARGIN_MM);
         self.ordered_focus[..n].fill(NO_ID);
+        self.commanded[..n].fill(false);
         for node in &command.nodes {
             let Some(unit) = &node.unit else {
                 continue;
@@ -341,7 +355,47 @@ impl SoldierAiSystem {
                 if let Some(slot) = self.ordered_focus.get_mut(id as usize) {
                     *slot = ordered_focus;
                 }
+                if let Some(slot) = self.commanded.get_mut(id as usize) {
+                    *slot = true;
+                }
             }
+        }
+    }
+
+    /// 隊列アンカーが作った最新目標を、兵士ごとの反応周期で受理する。
+    ///
+    /// `formation_goals` は毎 tick 全員ぶんを更新するが、ここでいったん個人の
+    /// 受理済み目標へラッチする。初回更新の位相を ID から散らすことで、命令が
+    /// 届いた瞬間に全員が同時発進する代わりに、短い時間幅の中で順次動き出す。
+    fn latch_formation_goals(
+        &mut self,
+        tick: u32,
+        soldiers: &Soldiers,
+        goals: &mut [Vec2Fx],
+        n: usize,
+    ) {
+        for (i, goal) in goals.iter_mut().take(n).enumerate() {
+            let raw_goal = *goal;
+            let interval = formation_goal_interval(soldiers, i);
+            if self.next_formation_sample[i] == u32::MAX {
+                self.accepted_formation_goal[i] = raw_goal;
+                let phase = formation_goal_phase(i as SoldierId, interval);
+                self.next_formation_sample[i] = tick.saturating_add(phase);
+            } else {
+                // 工兵タスクは作業地点・補給先・負傷者へ直接向かう必要がある。
+                // また、指揮系統に属さないテスト／サンドボックス兵は、局所迎撃中に
+                // 前 tick の迎撃目標を「新しい命令」と誤認して取り込まない。
+                let immediate = soldiers.hot.flags[i] & flags::ENGINEER != 0
+                    || soldiers.hot.state[i] == State::Working;
+                let may_sample = self.commanded[i]
+                    || self.action[i] == IndividualAction::FollowOrder
+                    || immediate;
+                if may_sample && (immediate || tick >= self.next_formation_sample[i]) {
+                    self.accepted_formation_goal[i] = raw_goal;
+                    self.next_formation_sample[i] = tick.saturating_add(interval);
+                }
+            }
+            *goal = self.accepted_formation_goal[i];
         }
     }
 
@@ -399,9 +453,34 @@ impl SoldierAiSystem {
             h = h.wrapping_mul(0x0100_0000_01b3);
             h ^= self.commit_until[i] as u64;
             h = h.wrapping_mul(0x0100_0000_01b3);
+            h ^= self.accepted_formation_goal[i].x as u32 as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            h ^= self.accepted_formation_goal[i].y as u32 as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            h ^= self.next_formation_sample[i] as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
         }
         h
     }
+}
+
+/// 陣形目標を見直す周期。反射と規律が高いほど短く、疲労・低士気で長くなる。
+/// 4〜22 tick（0.2〜1.1 秒）の範囲なので、命令伝達そのものの遅延に比べれば短いが、
+/// 一斉発進を崩すには十分な個人差になる。
+fn formation_goal_interval(soldiers: &Soldiers, i: usize) -> u32 {
+    let attrs = soldiers.attrs[i];
+    let response = (attrs.reflex as u32 + attrs.discipline as u32) / 2;
+    let base = 4 + (255u32.saturating_sub(response) * 12 / 255);
+    let fatigue_delay = soldiers.fatigue[i] as u32 / 2_500;
+    let morale_delay = if soldiers.morale[i] < 300 { 2 } else { 0 };
+    (base + fatigue_delay + morale_delay).clamp(4, 22)
+}
+
+/// 連番 ID がそのまま前から後ろへの波にならないよう乗法ハッシュで位相を散らす。
+fn formation_goal_phase(id: SoldierId, interval: u32) -> u32 {
+    let mixed = id.wrapping_mul(2_654_435_761) ^ id.rotate_left(13);
+    let mixed = mixed ^ (mixed >> 16);
+    1 + mixed % interval.max(1)
 }
 
 fn can_choose_local_action(soldiers: &Soldiers, i: usize) -> bool {
@@ -444,6 +523,66 @@ mod tests {
 
     fn eager_attrs() -> Attrs {
         Attrs::new(160, 160, 160, 160, 255, 160, 255, 220, 255, 0, 160, 200)
+    }
+
+    #[test]
+    fn formation_goal_acceptance_is_staggered_between_soldiers() {
+        let mut soldiers = Soldiers::default();
+        for i in 0..8 {
+            soldiers.push(fx(100), fx(100 + i), 0, 0, 0, Attrs::default(), 0);
+        }
+        let mut ai = SoldierAiSystem::default();
+        for _ in 0..soldiers.len() {
+            ai.register();
+        }
+        let command = CommandTree::new();
+        let initial: Vec<_> = (0..soldiers.len()).map(|i| soldiers.pos(i)).collect();
+        let ordered: Vec<_> = initial
+            .iter()
+            .map(|p| p.add(Vec2Fx::new(fx(20), 0)))
+            .collect();
+        let mut goals = initial.clone();
+        ai.tick(31, 0, &mut soldiers, &command, &mut goals);
+
+        goals.clone_from(&ordered);
+        ai.tick(31, 1, &mut soldiers, &command, &mut goals);
+        let first_wave = goals
+            .iter()
+            .zip(&ordered)
+            .filter(|(accepted, ordered)| accepted == ordered)
+            .count();
+        assert!(first_wave > 0);
+        assert!(first_wave < soldiers.len());
+
+        for tick in 2..=22 {
+            goals.clone_from(&ordered);
+            ai.tick(31, tick, &mut soldiers, &command, &mut goals);
+        }
+        assert_eq!(goals, ordered);
+    }
+
+    #[test]
+    fn alert_disciplined_soldiers_refresh_formation_goals_faster() {
+        let mut soldiers = Soldiers::default();
+        soldiers.push(fx(100), fx(100), 0, 0, 0, Attrs::default(), 0);
+        soldiers.push(fx(101), fx(100), 0, 0, 0, eager_attrs(), 0);
+        assert!(formation_goal_interval(&soldiers, 1) < formation_goal_interval(&soldiers, 0));
+    }
+
+    #[test]
+    fn engineer_task_goals_bypass_formation_response_delay() {
+        let mut soldiers = Soldiers::default();
+        let engineer = soldiers.push(fx(100), fx(100), 0, 0, 0, Attrs::default(), flags::ENGINEER);
+        let mut ai = SoldierAiSystem::default();
+        ai.register();
+        let command = CommandTree::new();
+        let mut goals = vec![soldiers.pos(engineer as usize)];
+        ai.tick(37, 0, &mut soldiers, &command, &mut goals);
+
+        let task_goal = Vec2Fx::new(fx(130), fx(100));
+        goals[engineer as usize] = task_goal;
+        ai.tick(37, 1, &mut soldiers, &command, &mut goals);
+        assert_eq!(goals[engineer as usize], task_goal);
     }
 
     #[test]

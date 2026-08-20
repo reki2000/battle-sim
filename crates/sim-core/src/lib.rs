@@ -48,7 +48,7 @@ use structures::StructureSystem;
 /// 兵士同士の当たり判定（歩容によるすり抜け・転倒）、死体の障害物化、
 /// 徒歩兵の助走突撃と移動疲労を入れたため 6 → 7。
 /// 連続移動する隊列アンカー、安定スロット、兵士の局所迎撃判断を入れたため 7 → 8。
-pub const SIM_VERSION: u32 = 8;
+pub const SIM_VERSION: u32 = 9;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
