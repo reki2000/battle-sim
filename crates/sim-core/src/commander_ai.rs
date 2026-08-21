@@ -31,18 +31,39 @@
 //!   傾向 → 実際に出る命令、という一本の因果の鎖を保ちながら、8 種類分の
 //!   個別の分解ロジックを書かずに済む。
 
-use sim_math::{dist, dist_sq, unit_vec, Fx, Purpose, Rng, Vec2Fx};
+use sim_math::{dist, dist_sq, fx, unit_vec, Fx, Purpose, Rng, Vec2Fx};
 use sim_terrain::Terrain;
 
 use crate::combat::CombatSystem;
 use crate::organization::{
     BattlePlan, CommandNode, CommandState, CommandTree, CommanderAttrs, DecisionRecord, FactionId,
-    Intent, KnownForce, MoveSpeed, NodeId, Objective, Priority, Side, SituationAssessment,
+    Intent, KnownForce, MissionState, MoveSpeed, NodeId, Objective, Priority, Side,
+    SituationAssessment, TerrainNote, TerrainNoteKind,
 };
 use crate::soldiers::{flags, Soldiers};
 
 /// 戦略層の思考間隔（tick）。仕様 05 章 1 節の帯域（0.2〜1 Hz）のうち 0.5 Hz を採用。
 pub(crate) const ASSESS_INTERVAL_TICKS: u32 = 40;
+
+// ── 地形の要点（B6）────────────────────────────────────────────────
+/// 司令部の周りで要点を探す範囲（m）と、標本の間隔（m）。全セルを走査しない。
+const CRITICAL_POINT_RANGE_M: i32 = 300;
+const CRITICAL_POINT_STEP_M: i32 = 40;
+/// 周囲の平均より何 cm 高ければ「高所」とみなすか。
+const CRITICAL_POINT_RISE_CM: i32 = 300;
+/// Blackboard に残す要点の数。
+const MAX_TERRAIN_NOTES: usize = 4;
+/// 要点を押さえるときの守備半径と迎撃半径（m）。
+const CRITICAL_POINT_HOLD_RADIUS_M: u16 = 20;
+const CRITICAL_POINT_INTERCEPT_M: u16 = 30;
+
+// ── 任務の割り当て（B6）────────────────────────────────────────────
+/// 主戦闘へ送る戦力の目安（敵の戦力に対する permille）。
+const ATTACK_STRENGTH_PERMILLE: u32 = 1_500;
+/// 予備に残す戦力（自軍に対する permille）。
+const RESERVE_STRENGTH_PERMILLE: u32 = 150;
+/// 同じ役目のまま任務を出し直すまでの間隔（tick）。20 Hz なので 400 tick = 20 秒。
+const REASSIGN_COOLDOWN_TICKS: u32 = 400;
 /// 会戦プラン（軍全体の方針）を再検討する間隔。Objective より大きな時間スケールで
 /// 動く（仕様 06 章「戦況が大きく変われば再選択する」）。
 const PLAN_REASSESS_STRIDE: u32 = 30; // ASSESS_INTERVAL_TICKS の何回に 1 回か
@@ -230,6 +251,7 @@ fn update_blackboard(
         }
     }
 
+    let notes = terrain_notes_near(terrain, observer_pos, tick);
     let Some(node) = command.node_mut(node_id) else {
         return;
     };
@@ -259,6 +281,91 @@ fn update_blackboard(
     }
     node.blackboard.enemy_forces.retain(|f| f.confidence > 0);
     node.blackboard.last_updated = tick;
+    node.blackboard.terrain_notes = notes;
+}
+
+/// 指揮官の周りで目につく地形の要点を拾う（B6）。
+///
+/// 見るのは高所・渡河点・道の 3 つ。全セルを走査せず、司令部の周囲を粗い格子で
+/// 標本抽出する。地点占拠・地点防衛の候補になる。
+fn terrain_notes_near(terrain: &Terrain, center: Vec2Fx, tick: u32) -> Vec<TerrainNote> {
+    let _ = tick;
+    let cell_m = terrain.cell_m.max(1) as i32;
+    let step_cells = (CRITICAL_POINT_STEP_M / cell_m).max(1);
+    let span_cells = (CRITICAL_POINT_RANGE_M / cell_m).max(1);
+    let (cx, cy) = terrain.world_to_cell(center.x, center.y);
+    let dim = terrain.dim as i32;
+
+    // 高さの基準は、標本のうちの中央付近ではなく平均で足りる（高いかどうかだけ）。
+    let mut samples: Vec<(i32, i32, i16)> = Vec::new();
+    let mut height_sum = 0i64;
+    let mut y = cy as i32 - span_cells;
+    while y <= cy as i32 + span_cells {
+        let mut x = cx as i32 - span_cells;
+        while x <= cx as i32 + span_cells {
+            if x >= 0 && y >= 0 && x < dim && y < dim {
+                let height = terrain.height_at_cell(x, y);
+                height_sum += height as i64;
+                samples.push((x, y, height));
+            }
+            x += step_cells;
+        }
+        y += step_cells;
+    }
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mean_height = (height_sum / samples.len() as i64) as i32;
+
+    let mut notes: Vec<TerrainNote> = Vec::new();
+    let mut best_high: Option<(i32, TerrainNote)> = None;
+    for &(x, y, height) in &samples {
+        let idx = terrain.idx(x as u32, y as u32);
+        let pos = Vec2Fx::new(fx(x * cell_m + cell_m / 2), fx(y * cell_m + cell_m / 2));
+        if terrain.is_ford(idx) {
+            push_note(
+                &mut notes,
+                TerrainNote {
+                    pos,
+                    kind: TerrainNoteKind::Ford,
+                },
+            );
+            continue;
+        }
+        if terrain.overlay_at_index(idx) == sim_terrain::Overlay::Road {
+            push_note(
+                &mut notes,
+                TerrainNote {
+                    pos,
+                    kind: TerrainNoteKind::Forest,
+                },
+            );
+            continue;
+        }
+        let rise = height as i32 - mean_height;
+        if rise >= CRITICAL_POINT_RISE_CM
+            && best_high.map_or(true, |(best_rise, _)| rise > best_rise)
+        {
+            best_high = Some((
+                rise,
+                TerrainNote {
+                    pos,
+                    kind: TerrainNoteKind::HighGround,
+                },
+            ));
+        }
+    }
+    if let Some((_, note)) = best_high {
+        push_note(&mut notes, note);
+    }
+    notes.truncate(MAX_TERRAIN_NOTES);
+    notes
+}
+
+fn push_note(notes: &mut Vec<TerrainNote>, note: TerrainNote) {
+    if notes.len() < MAX_TERRAIN_NOTES && !notes.iter().any(|existing| existing.pos == note.pos) {
+        notes.push(note);
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -741,47 +848,237 @@ fn decompose_objective(
             }
         }
         Objective::Envelop { target } => {
-            let (fc, fs) = unit_vec(own_facing);
-            let facing_vec = Vec2Fx::new(fc, fs);
-            let mut scored: Vec<(NodeId, i64, u32)> = children
-                .iter()
-                .filter_map(|&c| {
-                    let cn = command.node(c)?;
-                    if cn.stats.alive == 0 {
-                        return None;
-                    }
-                    let lateral = facing_vec.cross(cn.stats.centroid.sub(own_centroid));
-                    let mounted = child_mounted_permille(command, soldiers, c);
-                    Some((c, lateral, mounted))
-                })
-                .collect();
-            if scored.is_empty() {
-                return;
+            decompose_attack(
+                node_id,
+                target,
+                command,
+                soldiers,
+                own_facing,
+                own_centroid,
+                tick,
+            );
+        }
+    }
+}
+
+/// 攻撃の意図を小任務へ分解する（B6）。
+///
+/// 部隊全体へ同じ「突っ込め」を配らず、必要戦力を満たすところまでを主戦闘へ
+/// 送り、残りを側面警戒・予備・地点保持へ回す。既に同じ役目に就いている部隊は、
+/// 変更の手間（`REASSIGN_COOLDOWN_TICKS`）が経つまで動かさない。
+fn decompose_attack(
+    node_id: NodeId,
+    target: NodeId,
+    command: &mut CommandTree,
+    soldiers: &Soldiers,
+    own_facing: sim_math::Brad,
+    own_centroid: Vec2Fx,
+    tick: u32,
+) {
+    let (fc, fs) = unit_vec(own_facing);
+    let facing_vec = Vec2Fx::new(fc, fs);
+    let Some(node) = command.node(node_id) else {
+        return;
+    };
+    let children = node.children.clone();
+    // 守るべき地形の要点（高所・渡河点）。無ければ地点保持は割り当てない。
+    let critical_point = node
+        .blackboard
+        .terrain_notes
+        .iter()
+        .find(|note| {
+            matches!(
+                note.kind,
+                TerrainNoteKind::HighGround | TerrainNoteKind::Ford
+            )
+        })
+        .map(|note| note.pos);
+    let target_strength = command.node(target).map_or(0, |n| n.stats.alive);
+    // 主戦闘に要る戦力。互角では足りないので、相手より厚く見積もる。
+    let required = (target_strength * ATTACK_STRENGTH_PERMILLE / 1_000).max(1);
+
+    let own_faction = node.faction;
+    let mut scored: Vec<(NodeId, i64, u32, u32)> = children
+        .iter()
+        .filter_map(|&c| {
+            let cn = command.node(c)?;
+            // 自軍の部隊だけを割り当てる。テストやシナリオでは、便宜上ひとつの
+            // 根の下に敵味方が並ぶことがある。
+            if cn.stats.alive == 0 || cn.faction != own_faction {
+                return None;
             }
-            scored.sort_by_key(|&(_, lateral, _)| lateral);
-            let n = scored.len();
-            for (idx, &(child, _, mounted)) in scored.iter().enumerate() {
-                let intent = if mounted >= 500 {
-                    Intent::Charge { target }
-                } else if idx == 0 && n > 1 {
-                    Intent::Flank {
-                        target,
-                        side: Side::Left,
-                    }
-                } else if idx + 1 == n && n > 1 {
-                    Intent::Flank {
-                        target,
-                        side: Side::Right,
-                    }
+            let lateral = facing_vec.cross(cn.stats.centroid.sub(own_centroid));
+            let mounted = child_mounted_permille(command, soldiers, c);
+            Some((c, lateral, mounted, cn.stats.alive))
+        })
+        .collect();
+    if scored.is_empty() {
+        return;
+    }
+    // 左から右へ並べる。端の部隊が側面へ回り、中央が正面を押す。
+    scored.sort_by_key(|&(_, lateral, _, _)| lateral);
+
+    let total: u32 = scored.iter().map(|&(_, _, _, alive)| alive).sum();
+    // 予備に残す戦力。少数でも必ず残す——主戦闘へ全部を注ぎ込むと、崩れたときに
+    // 差し込む手が無くなる。
+    let reserve_target = (total * RESERVE_STRENGTH_PERMILLE / 1_000).max(1);
+    let n = scored.len();
+
+    // 役目は先に決める。主戦闘で埋めきってから余りを配ると、予備も要点保持も
+    // 残らないことがある。
+    let mut roles: Vec<Option<Intent>> = vec![None; n];
+
+    // 1) 予備。司令部にもっとも近い部隊が下がって控える。
+    if n >= 2 {
+        let mut held = 0u32;
+        while held < reserve_target {
+            let Some(pick) = (0..n)
+                .filter(|&idx| roles[idx].is_none())
+                // 主戦闘に最低 1 個は残す。
+                .filter(|_| roles.iter().filter(|r| r.is_none()).count() > 1)
+                .min_by_key(|&idx| {
+                    let centroid = command
+                        .node(scored[idx].0)
+                        .map(|node| node.stats.centroid)
+                        .unwrap_or(own_centroid);
+                    (dist_sq(centroid, own_centroid), scored[idx].0)
+                })
+            else {
+                break;
+            };
+            roles[pick] = Some(Intent::Reserve {
+                rally_pos: own_centroid,
+            });
+            held += scored[pick].3;
+        }
+    }
+
+    // 2) 要点の保持。要点にもっとも近い部隊が押さえる。
+    if let Some(point) = critical_point {
+        if let Some(pick) = (0..n)
+            .filter(|&idx| roles[idx].is_none())
+            .filter(|_| roles.iter().filter(|r| r.is_none()).count() > 1)
+            .min_by_key(|&idx| {
+                let centroid = command
+                    .node(scored[idx].0)
+                    .map(|node| node.stats.centroid)
+                    .unwrap_or(own_centroid);
+                (dist_sq(centroid, point), scored[idx].0)
+            })
+        {
+            roles[pick] = Some(Intent::GuardArea {
+                center: point,
+                radius_m: CRITICAL_POINT_HOLD_RADIUS_M,
+                intercept_radius_m: CRITICAL_POINT_INTERCEPT_M,
+            });
+        }
+    }
+
+    // 3) 側面警戒。主戦闘の外側の端を見張る。
+    if n >= 4 {
+        if let Some(pick) = (0..n)
+            .filter(|&idx| roles[idx].is_none())
+            .filter(|_| roles.iter().filter(|r| r.is_none()).count() > 1)
+            .max_by_key(|&idx| (scored[idx].1.abs(), scored[idx].0))
+        {
+            roles[pick] = Some(Intent::Screen {
+                protect: node_id,
+                side: if scored[pick].1 < 0 {
+                    Side::Left
                 } else {
-                    Intent::Attack {
-                        target,
-                        approach: crate::organization::ApproachStyle::Deliberate,
-                    }
-                };
-                command.issue_order(node_id, child, intent, Priority::Urgent, tick, soldiers);
+                    Side::Right
+                },
+            });
+        }
+    }
+
+    // 4) 残りが主戦闘。必要戦力に届かなくても、残せる予備は残したまま送る。
+    let mut assigned = 0u32;
+    for idx in 0..n {
+        if roles[idx].is_some() {
+            continue;
+        }
+        let (child, lateral, mounted, alive) = scored[idx];
+        let _ = child;
+        assigned += alive;
+        roles[idx] = Some(if mounted >= 500 {
+            Intent::Charge { target }
+        } else if lateral < 0 && n > 2 {
+            Intent::Flank {
+                target,
+                side: Side::Left,
+            }
+        } else if lateral > 0 && n > 2 {
+            Intent::Flank {
+                target,
+                side: Side::Right,
+            }
+        } else {
+            Intent::Attack {
+                target,
+                approach: crate::organization::ApproachStyle::Deliberate,
+            }
+        });
+    }
+
+    // 主戦闘が明らかに足りないときだけ、予備を切り崩して送り込む。
+    if assigned < required {
+        for idx in 0..n {
+            if assigned >= required {
+                break;
+            }
+            if matches!(roles[idx], Some(Intent::Reserve { .. })) && scored.len() > 2 {
+                roles[idx] = Some(Intent::Attack {
+                    target,
+                    approach: crate::organization::ApproachStyle::Deliberate,
+                });
+                assigned += scored[idx].3;
             }
         }
+    }
+
+    for (idx, role) in roles.into_iter().enumerate() {
+        let Some(role) = role else {
+            continue;
+        };
+        let child = scored[idx].0;
+        if !should_reassign(command, child, role, tick) {
+            continue;
+        }
+        command.issue_order(node_id, child, role, Priority::Urgent, tick, soldiers);
+    }
+}
+
+/// 役目を割り当て直すべきか（B6 の任務変更コスト）。
+///
+/// 同じ種類の任務に就いていて、就いてからの時間が短いうちは動かさない。命令の
+/// たびに全部隊が同時に向きを変えると、戦線が毎回作り直しになる。
+fn should_reassign(command: &CommandTree, child: NodeId, role: Intent, tick: u32) -> bool {
+    let Some(node) = command.node(child) else {
+        return false;
+    };
+    let Some(current) = node.objective else {
+        return true;
+    };
+    if intent_role(current) != intent_role(role) {
+        // 役目そのものが変わるなら、直近に変えたばかりでも通す（危急の変更）。
+        return true;
+    }
+    // 同じ役目なら、失敗しているときか、十分に時間が経ったときだけ出し直す。
+    node.mission.state == MissionState::Failed
+        || tick.saturating_sub(node.mission.since_tick) >= REASSIGN_COOLDOWN_TICKS
+}
+
+/// 任務を「役目」へ丸める。目標が変わっただけの再発令を数えないため。
+fn intent_role(intent: Intent) -> u8 {
+    match intent {
+        Intent::Attack { .. } | Intent::Charge { .. } | Intent::Flank { .. } => 0,
+        Intent::Screen { .. } => 1,
+        Intent::Reserve { .. } => 2,
+        Intent::GuardArea { .. } | Intent::OccupyArea { .. } => 3,
+        Intent::Hold { .. } => 4,
+        Intent::Withdraw { .. } => 5,
+        _ => 6,
     }
 }
 
@@ -1288,6 +1585,116 @@ mod tests {
     ///
     /// `objective_kind` は標的を区別しないので、ここで標的の消滅を見ないと
     /// 「もう居ない部隊を包囲し続ける」状態から抜けられず、会戦が止まる。
+    /// 攻撃の意図は、主戦闘・側面警戒・予備・要点保持へ分かれる（B6）。
+    #[test]
+    fn an_attack_is_split_into_sub_missions() {
+        let terrain = small_terrain(5);
+        let mut soldiers = Soldiers::default();
+        let mut command = CommandTree::new();
+
+        // 味方: 司令部 + 5 個の部隊。敵: 1 個の部隊。
+        // 命令が届いても無視されないよう、規律と忠誠のある兵にする。
+        let obedient = Attrs::new(140, 140, 140, 140, 140, 140, 140, 220, 100, 120, 220, 140);
+        let make_unit = |soldiers: &mut Soldiers, x: i32, faction: u8, count: u32| {
+            let mut ids = Vec::new();
+            for k in 0..count {
+                ids.push(soldiers.push(
+                    fx(x + k as i32),
+                    fx(if faction == 0 { 100 } else { 160 }),
+                    0,
+                    0,
+                    faction,
+                    obedient,
+                    0,
+                ));
+            }
+            ids
+        };
+        let hq_ids = make_unit(&mut soldiers, 100, 0, 1);
+        let root = command.add_node(None, 0, 0, hq_ids[0], vec![], None);
+        for k in 0..5 {
+            let ids = make_unit(&mut soldiers, 80 + k * 10, 0, 10);
+            let origin = soldiers.pos(ids[0] as usize);
+            command.add_node(
+                Some(root),
+                1,
+                0,
+                ids[0],
+                vec![],
+                Some(leaf_unit(ids, origin, 0)),
+            );
+        }
+        let enemy_ids = make_unit(&mut soldiers, 100, 1, 20);
+        let enemy_origin = soldiers.pos(enemy_ids[0] as usize);
+        let enemy = command.add_node(
+            None,
+            0,
+            1,
+            enemy_ids[0],
+            vec![],
+            Some(leaf_unit(enemy_ids, enemy_origin, 0)),
+        );
+        command.tick(&mut soldiers, &terrain, 0);
+
+        decompose_objective(
+            root,
+            Objective::Envelop { target: enemy },
+            &mut command,
+            &soldiers,
+            0,
+        );
+        // 伝令が届くまで回す。
+        for tick in 1..600 {
+            command.tick(&mut soldiers, &terrain, tick);
+        }
+
+        let roles: Vec<u8> = command
+            .node(root)
+            .unwrap()
+            .children
+            .iter()
+            .filter_map(|&child| command.node(child).and_then(|n| n.objective))
+            .map(intent_role)
+            .collect();
+        assert!(
+            roles.iter().filter(|&&role| role == 0).count() >= 2,
+            "主戦闘へ送られた部隊が少なすぎる: {roles:?}"
+        );
+        assert!(roles.contains(&2), "予備が残っていない: {roles:?}");
+        assert!(
+            roles.contains(&1) || roles.contains(&3),
+            "側面警戒も要点保持も割り当てられていない: {roles:?}"
+        );
+    }
+
+    /// 同じ役目に就いている部隊は、少し前に割り当てたばかりなら動かさない（B6）。
+    #[test]
+    fn units_are_not_reassigned_to_the_same_role_immediately() {
+        let terrain = small_terrain(7);
+        let mut soldiers = Soldiers::default();
+        let mut command = CommandTree::new();
+        let ids: Vec<_> = (0..4)
+            .map(|k| soldiers.push(fx(100 + k), fx(100), 0, 0, 0, Attrs::default(), 0))
+            .collect();
+        let origin = soldiers.pos(ids[0] as usize);
+        let node = command.add_node(None, 0, 0, ids[0], vec![], Some(leaf_unit(ids, origin, 0)));
+        let role = Intent::Reserve { rally_pos: origin };
+        command.override_intent(node, role, &mut soldiers, &terrain, 0);
+        command.tick(&mut soldiers, &terrain, 1);
+        assert!(
+            !should_reassign(&command, node, role, 10),
+            "同じ役目にすぐ出し直している"
+        );
+        assert!(
+            should_reassign(&command, node, Intent::Charge { target: 0 }, 10),
+            "役目が変わるのに出し直さない"
+        );
+        assert!(
+            should_reassign(&command, node, role, REASSIGN_COOLDOWN_TICKS + 10),
+            "十分に時間が経っても出し直さない"
+        );
+    }
+
     #[test]
     fn envelop_retargets_once_the_enveloped_force_is_wiped_out() {
         let mut command = CommandTree::new();

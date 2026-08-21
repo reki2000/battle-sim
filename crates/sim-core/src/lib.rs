@@ -16,12 +16,17 @@ pub mod combat;
 pub mod commander_ai;
 pub mod corpses;
 pub mod engineering;
+pub mod metrics;
 pub mod organization;
 pub mod pathing;
+pub mod perception;
+pub mod regression;
 pub mod scenario;
 pub mod snapshot;
+pub mod soldier_ai;
 pub mod soldiers;
 pub mod spatial;
+pub mod squads;
 pub mod structures;
 
 use cavalry::CavalrySystem;
@@ -30,10 +35,13 @@ use combat::CombatSystem;
 use corpses::CorpseField;
 use engineering::EngineeringSystem;
 use organization::CommandTree;
+use perception::PerceptionSystem;
 use sim_math::{fx, fx_div, fx_from_mm, fx_mul, per_sec_to_per_tick, Fx, Vec2Fx, FX_ONE};
 use sim_terrain::Terrain;
+use soldier_ai::SoldierAiSystem;
 use soldiers::{flags, Attrs, SoldierId, Soldiers, State};
 use spatial::{SpatialHash, MAX_NEIGHBORS};
+use squads::SquadSystem;
 use structures::StructureSystem;
 
 /// シミュレーションのロジックバージョン。リプレイの互換性判定に使う。
@@ -45,7 +53,8 @@ use structures::StructureSystem;
 /// でも結果が変わるので、それ以前の記録とは互換しない）。
 /// 兵士同士の当たり判定（歩容によるすり抜け・転倒）、死体の障害物化、
 /// 徒歩兵の助走突撃と移動疲労を入れたため 6 → 7。
-pub const SIM_VERSION: u32 = 7;
+/// 連続移動する隊列アンカー、安定スロット、兵士の局所迎撃判断を入れたため 7 → 8。
+pub const SIM_VERSION: u32 = 9;
 
 /// 衝突解決の反復回数（仕様 06 章 2.2）。
 const SEPARATION_ITERATIONS: usize = 2;
@@ -62,6 +71,98 @@ const STANDOFF_TOLERANCE_MM: i32 = 150;
 /// 間合いを詰める・取り直すときの足の速さ（mm/s）。摺り足で、走りはしない。
 const STANDOFF_STEP_MM_PER_S: i32 = 700;
 
+/// 歩行中に操舵段階で保とうとする味方との間隔。衝突判定の「通れる最小幅」
+/// とは別で、普段から人へぶつかって押し戻される動きを減らすための希望値。
+const MARCH_PREFERRED_CLEARANCE_MM: i32 = 900;
+const MARCH_SEPARATION_WEIGHT_MM: i32 = 650;
+
+/// すれ違いのために前方を見る距離（mm）と、避ける強さ（mm）。向かってくる味方が
+/// この距離にいると、進行方向の右手へ寄る（B4 の通行レーン）。
+const YIELD_LOOKAHEAD_MM: i32 = 2_500;
+const YIELD_WEIGHT_MM: i32 = 500;
+
+/// tick のフェーズ別所要時間（B7 の計測）。
+///
+/// 計測は `tick_profiled` を呼んだときだけ行い、通常の [`World::tick`] は
+/// 時計に触らない（wasm では `Instant` が使えないため、そこも安全に保つ）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhaseTimings {
+    /// 各フェーズの累計（ナノ秒）。並びは [`PHASE_NAMES`]。
+    pub ns: [u64; PHASE_NAMES.len()],
+    pub ticks: u32,
+}
+
+/// [`PhaseTimings::ns`] の並び。tick の順序と 1 対 1 に対応する。
+///
+/// - `command`: 伝令・命令の解釈・任務段階
+/// - `commander_ai`: 戦略層（Blackboard・目的・分解）
+/// - `formation`: 穴埋め・前後列交代・陣形スロット・空間ハッシュ
+/// - `combat`: 騎兵・徒歩突撃・白兵と射撃
+/// - `engineering`: 工兵作業
+/// - `perception`: 局所知覚
+/// - `squads`: 小集団
+/// - `soldier_ai`: 個人の行動選択
+/// - `movement`: 操舵と移動積分
+/// - `collision`: 押し合い・転倒・地形追従・疲労・死体
+pub const PHASE_NAMES: [&str; 10] = [
+    "command",
+    "commander_ai",
+    "formation",
+    "combat",
+    "engineering",
+    "perception",
+    "squads",
+    "soldier_ai",
+    "movement",
+    "collision",
+];
+
+impl PhaseTimings {
+    /// 1 tick あたりの平均（マイクロ秒）。
+    pub fn mean_us(&self, phase: usize) -> u64 {
+        if self.ticks == 0 {
+            0
+        } else {
+            self.ns[phase] / 1_000 / self.ticks as u64
+        }
+    }
+}
+
+/// フェーズの境目で時計を読む小道具。計測しないときは何もしない。
+struct PhaseClock {
+    #[cfg(not(target_arch = "wasm32"))]
+    last: Option<std::time::Instant>,
+    phase: usize,
+}
+
+impl PhaseClock {
+    fn new(enabled: bool) -> PhaseClock {
+        PhaseClock {
+            #[cfg(not(target_arch = "wasm32"))]
+            last: enabled.then(std::time::Instant::now),
+            phase: 0,
+        }
+    }
+
+    /// ここまでのフェーズを閉じる。
+    fn lap(&mut self, timings: &mut Option<&mut PhaseTimings>) {
+        let Some(timings) = timings.as_mut() else {
+            return;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.last {
+                if self.phase < timings.ns.len() {
+                    timings.ns[self.phase] += now.duration_since(last).as_nanos() as u64;
+                }
+            }
+            self.last = Some(now);
+        }
+        self.phase += 1;
+    }
+}
+
 /// シミュレーションのワールド。
 pub struct World {
     pub seed: u64,
@@ -77,6 +178,12 @@ pub struct World {
     pub cavalry: CavalrySystem,
     /// 徒歩兵の助走突撃・すり抜けの失敗による転倒・微視的な行動決定。
     pub charge: ChargeSystem,
+    /// 兵士ごとの局所知覚（近傍の敵味方、方向別の脅威、援護できる戦闘）。
+    pub perception: PerceptionSystem,
+    /// 部隊の中の小集団（近い仲間と局所的な先導役）。
+    pub squads: SquadSystem,
+    /// 近隣の戦闘へ個人ごとのタイミングで反応する兵士 AI。
+    pub soldier_ai: SoldierAiSystem,
     /// 倒れた兵士が作る低い障害物（跨げるが時間がかかる）。
     pub corpses: CorpseField,
     /// M6 の野戦築城・地形改修の対象（杭列・堀・鹿砦・土塁・馬防柵・橋）。
@@ -88,6 +195,9 @@ pub struct World {
     /// 衝突解決の書き込み先（読み書きフェーズを分けるため）
     push_x: Vec<Fx>,
     push_y: Vec<Fx>,
+    /// この tick に「進もうとしている向きと逆へ押し戻された」回数。操舵と衝突
+    /// 解決が綱引きしている量の目安（B4 の計測用、挙動には影響しない）。
+    pub push_conflicts: u32,
     /// 衝突解決の全反復で蓄積した重なり量。圧迫（crush）判定に使う。
     crush_accum: Vec<Fx>,
     /// 歩容から決まるすり抜け半径のキャッシュ。速度は衝突解決のあいだ変わら
@@ -124,12 +234,16 @@ impl World {
             combat: CombatSystem::default(),
             cavalry: CavalrySystem::default(),
             charge: ChargeSystem::default(),
+            perception: PerceptionSystem::default(),
+            squads: SquadSystem::default(),
+            soldier_ai: SoldierAiSystem::default(),
             corpses: CorpseField::default(),
             structures: StructureSystem::default(),
             engineering: EngineeringSystem::default(),
             goal: Vec::new(),
             push_x: Vec::new(),
             push_y: Vec::new(),
+            push_conflicts: 0,
             crush_accum: Vec::new(),
             pass_radius: Vec::new(),
         }
@@ -173,6 +287,9 @@ impl World {
         self.combat.register();
         self.cavalry.register();
         self.charge.register();
+        self.perception.register();
+        self.squads.register();
+        self.soldier_ai.register();
         self.engineering.register();
         if soldier_flags & flags::MOUNTED != 0 {
             self.combat.set_mounted(id, true);
@@ -202,6 +319,12 @@ impl World {
         }
     }
 
+    /// 兵士の現在の移動目標。命令・陣形・局所行動のうち、この tick で最後に
+    /// 書いたものが入っている（デバッグ表示と観測用の読み取り口）。
+    pub fn goal(&self, id: SoldierId) -> Vec2Fx {
+        self.goal.get(id as usize).copied().unwrap_or(Vec2Fx::ZERO)
+    }
+
     /// 指揮ノードを追加する。葉ノードには `organization::Unit` を渡す。
     pub fn add_command_node(
         &mut self,
@@ -226,6 +349,16 @@ impl World {
     ) -> Option<organization::OrderId> {
         self.command
             .issue_order(issuer, target, intent, priority, self.tick, &self.soldiers)
+    }
+
+    /// 伝令を介さず、その場で部隊の任務を設定する（初期配置用）。
+    ///
+    /// 会戦が始まってからの命令は [`World::issue_order`] を使う。こちらは
+    /// 「シナリオを組み立てた時点で、この部隊はこの任務を帯びている」を
+    /// 表すための初期化手段。
+    pub fn set_objective(&mut self, node: organization::NodeId, intent: organization::Intent) {
+        self.command
+            .set_objective(node, intent, &mut self.soldiers, &self.terrain, self.tick);
     }
 
     pub fn issue_order_via(
@@ -390,8 +523,22 @@ impl World {
     ///
     /// フェーズの順序は仕様 02 章 5 節に従う。M0 では未実装のフェーズを飛ばす。
     pub fn tick(&mut self) {
+        self.tick_inner(None);
+    }
+
+    /// フェーズ別の所要時間を測りながら 1 tick 進める（B7 の計測用）。
+    ///
+    /// 結果は加算されるので、複数 tick 回した合計を `ticks` で割れば平均になる。
+    pub fn tick_profiled(&mut self, timings: &mut PhaseTimings) {
+        timings.ticks += 1;
+        self.tick_inner(Some(timings));
+    }
+
+    fn tick_inner(&mut self, mut timings: Option<&mut PhaseTimings>) {
+        let mut clock = PhaseClock::new(timings.is_some());
         self.command
             .tick(&mut self.soldiers, &self.terrain, self.tick);
+        clock.lap(&mut timings);
         // M7 の指揮官 AI（Blackboard の更新、Objective・会戦プランの選択と
         // それに基づく命令の発令、独断専行の判定）。`command.tick` の直後に
         // 置くことで、`NodeStats` が最新（このメソッド呼び出し時点）であり、
@@ -404,13 +551,17 @@ impl World {
             self.seed,
             self.tick,
         );
+        clock.lap(&mut timings);
         // 疲れた前列を後列と入れ替える。陣形スロットの並びを変えるので、
         // スロットから目標を配る `formation_goals` の直前に置く。
+        self.command
+            .fill_front_vacancies(&self.soldiers, &self.hash, self.tick);
         self.command
             .rotate_tired_ranks(&self.soldiers, self.seed, self.tick);
         self.command
             .formation_goals(&mut self.soldiers, &mut self.goal, self.tick);
         self.hash.rebuild(&self.soldiers);
+        clock.lap(&mut timings);
         // 騎兵の忌避・衝撃は白兵戦の通常交戦より先に解決する。こうすると、
         // 忌避で Wavering に、衝撃で Engaged に落ちた騎兵を、同じ tick 内で
         // combat.tick の通常交戦ロジックがそのまま拾える（仕様 12 章 M5）。
@@ -437,6 +588,7 @@ impl World {
         );
         self.combat
             .tick(self.seed, self.tick, &mut self.soldiers, &self.hash);
+        clock.lap(&mut timings);
         // 工兵（M6）は白兵・射撃・騎兵の交戦判定の後に置く。こうすると、
         // 実戦闘に引き込まれた工兵の `State` はすでに書き換わっており、
         // `engineering.tick` はそれを見て作業を打ち切るだけでよい
@@ -450,6 +602,29 @@ impl World {
             &mut self.combat,
             &mut self.goal,
         );
+        clock.lap(&mut timings);
+        // 局所知覚（B1）は個人判断の直前に更新する。交戦の結果が反映された後の
+        // 周囲——誰が組み合っていて、どこから脅威が来ているか——を見るため。
+        self.perception.tick(self.tick, &mut self.soldiers);
+        clock.lap(&mut timings);
+        // 小集団（B3）。仲間が出たか、先導役が誰かは、個人判断が読む。
+        self.squads.tick(self.tick, &self.soldiers, &self.command);
+        clock.lap(&mut timings);
+        // 部隊のスロットを基準にしながら、近くの敵へ反応した兵士だけが個別目標で
+        // 上書きする。徒歩突撃の助走判断はさらに局所的なので、この後に置く。
+        let decisions = soldier_ai::DecisionContext {
+            command: &self.command,
+            perception: &self.perception,
+            squads: &self.squads,
+        };
+        self.soldier_ai.tick(
+            self.seed,
+            self.tick,
+            &mut self.soldiers,
+            &decisions,
+            &mut self.goal,
+        );
+        clock.lap(&mut timings);
         // 兵士自身の判断（下がって助走をつける・離れた敵へ走り込む）は、
         // 部隊の陣形目標と交戦相手が確定した後に、その tick 分だけ `goal` を
         // 上書きする形で入れる。命令が変われば次の tick から自然に元へ戻る。
@@ -464,6 +639,7 @@ impl World {
         );
         self.steer();
         self.integrate_motion();
+        clock.lap(&mut timings);
         self.resolve_collisions();
         // 走り抜けようとして人や死体にぶつかった者を転ばせる。位置が確定した
         // 後でないと「隙間が足りなかったか」を判定できない（空間ハッシュは
@@ -478,6 +654,7 @@ impl World {
         self.follow_terrain();
         self.apply_movement_fatigue();
         self.corpses.maybe_rebuild(&self.soldiers, self.tick);
+        clock.lap(&mut timings);
         self.tick += 1;
     }
 
@@ -550,7 +727,10 @@ impl World {
                 // 到着した
                 self.soldiers.hot.vel_x[i] = 0;
                 self.soldiers.hot.vel_y[i] = 0;
-                if self.soldiers.hot.state[i] == State::Marching {
+                if matches!(
+                    self.soldiers.hot.state[i],
+                    State::Marching | State::Repositioning | State::Advancing
+                ) {
                     self.soldiers.hot.state[i] = State::Idle;
                 }
                 self.face_nearest_enemy_if_close(i);
@@ -558,7 +738,7 @@ impl World {
             }
 
             let desired_speed = self.desired_speed(i);
-            let dir = to_goal.normalized();
+            let dir = self.march_direction_with_separation(i, to_goal);
             let target = dir.scale(desired_speed);
 
             // 加速度で追従する
@@ -585,6 +765,103 @@ impl World {
             // 満たせないまま双方が固まってしまうため。
             self.face_nearest_enemy_if_close(i);
         }
+    }
+
+    /// 目標方向に、近すぎる味方から離れる成分を足す。
+    ///
+    /// 物理衝突の押し戻しは「重なった後」の解決なので、それだけでは歩行者が常に
+    /// 肩をぶつけながら進む。こちらは重なる前の希望操舵で、密集陣形の最終位置は
+    /// 変えず、歩いている途中だけ空いた側へ少し進路を譲る。
+    fn march_direction_with_separation(&self, i: usize, to_goal: Vec2Fx) -> Vec2Fx {
+        let seek = to_goal.normalized();
+        if self.soldiers.hot.flags[i] & flags::MOUNTED != 0 {
+            return seek;
+        }
+        let pos = self.soldiers.pos(i);
+        let preferred = fx_from_mm(MARCH_PREFERRED_CLEARANCE_MM);
+        let preferred_sq = (preferred as i64) * (preferred as i64);
+        let mut neighbors = [0u32; MAX_NEIGHBORS];
+        let count = self.hash.query_neighbors(pos.x, pos.y, &mut neighbors);
+        let mut separation = Vec2Fx::ZERO;
+        for &jid in &neighbors[..count] {
+            let j = jid as usize;
+            if j == i
+                || !self.soldiers.is_alive(j)
+                || self.soldiers.faction[j] != self.soldiers.faction[i]
+            {
+                continue;
+            }
+            let delta = pos.sub(self.soldiers.pos(j));
+            let d2 = delta.len_sq();
+            if d2 >= preferred_sq {
+                continue;
+            }
+            let (away, distance) = if d2 == 0 {
+                let angle = ((i as u32).wrapping_mul(2654435761) >> 16) as u16;
+                (
+                    Vec2Fx::new(sim_math::cos_fx(angle), sim_math::sin_fx(angle)),
+                    0,
+                )
+            } else {
+                let distance = sim_math::isqrt64(d2 as u64) as Fx;
+                (delta.scale(fx_div(FX_ONE, distance)), distance)
+            };
+            let weight = fx_div(preferred - distance, preferred);
+            separation = separation.add(away.scale(weight));
+        }
+        let separation_weight = fx_from_mm(MARCH_SEPARATION_WEIGHT_MM);
+        let yield_step = self.yield_to_oncoming(i, seek, &neighbors[..count]);
+        let combined = seek
+            .add(separation.clamp_len(FX_ONE).scale(separation_weight))
+            .add(yield_step);
+        if combined == Vec2Fx::ZERO {
+            seek
+        } else {
+            combined.normalized()
+        }
+    }
+
+    /// 向かってくる味方とすれ違うとき、同じ側へ避ける（B4）。
+    ///
+    /// 双方が同じ手（右肩どうし）へ寄るので、正面から来た二人が同じ方向へ避けて
+    /// 詰まることがない。部隊どうしが交差するときの押し戻しの連鎖も、これで
+    /// だいぶ減る。
+    fn yield_to_oncoming(&self, i: usize, seek: Vec2Fx, neighbors: &[u32]) -> Vec2Fx {
+        let pos = self.soldiers.pos(i);
+        let radius = fx_from_mm(YIELD_LOOKAHEAD_MM);
+        let radius_sq = (radius as i64) * (radius as i64);
+        // 進行方向の右手。`seek` は正規化済み。
+        let right = Vec2Fx::new(seek.y, -seek.x);
+        let mut step = Vec2Fx::ZERO;
+        for &jid in neighbors {
+            let j = jid as usize;
+            if j == i
+                || !self.soldiers.is_alive(j)
+                || self.soldiers.faction[j] != self.soldiers.faction[i]
+            {
+                continue;
+            }
+            let delta = self.soldiers.pos(j).sub(pos);
+            let d2 = delta.len_sq();
+            if d2 == 0 || d2 >= radius_sq {
+                continue;
+            }
+            // 前方にいるか（進行方向との内積が正）。
+            if (delta.x as i64) * (seek.x as i64) + (delta.y as i64) * (seek.y as i64) <= 0 {
+                continue;
+            }
+            // 相手がこちらへ向かってきているか（速度が逆向き）。
+            let other_vel = Vec2Fx::new(
+                self.soldiers.hot.vel_x[j] as Fx,
+                self.soldiers.hot.vel_y[j] as Fx,
+            );
+            if (other_vel.x as i64) * (seek.x as i64) + (other_vel.y as i64) * (seek.y as i64) >= 0
+            {
+                continue;
+            }
+            step = step.add(right);
+        }
+        step.clamp_len(fx_from_mm(YIELD_WEIGHT_MM))
     }
 
     /// 間合いの範囲内にいる最も近い敵がいれば、そちらへ向き直らせる
@@ -855,6 +1132,7 @@ impl World {
     /// 走査順に結果が依存しないようにする。並列化の前提でもある。
     fn resolve_collisions(&mut self) {
         let n = self.soldiers.len();
+        self.push_conflicts = 0;
         if n == 0 {
             return;
         }
@@ -912,6 +1190,14 @@ impl World {
                 }
                 if self.push_x[i] == 0 && self.push_y[i] == 0 {
                     continue;
+                }
+                // 押し戻しが自分の進もうとしている向きと逆であれば、操舵と衝突
+                // 解決が綱引きしている。どれだけ起きているかを数えるだけで、
+                // 動きは変えない（B4 の計測）。
+                let against = (self.push_x[i] as i64) * (self.soldiers.hot.vel_x[i] as i64)
+                    + (self.push_y[i] as i64) * (self.soldiers.hot.vel_y[i] as i64);
+                if against < 0 {
+                    self.push_conflicts = self.push_conflicts.saturating_add(1);
                 }
                 self.soldiers.hot.pos_x[i] =
                     (self.soldiers.hot.pos_x[i] + self.push_x[i]).clamp(0, limit);
@@ -1010,6 +1296,7 @@ impl World {
         mix(self.combat.state_hash());
         mix(self.cavalry.state_hash());
         mix(self.charge.state_hash());
+        mix(self.soldier_ai.state_hash());
         mix(self.structures.state_hash());
         mix(self.engineering.state_hash());
         for i in 0..self.soldiers.len() {
@@ -1023,6 +1310,9 @@ impl World {
             mix(self.soldiers.hp[i] as u64);
             mix(self.soldiers.morale[i] as u64);
             mix(self.soldiers.fatigue[i] as u64);
+            mix(self.soldiers.target[i] as u64);
+            mix(self.soldiers.slot[i] as u64);
+            mix(self.soldiers.think_at[i] as u64);
         }
         h
     }
@@ -1471,6 +1761,28 @@ mod tests {
         );
     }
 
+    /// 向かい合って歩く味方どうしが、同じ側へ避けてすれ違える（B4）。
+    #[test]
+    fn friendly_soldiers_pass_each_other_instead_of_jamming() {
+        let mut w = small_world();
+        let a = w.spawn(Vec2Fx::new(fx(150), fx(150)), 0, 0, 0, Attrs::default(), 0);
+        let b = w.spawn(Vec2Fx::new(fx(158), fx(150)), 0, 0, 0, Attrs::default(), 0);
+        // 互いの位置を通り越した先を目標にする。
+        w.set_goal(a, Vec2Fx::new(fx(166), fx(150)));
+        w.set_goal(b, Vec2Fx::new(fx(142), fx(150)));
+        for _ in 0..400 {
+            w.tick();
+        }
+        let a_pos = w.soldiers.pos(a as usize);
+        let b_pos = w.soldiers.pos(b as usize);
+        assert!(
+            a_pos.x > b_pos.x,
+            "すれ違えずに詰まっている: a={} mm b={} mm",
+            sim_math::fx_to_mm(a_pos.x),
+            sim_math::fx_to_mm(b_pos.x)
+        );
+    }
+
     /// 長物は間合いを取り、短い武器は組み合う（仕様 06 章 3.1 節の reach）。
     ///
     /// 踏み込まれた状態から始め、それぞれが落ち着く距離を見る。
@@ -1488,6 +1800,9 @@ mod tests {
                 // 相手は棒立ちで、間合いを詰めても離れもしない
                 w.soldiers.set_pos(b as usize, target_pos);
                 w.soldiers.hot.state[b as usize] = State::Idle;
+                // 見ているのは武器の間合いなので、単騎で敵と向き合った兵士の
+                // 士気が折れて逃げ出す（それ自体は正しい挙動）成分は取り除く。
+                w.soldiers.morale[a as usize] = soldiers::MAX_MORALE;
                 w.tick();
             }
             sim_math::dist(w.soldiers.pos(a as usize), target_pos)

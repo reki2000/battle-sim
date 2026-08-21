@@ -259,6 +259,17 @@ pub struct CoarseIndex {
     rows: i32,
     cell_start: Vec<u32>,
     entries: Vec<u32>,
+    /// セルにいる陣営のビットマスク（`1 << (faction & 7)`）。敵を探す走査が、
+    /// 味方しかいないセルを中身を見ずに飛ばせる。密集陣形では周囲のセルの
+    /// ほとんどが味方だけなので、これが無いと「近くに敵がいない」ことを
+    /// 確かめるだけで半径内の全員を触ることになる。
+    cell_factions: Vec<u8>,
+}
+
+/// 陣営をセルのビットマスクへ写す。
+#[inline]
+fn faction_bit(faction: u8) -> u8 {
+    1u8 << (faction & 7)
 }
 
 impl CoarseIndex {
@@ -286,6 +297,7 @@ impl CoarseIndex {
                 rows: 0,
                 cell_start: Vec::new(),
                 entries: Vec::new(),
+                cell_factions: Vec::new(),
             };
         }
         let origin_x = fx_floor_int(min_x).div_euclid(cell_m) - 1;
@@ -313,12 +325,14 @@ impl CoarseIndex {
         }
         cell_start[cells] = acc;
         let mut entries = vec![0u32; acc as usize];
+        let mut cell_factions = vec![0u8; cells];
         let mut cursor = cell_start.clone();
         for i in 0..n {
             if soldiers.is_alive(i) {
                 let c = cell_of(soldiers.hot.pos_x[i], soldiers.hot.pos_y[i]);
                 entries[cursor[c] as usize] = i as u32;
                 cursor[c] += 1;
+                cell_factions[c] |= faction_bit(soldiers.faction[i]);
             }
         }
         CoarseIndex {
@@ -329,7 +343,14 @@ impl CoarseIndex {
             rows,
             cell_start,
             entries,
+            cell_factions,
         }
+    }
+
+    /// このセルに `faction` 以外の陣営がいるか。
+    #[inline]
+    fn cell_has_enemy(&self, cell: usize, faction: u8) -> bool {
+        self.cell_factions[cell] & !faction_bit(faction) != 0
     }
 
     /// 周囲 3×3 セルから、`faction` とは異なる陣営の兵士だけを最大
@@ -360,6 +381,9 @@ impl CoarseIndex {
                     continue;
                 }
                 let c = (ny as usize) * (self.cols as usize) + (nx as usize);
+                if !self.cell_has_enemy(c, faction) {
+                    continue;
+                }
                 let (start, end) = (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
                 for &id in &self.entries[start..end] {
                     if soldiers.faction[id as usize] == faction {
@@ -374,6 +398,134 @@ impl CoarseIndex {
             }
         }
         count
+    }
+
+    /// 指定半径を覆うセルから、近いセルにいる敵を最大 [`MAX_NEIGHBORS`] 件集める。
+    ///
+    /// 3×3 固定の問い合わせでは、セル境界の位置によって 8 m セル越しの
+    /// 10〜14 m 先が候補から漏れる。局所兵士 AI の迎撃半径は任務ごとに異なる
+    /// ため、必要なセル数まで同心四角形状に広げる。中心セルから外側へ走査し、
+    /// 密集時は近いセルだけで上限に達した時点で止めることで計算量も抑える。
+    pub fn query_enemies_in_radius(
+        &self,
+        soldiers: &Soldiers,
+        x: Fx,
+        y: Fx,
+        radius: Fx,
+        faction: u8,
+        out: &mut [u32; MAX_NEIGHBORS],
+    ) -> usize {
+        if self.cols == 0 || radius <= 0 {
+            return 0;
+        }
+        let cx = (fx_floor_int(x).div_euclid(self.cell_m) - self.origin_x).clamp(0, self.cols - 1);
+        let cy = (fx_floor_int(y).div_euclid(self.cell_m) - self.origin_y).clamp(0, self.rows - 1);
+        let cell_size = fx(self.cell_m);
+        let cell_radius = (radius + cell_size - 1) / cell_size;
+        let radius_sq = (radius as i64) * (radius as i64);
+        let here = sim_math::Vec2Fx::new(x, y);
+        let mut count = 0usize;
+
+        for ring in 0..=cell_radius {
+            for dy in -ring..=ring {
+                let ny = cy + dy;
+                if ny < 0 || ny >= self.rows {
+                    continue;
+                }
+                for dx in -ring..=ring {
+                    if dx.abs().max(dy.abs()) != ring {
+                        continue;
+                    }
+                    let nx = cx + dx;
+                    if nx < 0 || nx >= self.cols {
+                        continue;
+                    }
+                    let c = (ny as usize) * (self.cols as usize) + nx as usize;
+                    if !self.cell_has_enemy(c, faction) {
+                        continue;
+                    }
+                    let (start, end) =
+                        (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
+                    for &id in &self.entries[start..end] {
+                        let i = id as usize;
+                        if soldiers.faction[i] == faction
+                            || sim_math::dist_sq(here, soldiers.pos(i)) > radius_sq
+                        {
+                            continue;
+                        }
+                        out[count] = id;
+                        count += 1;
+                        if count >= MAX_NEIGHBORS {
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// 半径を覆うセルを内側から走査し、見つけた兵士を順に `visit` へ渡す。
+    ///
+    /// [`CoarseIndex::query_enemies_in_radius`] と違い、陣営で絞らず配列にも
+    /// 貯めない。局所知覚のように「近傍の敵味方をまとめて数える」用途では、
+    /// [`MAX_NEIGHBORS`] の上限が数え落としになるため。代わりに走査人数の上限
+    /// (`budget`) を呼び出し側が決める——人が一度に把握できる人数には限りが
+    /// あり、密集地でも計算量を兵数に対して一定に保てる。
+    ///
+    /// 走査順はリング（中心セルから外側へ）→ セル → 登録順で、決定論的。
+    /// 戻り値は実際に距離判定まで見た人数。
+    pub fn scan_in_radius(
+        &self,
+        soldiers: &Soldiers,
+        x: Fx,
+        y: Fx,
+        radius: Fx,
+        budget: u32,
+        mut visit: impl FnMut(u32, i64),
+    ) -> u32 {
+        if self.cols == 0 || radius <= 0 || budget == 0 {
+            return 0;
+        }
+        let cx = (fx_floor_int(x).div_euclid(self.cell_m) - self.origin_x).clamp(0, self.cols - 1);
+        let cy = (fx_floor_int(y).div_euclid(self.cell_m) - self.origin_y).clamp(0, self.rows - 1);
+        let cell_size = fx(self.cell_m);
+        let cell_radius = (radius + cell_size - 1) / cell_size;
+        let radius_sq = (radius as i64) * (radius as i64);
+        let here = sim_math::Vec2Fx::new(x, y);
+        let mut scanned = 0u32;
+
+        for ring in 0..=cell_radius {
+            for dy in -ring..=ring {
+                let ny = cy + dy;
+                if ny < 0 || ny >= self.rows {
+                    continue;
+                }
+                for dx in -ring..=ring {
+                    if dx.abs().max(dy.abs()) != ring {
+                        continue;
+                    }
+                    let nx = cx + dx;
+                    if nx < 0 || nx >= self.cols {
+                        continue;
+                    }
+                    let c = (ny as usize) * (self.cols as usize) + nx as usize;
+                    let (start, end) =
+                        (self.cell_start[c] as usize, self.cell_start[c + 1] as usize);
+                    for &id in &self.entries[start..end] {
+                        scanned += 1;
+                        let d2 = sim_math::dist_sq(here, soldiers.pos(id as usize));
+                        if d2 <= radius_sq {
+                            visit(id, d2);
+                        }
+                        if scanned >= budget {
+                            return scanned;
+                        }
+                    }
+                }
+            }
+        }
+        scanned
     }
 
     /// 周囲 3×3 セルにいる兵士（陣営を問わない）を最大 [`MAX_NEIGHBORS`] 件集める。
@@ -547,5 +699,17 @@ mod tests {
         let mut out = [0u32; MAX_NEIGHBORS];
         let p = s.pos(5);
         assert!(h.query_neighbors(p.x, p.y, &mut out) > 0);
+    }
+
+    #[test]
+    fn coarse_radius_query_reaches_beyond_adjacent_cells() {
+        let mut s = Soldiers::default();
+        s.push(fx(100), fx(100), 0, 0, 0, Attrs::default(), 0);
+        let enemy = s.push(fx(112), fx(100), 0, 0, 1, Attrs::default(), 0);
+        let index = CoarseIndex::build(8, &s);
+        let mut out = [0u32; MAX_NEIGHBORS];
+        let n = index.query_enemies_in_radius(&s, fx(100), fx(100), fx(14), 0, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out[0], enemy);
     }
 }

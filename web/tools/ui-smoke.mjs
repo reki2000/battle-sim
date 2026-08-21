@@ -63,6 +63,25 @@ const soldierDetailShown = await page.locator("#detail-panel").textContent();
 if (!soldierDetailShown || !soldierDetailShown.includes("兵士詳細")) {
   fail(`兵士クリックで詳細パネルが更新されない: ${soldierDetailShown}`);
 } else {
+  // 判断まわりのデバッグ表示（B0）が出ているか。任務・現在行動・隊形スロット・
+  // 反応待ちが読めないと、後続フェーズの挙動変更を目で追えない。
+  for (const label of [
+    "判断",
+    "任務",
+    "現在行動",
+    "隊形スロット",
+    "命令反応待ち",
+    "行動候補",
+    "見えている",
+    "脅威の向き",
+    "援護できる戦闘",
+    "行動の点数",
+    "任務の段階",
+  ]) {
+    if (!soldierDetailShown.includes(label)) {
+      fail(`兵士の判断デバッグ表示に「${label}」が無い: ${soldierDetailShown}`);
+    }
+  }
   await page.getByRole("button", { name: "追従" }).click();
   await page.waitForTimeout(1500);
   const hud = (await page.textContent("#hud")) ?? "";

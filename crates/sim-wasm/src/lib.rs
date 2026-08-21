@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+use sim_core::metrics::MissionKind;
 use sim_core::organization::{ApproachStyle, Intent, MoveSpeed, Priority, ShootMode, Side, Unit};
 use sim_core::snapshot::RenderSnapshot;
 use sim_core::structures::StructureKind;
@@ -647,6 +648,72 @@ impl World {
             .is_some()
     }
 
+    /// 特定の敵兵（通常は指揮官）を、行動不能になるまで追跡する。
+    #[wasm_bindgen(js_name = issueHuntPerson)]
+    pub fn issue_hunt_person(&mut self, node: u32, target_soldier: u32) -> bool {
+        let Some(command_node) = self.inner.command.node(node) else {
+            return false;
+        };
+        let Some(target) = self.inner.soldiers.index_if_present(target_soldier) else {
+            return false;
+        };
+        if !self.inner.soldiers.is_alive(target)
+            || self.inner.soldiers.faction[target] == command_node.faction
+        {
+            return false;
+        }
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::HuntPerson {
+                    target: target_soldier,
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定した円形区域へ進出し、区域内に分散して占拠する。
+    #[wasm_bindgen(js_name = issueOccupyArea)]
+    pub fn issue_occupy_area(&mut self, node: u32, x_m: i32, y_m: i32, radius_m: u16) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::OccupyArea {
+                    center: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    radius_m: radius_m.clamp(1, 200),
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
+    /// 指定した区域を守り、各持ち場から迎撃半径内の敵へ個別に反応する。
+    #[wasm_bindgen(js_name = issueGuardArea)]
+    pub fn issue_guard_area(
+        &mut self,
+        node: u32,
+        x_m: i32,
+        y_m: i32,
+        radius_m: u16,
+        intercept_radius_m: u16,
+    ) -> bool {
+        self.inner
+            .issue_order(
+                node,
+                node,
+                Intent::GuardArea {
+                    center: Vec2Fx::new(fx(x_m), fx(y_m)),
+                    radius_m: radius_m.clamp(1, 200),
+                    intercept_radius_m: intercept_radius_m.clamp(1, 50),
+                },
+                Priority::Absolute,
+            )
+            .is_some()
+    }
+
     #[wasm_bindgen(js_name = messengerCount)]
     pub fn messenger_count(&self) -> u32 {
         self.inner.command.messengers.len() as u32
@@ -985,6 +1052,188 @@ impl World {
             reach_mm,
         ]
     }
+
+    /// 兵士 1 体の判断まわり（任務・現在行動・行動候補・目標地点・隊形スロット・
+    /// 反応待ち）を JSON で返す（B0 のデバッグ表示）。
+    ///
+    /// 呼ぶとその兵士が観測対象になり、以降の tick では判断の候補と点数が
+    /// 記録される。記録は判断そのものを変えないので、状態ハッシュもリプレイも
+    /// 影響を受けない。別の兵士を指定すると観測対象が移る。
+    #[wasm_bindgen(js_name = soldierDebugJson)]
+    pub fn soldier_debug_json(&mut self, id: u32) -> String {
+        let i = id as usize;
+        if i >= self.inner.soldiers.len() {
+            return "null".to_string();
+        }
+        self.inner.soldier_ai.set_watch(Some(id));
+
+        let node = self.node_for_soldier(id);
+        let owner = self.inner.command.nodes.iter().find(|n| {
+            n.unit
+                .as_ref()
+                .is_some_and(|unit| unit.soldiers.contains(&id))
+        });
+        let mission = owner
+            .map(|n| MissionKind::of(n.objective.as_ref()))
+            .unwrap_or(MissionKind::NoUnit);
+        // 任務の段階と、地点任務の半径・追撃限界（B5 の可視化）。
+        let mission_state = owner.map(|n| n.mission).unwrap_or_default();
+        let area = owner.and_then(|n| match n.objective {
+            Some(Intent::OccupyArea { center, radius_m }) => Some((center, radius_m, 0u16)),
+            Some(Intent::GuardArea {
+                center,
+                radius_m,
+                intercept_radius_m,
+            }) => Some((center, radius_m, intercept_radius_m)),
+            _ => None,
+        });
+
+        let ai = &self.inner.soldier_ai;
+        let tick = self.inner.tick;
+        let pos = self.inner.soldiers.pos(i);
+        let goal = self.inner.goal(id);
+        let slot_goal = ai.formation_goal(id);
+        let slot_distance_mm =
+            sim_math::fx_to_mm(sim_math::isqrt64(sim_math::dist_sq(pos, slot_goal) as u64) as i32);
+        let action = ai.action(id).id();
+        let awareness = self.inner.perception.awareness(id);
+        let record = ai.watch_record();
+        let candidates: Vec<String> = record
+            .candidates
+            .iter()
+            .map(|c| {
+                format!(
+                    "{{\"target\":{},\"score\":{},\"distanceMm\":{},\"fighting\":{},\"load\":{}}}",
+                    c.target, c.score, c.distance_mm, c.fighting, c.load
+                )
+            })
+            .collect();
+        // 記録は観測対象が判断した瞬間のものなので、別の兵士のものは出さない。
+        let record_is_mine = record.soldier == id;
+
+        // JSON は 1 本の巨大な書式文字列にせず、区切りごとに書き足す。
+        // `cargo fmt` が長い文字列リテラルを畳むと、意図しない空白が JSON の中に
+        // 混ざるため。
+        use core::fmt::Write;
+        let mut out = String::with_capacity(512);
+        let _ = write!(
+            out,
+            "{{\"id\":{id},\"node\":{node},\"mission\":\"{}\",\"action\":\"{action}\"",
+            mission.id()
+        );
+        let _ = write!(
+            out,
+            ",\"focus\":{},\"orderedFocus\":{},\"slot\":{}",
+            optional_id(ai.focus(id)),
+            optional_id(ai.ordered_focus(id)),
+            self.inner.soldiers.slot[i]
+        );
+        let _ = write!(
+            out,
+            ",\"goalXMm\":{},\"goalYMm\":{},\"slotXMm\":{},\"slotYMm\":{},\"slotDistanceMm\":{}",
+            sim_math::fx_to_mm(goal.x),
+            sim_math::fx_to_mm(goal.y),
+            sim_math::fx_to_mm(slot_goal.x),
+            sim_math::fx_to_mm(slot_goal.y),
+            slot_distance_mm
+        );
+        let _ = write!(
+            out,
+            ",\"reactionRadiusMm\":{},\"thinkInTicks\":{},\"formationSampleInTicks\":{},\"commitTicksLeft\":{}",
+            ai.reaction_radius_mm(id),
+            ticks_until(self.inner.soldiers.think_at[i], tick),
+            ticks_until(ai.next_formation_sample(id), tick),
+            ticks_until(ai.commit_until(id), tick)
+        );
+        let _ = write!(
+            out,
+            ",\"awareness\":{{\"updatedTick\":{},\"enemies\":{},\"allies\":{},\"threatFront\":{},\"threatFlank\":{},\"threatRear\":{},\"crowding\":{},\"localBroken\":{},\"nearestEnemy\":{},\"nearestEnemyMm\":{},\"supportableEnemy\":{}}}",
+            awareness.updated_tick,
+            awareness.enemies,
+            awareness.allies,
+            awareness.threat_front,
+            awareness.threat_flank,
+            awareness.threat_rear,
+            awareness.crowding,
+            awareness.local_broken,
+            optional_id(awareness.sees_enemy().then_some(awareness.nearest_enemy)),
+            if awareness.sees_enemy() {
+                awareness.nearest_enemy_mm
+            } else {
+                -1
+            },
+            optional_id(
+                awareness
+                    .can_support_fight()
+                    .then_some(awareness.supportable_enemy)
+            )
+        );
+        // 行動の点数（B2）。選べた行動だけが並ぶ。
+        let action_scores: Vec<String> = record
+            .actions
+            .iter()
+            .map(|(action, score)| format!("{{\"action\":\"{}\",\"score\":{score}}}", action.id()))
+            .collect();
+        let _ = write!(
+            out,
+            ",\"actionScores\":[{}],\"chosenAction\":{}",
+            if record_is_mine {
+                action_scores.join(",")
+            } else {
+                String::new()
+            },
+            match record_is_mine.then_some(record.chosen_action).flatten() {
+                Some(action) => format!("\"{}\"", action.id()),
+                None => "null".to_string(),
+            }
+        );
+        let _ = write!(
+            out,
+            ",\"missionState\":\"{}\",\"missionSinceTick\":{},\"insideFriendly\":{},\"insideEnemy\":{}",
+            mission_state.state.id(),
+            mission_state.since_tick,
+            mission_state.inside_friendly,
+            mission_state.inside_enemy
+        );
+        let _ = match area {
+            Some((center, radius_m, intercept_m)) => write!(
+                out,
+                ",\"area\":{{\"centerXMm\":{},\"centerYMm\":{},\"radiusMm\":{},\"leashMm\":{}}}",
+                sim_math::fx_to_mm(center.x),
+                sim_math::fx_to_mm(center.y),
+                i32::from(radius_m) * 1_000,
+                i32::from(intercept_m) * 1_000
+            ),
+            None => write!(out, ",\"area\":null"),
+        };
+        let _ = write!(
+            out,
+            ",\"decidedAtTick\":{},\"candidates\":[{}]}}",
+            match record_is_mine.then_some(record.tick).flatten() {
+                Some(t) => t.to_string(),
+                None => "null".to_string(),
+            },
+            if record_is_mine {
+                candidates.join(",")
+            } else {
+                String::new()
+            }
+        );
+        out
+    }
+}
+
+/// JSON へ出す「いなければ null」の兵士 ID。
+fn optional_id(id: Option<u32>) -> String {
+    id.map_or_else(|| "null".to_string(), |v| v.to_string())
+}
+
+/// あと何 tick で来るか。過ぎていれば 0、予定が無ければ -1。
+fn ticks_until(at: u32, now: u32) -> i64 {
+    if at == u32::MAX {
+        return -1;
+    }
+    (at as i64 - now as i64).max(0)
 }
 
 /// `battleSites()` と同じ 7 要素 1 組の平坦な配列を候補の一覧へ戻す。
@@ -1216,6 +1465,10 @@ mod tests {
         assert!(w.issue_withdraw(friendly, 90, 90, true));
         assert!(w.issue_shoot_at(friendly, enemy, 1));
         assert!(w.issue_reserve(friendly, 80, 80));
+        assert!(w.issue_hunt_person(friendly, 16));
+        assert!(w.issue_occupy_area(friendly, 120, 100, 25));
+        assert!(w.issue_guard_area(friendly, 100, 120, 20, 14));
+        assert!(!w.issue_hunt_person(friendly, 0));
         // 存在しないノードへは出せない。
         assert!(!w.issue_attack(999, enemy, 0));
 
@@ -1271,6 +1524,62 @@ mod tests {
         let detail = w.soldier_detail(0);
         assert_eq!(detail.len(), 9);
         assert!(detail[0] > 0, "hp が 0 以下: {}", detail[0]);
+    }
+
+    /// デバッグ表示が、任務・現在行動・隊形スロット・反応待ちまで届くこと。
+    /// 観測を始めてもワールドの状態ハッシュは変わらない。
+    #[test]
+    fn soldier_debug_json_describes_the_decision_state() {
+        let mut w = sloped_world(11, 300);
+        w.deploy_block(100, 100, 4, 4, 900, 0, 0, 0, 1);
+        w.deploy_block(100, 112, 4, 4, 900, 1, 1, 0, 2);
+        let friendly = w.add_line_unit(0, 0, 16, 4, 0);
+        let _enemy = w.add_line_unit(1, 16, 16, 4, 0);
+        assert!(w.issue_move_to(friendly, 100, 112, 0, 0));
+        for _ in 0..40 {
+            w.tick();
+        }
+
+        let before = (w.state_hash_lo(), w.state_hash_hi());
+        let json = w.soldier_debug_json(0);
+        assert!(json.starts_with('{'), "JSON オブジェクトでない: {json}");
+        assert!(
+            !json.contains("  "),
+            "JSON に書式由来の空白が混ざっている: {json}"
+        );
+        for key in [
+            "\"mission\"",
+            "\"action\"",
+            "\"slotDistanceMm\"",
+            "\"reactionRadiusMm\"",
+            "\"thinkInTicks\"",
+            "\"candidates\"",
+            "\"awareness\"",
+            "\"threatRear\"",
+            "\"supportableEnemy\"",
+            "\"actionScores\"",
+            "\"chosenAction\"",
+            "\"missionState\"",
+            "\"area\"",
+        ] {
+            assert!(json.contains(key), "{key} が無い: {json}");
+        }
+        assert_eq!(
+            (w.state_hash_lo(), w.state_hash_hi()),
+            before,
+            "観測を始めただけで状態が変わった"
+        );
+
+        // 観測を始めた後は、判断のたびに候補と点数が記録される。
+        for _ in 0..80 {
+            w.tick();
+        }
+        let watched = w.soldier_debug_json(0);
+        assert!(
+            watched.contains("\"decidedAtTick\":") && !watched.contains("\"decidedAtTick\":null"),
+            "判断が記録されていない: {watched}"
+        );
+        assert_eq!(w.soldier_debug_json(9999), "null");
     }
 
     /// 会戦プリセットが wasm 境界を越えて、そのまま回せる形で届くこと。

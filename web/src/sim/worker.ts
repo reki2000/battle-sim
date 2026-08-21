@@ -29,7 +29,7 @@ import type {
   StatsPayload,
   ToWorker,
 } from "./protocol";
-import { buildCommanderInfo, parseSoldierDetail } from "./detail";
+import { buildCommanderInfo, parseSoldierDebug, parseSoldierDetail } from "./detail";
 import { loadCachedTerrain, saveCachedTerrain, terrainCacheKey } from "./terrain-cache";
 import type { CachedTerrain } from "./terrain-cache";
 import { generateTerrain } from "../terrain";
@@ -244,6 +244,21 @@ function applyCommand(
     case "issuePursue":
       world.issuePursue(msg.node, msg.targetNode, msg.maxDistanceM);
       break;
+    case "issueHuntPerson":
+      world.issueHuntPerson(msg.node, msg.targetSoldier);
+      break;
+    case "issueOccupyArea":
+      world.issueOccupyArea(msg.node, msg.xM, msg.yM, msg.radiusM);
+      break;
+    case "issueGuardArea":
+      world.issueGuardArea(
+        msg.node,
+        msg.xM,
+        msg.yM,
+        msg.radiusM,
+        msg.interceptRadiusM,
+      );
+      break;
     case "queueBuildStructure":
       world.queueBuildStructure(
         msg.kind,
@@ -289,6 +304,9 @@ const MUTATING_TYPES = new Set<ToWorker["type"]>([
   "issueShootAt",
   "issueReserve",
   "issuePursue",
+  "issueHuntPerson",
+  "issueOccupyArea",
+  "issueGuardArea",
   "queueBuildStructure",
   "setCommanderArchetype",
 ]);
@@ -529,7 +547,16 @@ self.onmessage = async (ev: MessageEvent<ToWorker>) => {
       if (!world) break;
       const node = world.nodeForSoldier(msg.id);
       const flat = Array.from(world.soldierDetail(msg.id));
-      post({ type: "soldierInfo", id: msg.id, node, detail: parseSoldierDetail(flat) });
+      // 判断まわり（任務・行動候補・反応待ち）は同じ問い合わせで一緒に取る。
+      // 選択した兵士が以降の tick で観測対象になる（記録だけで挙動は変わらない）。
+      const debug = parseSoldierDebug(world.soldierDebugJson(msg.id));
+      post({
+        type: "soldierInfo",
+        id: msg.id,
+        node,
+        detail: parseSoldierDetail(flat),
+        debug,
+      });
       break;
     }
 

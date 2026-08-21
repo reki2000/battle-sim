@@ -99,7 +99,9 @@
         max-height: 46vh;
       }
       #detail-panel {
-        max-height: 30vh;
+        /* 判断まわり（任務・行動候補・局所知覚）を足したぶん、指揮系統と同じ
+           高さまで見えるようにする。あふれた分はこのパネル内でスクロールする。 */
+        max-height: 46vh;
       }
       #scenario-panel {
         position: fixed;
