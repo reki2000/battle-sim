@@ -138,7 +138,7 @@ worker.onmessage = async (ev: MessageEvent<FromWorker>) => {
   const msg = ev.data;
 
   if (msg.type === "soldierInfo") {
-    detailPanel.showSoldier(msg.id, msg.node, msg.detail);
+    detailPanel.showSoldier(msg.id, msg.node, msg.detail, msg.debug);
     return;
   }
   if (msg.type === "commanderInfo") {

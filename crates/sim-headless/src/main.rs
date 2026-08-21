@@ -11,11 +11,14 @@
 //! sim-headless winrate  --soldiers 2000 --runs 200       対称な兵力を繰り返し戦わせて勝率を見る
 //! sim-headless prep     --soldiers 2000 --runs 100       準備時間の長短が防御側の勝率に効くか見る（M6）
 //! sim-headless scenario --scenario agincourt_1415        史実の会戦プリセットを最後まで回す
+//! sim-headless regress                                     戦場挙動の固定 seed 回帰シナリオを全部回す
 //! ```
 
 use std::time::Instant;
 
 use sim_core::combat::BattlePhase;
+use sim_core::metrics::MetricsConfig;
+use sim_core::regression::{self, RegressionScenario};
 use sim_core::soldiers::{flags, Attrs};
 use sim_core::structures::StructureKind;
 use sim_core::{deploy_block, World};
@@ -35,20 +38,27 @@ fn main() {
         "winrate" => winrate(&opts),
         "prep" => prep_experiment(&opts),
         "scenario" => scenario_run(&opts),
+        "regress" => regress(&opts),
         _ => {
             eprintln!(
                 "使い方:\n  \
-                 bench   [--soldiers N] [--ticks N] [--size M] [--seed N]   性能を計測する\n  \
+                 bench   [--soldiers N] [--ticks N] [--size M] [--seed N] [--metrics]\n          \
+                 性能を計測する。--metrics でフェーズ別の内訳も出す\n  \
                  verify  [--soldiers N] [--ticks N] [--seed N]              決定論を検証する\n  \
                  terrain --scenario ID                                     固定地形（data/terrain/*.bin）の統計を出す\n          \
                  地形の生成は web/src/terrain にあり、tools/gen_terrain_fixtures.mjs で書き出す\n  \
-                 battle  [--soldiers N] [--seed N] [--max-ticks N]          会戦を最後まで回し、死因内訳・所要時間を出す（M4 受け入れ条件）\n  \
+                 battle  [--soldiers N] [--seed N] [--max-ticks N] [--metrics]\n          \
+                 会戦を最後まで回し、死因内訳・所要時間を出す（M4 受け入れ条件）。\n          \
+                 --metrics で B0 の観測を --metrics-interval tick ごとに出す\n  \
                  winrate [--soldiers N] [--runs N] [--max-ticks N]          対称な兵力で繰り返し会戦し、勝率が 50%±8% に収まるか見る\n  \
                  prep    [--soldiers N] [--runs N] [--prep-short N] [--prep-long N]\n          \
                  防御側（陣営 1）に杭列・堀を築かせる準備時間を短/長で比較し、\n          \
                  勝率が有意に変わるか見る（M6 受け入れ条件）\n  \
                  scenario [--scenario ID] [--max-ticks N]                  史実の会戦プリセットを決着まで回す\n          \
-                 ID を省略すると登録されているプリセットの一覧を出す"
+                 ID を省略すると登録されているプリセットの一覧を出す\n  \
+                 regress [--scenario ID] [--ticks N] [--list]               戦場挙動の固定 seed 回帰シナリオを回す\n          \
+                 任務別の行動人数・移動開始の散らばり・戦闘近傍の非交戦人数・スロットからの\n          \
+                 距離・標的集中・地点占拠率を JSON で出す（B0 の観測基盤）"
             );
             std::process::exit(2);
         }
@@ -66,6 +76,17 @@ struct Opts {
     prep_short: u32,
     prep_long: u32,
     scenario: Option<String>,
+    /// `regress --list`。回さずに一覧だけ出す。
+    list: bool,
+    /// `battle`/`scenario` に B0 の観測を重ねる。
+    metrics: bool,
+    /// 観測を出す間隔（tick）。
+    metrics_interval: u32,
+    /// 判断を追いかける兵士 ID（`--metrics` と併用）。
+    watch: Option<u32>,
+    /// `--ticks` が明示されたか。回帰シナリオは既定の長さを持つので、
+    /// 指定がなければそちらを使う。
+    ticks_given: bool,
 }
 
 impl Opts {
@@ -84,13 +105,39 @@ impl Opts {
             prep_short: 0,
             prep_long: 15_000,
             scenario: None,
+            list: false,
+            metrics: false,
+            metrics_interval: 200,
+            watch: None,
+            ticks_given: false,
         };
+        // 値を取らないフラグは 1 つ進める。値つきの引数と混ざっても、以降の
+        // 対応がずれないようにする。
         let mut i = 1;
-        while i + 1 < args.len() {
+        while i < args.len() {
+            match args[i].as_str() {
+                "--list" => {
+                    o.list = true;
+                    i += 1;
+                    continue;
+                }
+                "--metrics" => {
+                    o.metrics = true;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if i + 1 >= args.len() {
+                break;
+            }
             let v = &args[i + 1];
             match args[i].as_str() {
                 "--soldiers" => o.soldiers = v.parse().unwrap_or(o.soldiers),
-                "--ticks" => o.ticks = v.parse().unwrap_or(o.ticks),
+                "--ticks" => {
+                    o.ticks = v.parse().unwrap_or(o.ticks);
+                    o.ticks_given = true;
+                }
                 "--size" => o.size_m = v.parse().unwrap_or(o.size_m),
                 "--relief" => o.relief = v.parse().unwrap_or(o.relief),
                 "--seed" => o.seed = parse_seed(v).unwrap_or(o.seed),
@@ -99,6 +146,10 @@ impl Opts {
                 "--prep-short" => o.prep_short = v.parse().unwrap_or(o.prep_short),
                 "--prep-long" => o.prep_long = v.parse().unwrap_or(o.prep_long),
                 "--scenario" => o.scenario = Some(v.clone()),
+                "--watch" => o.watch = v.parse().ok(),
+                "--metrics-interval" => {
+                    o.metrics_interval = v.parse().unwrap_or(o.metrics_interval).max(1)
+                }
                 _ => {}
             }
             i += 2;
@@ -318,10 +369,40 @@ fn run_battle(o: &Opts) -> BattleReport {
 }
 
 /// 決着がつくか `max_ticks` に達するまで tick を回し、結果をまとめる。
+///
+/// `--metrics` を付けると、回帰シナリオと同じ観測（B0）を会戦にも重ねて、
+/// 任務別の行動人数や戦闘近傍の非交戦人数を経過とともに出す。
 fn finish_battle(mut w: World, o: &Opts) -> BattleReport {
     let mut timed_out = true;
+    let mut observer = o
+        .metrics
+        .then(|| sim_core::metrics::BattlefieldObserver::new(MetricsConfig::default()));
+    if let Some(id) = o.watch {
+        w.soldier_ai.set_watch(Some(id));
+    }
     for _ in 0..o.max_ticks {
         w.tick();
+        if let Some(observer) = observer.as_mut() {
+            observer.observe(&w);
+            if w.tick % o.metrics_interval == 0 {
+                eprintln!(
+                    "t{} phase={:?} {}",
+                    w.tick,
+                    w.combat.phase,
+                    observer.report().to_json()
+                );
+                if let Some(id) = o.watch {
+                    let record = w.soldier_ai.watch_record();
+                    eprintln!(
+                        "  watch #{id} state={:?} action={:?} scores={:?} candidates={:?}",
+                        w.soldiers.hot.state[id as usize],
+                        record.chosen_action,
+                        record.actions,
+                        record.candidates
+                    );
+                }
+            }
+        }
         if w.combat.phase == BattlePhase::Complete {
             timed_out = false;
             break;
@@ -666,6 +747,113 @@ fn clone_opts(o: &Opts) -> Opts {
         prep_short: o.prep_short,
         prep_long: o.prep_long,
         scenario: o.scenario.clone(),
+        list: o.list,
+        metrics: o.metrics,
+        metrics_interval: o.metrics_interval,
+        watch: o.watch,
+        ticks_given: o.ticks_given,
+    }
+}
+
+/// 戦場挙動の固定 seed 回帰シナリオ（B0）を回して、指標を JSON で出す。
+///
+/// 後続フェーズの改善量と性能退行は、ここで出た数値を並べて比較する。
+/// `state_hash` / `trace_hash` が変わっていれば挙動そのものが変わっている。
+fn regress(o: &Opts) {
+    if o.list {
+        list_regression_scenarios();
+        return;
+    }
+    let scenarios: Vec<&'static RegressionScenario> = match o.scenario.as_deref() {
+        None => regression::SCENARIOS.iter().collect(),
+        Some(id) => match regression::find(id) {
+            Some(s) => vec![s],
+            None => {
+                eprintln!("そのような回帰シナリオはありません: {id}");
+                list_regression_scenarios();
+                std::process::exit(2);
+            }
+        },
+    };
+
+    println!("[");
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let ticks = if o.ticks_given {
+            o.ticks
+        } else {
+            scenario.ticks
+        };
+        let t0 = Instant::now();
+        let run = regression::run_for(scenario, ticks, MetricsConfig::default());
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let comma = if index + 1 == scenarios.len() {
+            ""
+        } else {
+            ","
+        };
+        println!("  {}{comma}", run.to_json());
+        let m = &run.metrics;
+        eprintln!(
+            "\n{}（{}）{} tick / {:.0} ms（{:.3} ms/tick）",
+            scenario.id,
+            scenario.name_ja,
+            run.ticks,
+            ms,
+            ms / run.ticks.max(1) as f64
+        );
+        eprintln!(
+            "  生存 {}/{}  移動開始 {} 回（同方向 {:.1}%・1 tick 最大 {} 人）",
+            m.alive,
+            m.soldiers,
+            m.movement.starts,
+            m.movement.same_heading_permille as f64 / 10.0,
+            m.movement.peak_starts_in_one_tick
+        );
+        eprintln!(
+            "  戦闘近傍 {} 人（うち非交戦 {} 人・最大 {} 人）",
+            m.vicinity.near_combat, m.vicinity.idle_near_combat, m.vicinity.peak_idle_near_combat
+        );
+        eprintln!(
+            "  スロット距離 平均 {} mm / p90 {} mm / 最大 {} mm",
+            m.formation.slot_distance_mean_mm,
+            m.formation.slot_distance_p90_mm,
+            m.formation.slot_distance_max_mm
+        );
+        eprintln!(
+            "  標的集中 最大 {} 人（超過 {} 体）  占拠 {}/{}  防衛範囲外 {} 人 / 追撃限界超え {} 人",
+            m.targeting.max_attackers_per_enemy,
+            m.targeting.crowded_enemies,
+            m.area.occupy_inside,
+            m.area.occupy_assigned,
+            m.area.guard_outside_post,
+            m.area.guard_beyond_leash
+        );
+        eprintln!(
+            "  知覚 敵が見える {} 人（平均 {:.1} 体）  側面 {} 人 / 背面 {} 人  援護可能 {} 人（出ている {} 人）",
+            m.awareness.sees_enemy,
+            m.awareness.enemies_seen_mean_permille as f64 / 1_000.0,
+            m.awareness.threatened_from_flank,
+            m.awareness.threatened_from_rear,
+            m.awareness.can_support_fight,
+            m.awareness.supporting
+        );
+        if m.hunt.tracking + m.hunt.searching + m.hunt.lost + m.hunt.target_down > 0 {
+            eprintln!(
+                "  人物追跡 追跡中 {} / 捜索中 {} / 打ち切り {} / 対象撃破 {}",
+                m.hunt.tracking, m.hunt.searching, m.hunt.lost, m.hunt.target_down
+            );
+        }
+    }
+    println!("]");
+}
+
+fn list_regression_scenarios() {
+    eprintln!("登録されている回帰シナリオ:");
+    for s in regression::SCENARIOS {
+        eprintln!(
+            "  {:<22} {}（既定 {} tick・seed 0x{:016X}）\n    {}",
+            s.id, s.name_ja, s.ticks, s.seed, s.watches_ja
+        );
     }
 }
 
@@ -678,11 +866,17 @@ fn bench(o: &Opts) {
         w.tick();
     }
 
+    let mut phases = sim_core::PhaseTimings::default();
     let t0 = Instant::now();
     let mut max_tick_ms = 0.0f64;
     for _ in 0..o.ticks {
         let t = Instant::now();
-        w.tick();
+        if o.metrics {
+            // フェーズ別の内訳を取るときだけ時計を読む（B7 の計測）。
+            w.tick_profiled(&mut phases);
+        } else {
+            w.tick();
+        }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         if ms > max_tick_ms {
             max_tick_ms = ms;
@@ -708,6 +902,21 @@ fn bench(o: &Opts) {
         "\n{n} 体 / {:.3} ms per tick / 実時間の {realtime_headroom:.1}x まで回る",
         per_tick
     );
+    if o.metrics {
+        eprintln!("フェーズ別（1 tick あたり）:");
+        let total: u64 = phases.ns.iter().sum();
+        for (index, name) in sim_core::PHASE_NAMES.iter().enumerate() {
+            let share = if total == 0 {
+                0.0
+            } else {
+                phases.ns[index] as f64 * 100.0 / total as f64
+            };
+            eprintln!(
+                "  {name:<14} {:>7} us  {share:>5.1}%",
+                phases.mean_us(index)
+            );
+        }
+    }
 }
 
 fn verify(o: &Opts) {

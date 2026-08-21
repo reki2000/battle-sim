@@ -201,6 +201,103 @@ export interface SoldierDetail {
   weaponReachMm: number;
 }
 
+/**
+ * `soldierDebugJson` が返す判断まわりの状態（B0 のデバッグ表示）。
+ * `crates/sim-wasm/src/lib.rs::soldier_debug_json` と一致させること。
+ */
+export interface SoldierDebugCandidate {
+  /** 候補になった敵の兵士 ID。 */
+  target: number;
+  score: number;
+  distanceMm: number;
+  /** その敵が既に交戦中か。 */
+  fighting: boolean;
+  /** 既にその敵へ向かっている味方の人数。 */
+  load: number;
+}
+
+/** `soldierDebugJson` の `awareness`。`sim-core::perception::LocalAwareness` と一致させること。 */
+export interface SoldierAwareness {
+  /** 最後に周囲を見た tick。 */
+  updatedTick: number;
+  enemies: number;
+  allies: number;
+  threatFront: number;
+  threatFlank: number;
+  threatRear: number;
+  /** 1.5 m 以内の味方（押し合いの元）。 */
+  crowding: number;
+  /** 近くで崩れている味方。 */
+  localBroken: number;
+  /** もっとも近い敵。見えていなければ null。 */
+  nearestEnemy: number | null;
+  nearestEnemyMm: number;
+  /** 味方が組み合っていて援護に入れる相手。無ければ null。 */
+  supportableEnemy: number | null;
+}
+
+/** `soldierDebugJson` の `actionScores` の 1 件。`soldier_ai::IndividualAction` の識別子と点数。 */
+export interface SoldierActionScore {
+  action: string;
+  score: number;
+}
+
+/** 地点任務の範囲（`soldierDebugJson` の `area`）。 */
+export interface SoldierMissionArea {
+  centerXMm: number;
+  centerYMm: number;
+  radiusMm: number;
+  /** 地点防衛の追撃限界。占拠任務では 0。 */
+  leashMm: number;
+}
+
+export interface SoldierDebug {
+  id: number;
+  /** 所属する葉部隊の指揮ノード。無所属なら -1。 */
+  node: number;
+  /** 受けている任務（`metrics::MissionKind` の識別子）。 */
+  mission: string;
+  /** 現在の局所行動（`follow_order` / `join_fight`）。 */
+  action: string;
+  /** 個人判断で向かっている敵。いなければ null。 */
+  focus: number | null;
+  /** 任務が名指しした対象（人物追跡）。 */
+  orderedFocus: number | null;
+  /** 隊形スロットの番号。 */
+  slot: number;
+  goalXMm: number;
+  goalYMm: number;
+  slotXMm: number;
+  slotYMm: number;
+  slotDistanceMm: number;
+  reactionRadiusMm: number;
+  /** 次に局所判断をするまでの tick。予定が無ければ -1。 */
+  thinkInTicks: number;
+  /** 次に陣形目標を取り込むまでの tick（＝命令への反応待ち）。 */
+  formationSampleInTicks: number;
+  /** 現在の行動を続けると決めている残り tick。 */
+  commitTicksLeft: number;
+  /** 任務の段階（`organization::MissionState` の識別子、B5）。 */
+  missionState: string;
+  /** その段階に入った tick。 */
+  missionSinceTick: number;
+  /** 地点任務で範囲の中にいる味方・敵の人数。 */
+  insideFriendly: number;
+  insideEnemy: number;
+  /** 地点任務の範囲。地点任務でなければ null。 */
+  area: SoldierMissionArea | null;
+  /** この兵士がいま把握している周囲（B1 の局所知覚）。 */
+  awareness: SoldierAwareness;
+  /** 選べた行動とその点数（B2）。点数の高い順ではなく列挙順で並ぶ。 */
+  actionScores: SoldierActionScore[];
+  /** 直近の判断で選んだ行動。まだ判断していなければ null。 */
+  chosenAction: string | null;
+  /** 候補と点数を記録した tick。まだ判断していなければ null。 */
+  decidedAtTick: number | null;
+  /** 認識していた敵と、その点数（高い順）。 */
+  candidates: SoldierDebugCandidate[];
+}
+
 /** `commanderAttrs` の 10 要素。`organization::CommanderAttrs` と一致させること。 */
 export interface CommanderAttrs {
   boldness: number;
@@ -269,7 +366,13 @@ export type FromWorker =
       buffer: ArrayBuffer;
       stats?: StatsPayload;
     }
-  | { type: "soldierInfo"; id: number; node: number; detail: SoldierDetail | null }
+  | {
+      type: "soldierInfo";
+      id: number;
+      node: number;
+      detail: SoldierDetail | null;
+      debug: SoldierDebug | null;
+    }
   | { type: "commanderInfo"; info: CommanderInfo }
   | { type: "recording"; recording: Recording }
   | {

@@ -124,9 +124,18 @@ cargo run --release -p sim-headless -- winrate --soldiers 2000 --runs 200
 # 準備時間の長短による防御側勝率の比較
 cargo run --release -p sim-headless -- prep --soldiers 2000 --runs 100
 
-# 性能と固定地形の統計
+# 性能と固定地形の統計（--metrics でフェーズ別の内訳）
 cargo run --release -p sim-headless -- bench --soldiers 20000 --ticks 500
+cargo run --release -p sim-headless -- bench --soldiers 20000 --ticks 300 --metrics
 cargo run --release -p sim-headless -- terrain --scenario agincourt_1415
+
+# 戦場挙動の固定シードシナリオ（任務別の行動人数、移動開始の散らばり、
+# 戦闘近傍の非交戦人数、スロットからの距離、標的集中、地点占拠率）
+cargo run --release -p sim-headless -- regress
+cargo run --release -p sim-headless -- regress --list
+
+# 会戦の途中経過を同じ指標で見る（--watch ID で1人の判断を追う）
+cargo run --release -p sim-headless -- battle --soldiers 2000 --metrics --watch 999
 ```
 
 性能値は必ず`--release`で測ってください。devプロファイルの固定小数点演算は、
